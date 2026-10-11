@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent};
 use rust_cast::channels::connection::ConnectionChannel;
 use rust_cast::channels::heartbeat::{HeartbeatChannel, HeartbeatResponse};
-use rust_cast::channels::media::{MediaChannel, MediaResponse, PlayerState};
+use rust_cast::channels::media::{IdleReason, MediaChannel, MediaResponse, PlayerState};
 use rust_cast::channels::receiver::{Application, ReceiverChannel, ReceiverResponse};
 use rust_cast::message_manager::{CastMessage, CastMessagePayload, MessageManager};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -2583,28 +2583,37 @@ impl CastLink {
     fn pump(&self) -> Result<Option<PumpUpdate>, String> {
         self.set_read_timeout(READ_IDLE);
         match self.mm.receive() {
-            Ok(msg) => Ok(Some(PumpUpdate {
-                player: self.apply_message(&msg),
-            })),
+            Ok(msg) => Ok(Some(self.apply_message(&msg))),
             Err(e) if cast_err_is_timeout(&e) => Ok(None),
             Err(_) => Err(link_down_message()),
         }
     }
 
-    fn apply_message(&self, msg: &CastMessage) -> Option<PlayerState> {
+    fn apply_message(&self, msg: &CastMessage) -> PumpUpdate {
         if self.answer_heartbeat(msg) {
-            return None;
+            return PumpUpdate::empty();
         }
         if self.media.can_handle(msg) {
             match self.media.parse(msg) {
                 Ok(MediaResponse::Status(status)) => {
-                    return status.entries.first().map(|e| e.player_state);
+                    if let Some(entry) = status.entries.first() {
+                        return PumpUpdate {
+                            player: Some(entry.player_state),
+                            media_session: Some(entry.media_session_id),
+                            idle_reason: entry.idle_reason,
+                        };
+                    }
                 }
-                Ok(MediaResponse::LoadFailed(_)) => return Some(PlayerState::Idle),
+                Ok(MediaResponse::LoadFailed(_)) => {
+                    return PumpUpdate {
+                        player: Some(PlayerState::Idle),
+                        ..PumpUpdate::empty()
+                    };
+                }
                 _ => {}
             }
         }
-        None
+        PumpUpdate::empty()
     }
 
     fn ping(&self) -> Result<(), String> {
@@ -2681,6 +2690,18 @@ enum Waited {
 
 struct PumpUpdate {
     player: Option<PlayerState>,
+    media_session: Option<i32>,
+    idle_reason: Option<IdleReason>,
+}
+
+impl PumpUpdate {
+    fn empty() -> Self {
+        Self {
+            player: None,
+            media_session: None,
+            idle_reason: None,
+        }
+    }
 }
 
 fn launch_payload(request_id: u32) -> String {
@@ -2882,6 +2903,8 @@ struct SessionFlags {
     last_rx: Instant,
     media_session: Option<i32>,
     disconnect_origin: Option<CastOrigin>,
+    /// mediaSessionId we already advanced from, so a repeated FINISHED is one step.
+    advanced_session: Option<i32>,
 }
 
 impl SessionFlags {
@@ -2913,6 +2936,48 @@ impl SessionFlags {
             }
         }
     }
+
+    /// IDLE + FINISHED for the item now on the TV. STOP, ERROR, and any other
+    /// reason do not advance, and neither does a status for an older item.
+    fn note_finished(&mut self, session: Option<i32>, reason: Option<IdleReason>) -> bool {
+        let Some(session) = session else {
+            return false;
+        };
+        let Some(current) = self.media_session else {
+            return false;
+        };
+        if session != current || reason != Some(IdleReason::Finished) {
+            return false;
+        }
+        if self.advanced_session == Some(session) {
+            return false;
+        }
+        self.advanced_session = Some(session);
+        cast_log("advance", "source=remote");
+        if let Ok(mut ev) = self.remote_event.lock() {
+            *ev = Some("finished".to_string());
+        }
+        true
+    }
+}
+
+/// What `goTo(next, 'remote')` asks Cast to do: load the successor only after
+/// the current item finished. A false decision sends nothing.
+#[cfg(test)]
+fn load_after_finished(
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    session: Option<i32>,
+    reason: Option<IdleReason>,
+    next_url: &str,
+    next_type: &str,
+) -> Result<Option<i32>, String> {
+    if !flags.note_finished(session, reason) {
+        return Ok(None);
+    }
+    Ok(Some(
+        link.load_url(next_url, next_type, true, CastOrigin::Remote)?,
+    ))
 }
 
 enum CastCmd {
@@ -3035,7 +3100,9 @@ impl CastState {
                     reply: mpsc::channel().0,
                 });
                 let _ = worker.join();
-                return Err(with_public_network(link_down_message()));
+                let reason = with_public_network(link_down_message());
+                cast_log("error", &reason);
+                return Err(reason);
             }
         };
 
@@ -3288,6 +3355,7 @@ fn run_session(
         last_rx: Instant::now(),
         media_session: None,
         disconnect_origin: None,
+        advanced_session: None,
     };
     let mut last_ping = Instant::now();
     let mut running = true;
@@ -3340,6 +3408,9 @@ fn run_session(
                 flags.last_rx = Instant::now();
                 if let Some(state) = update.player {
                     flags.note_state(state, false);
+                    if state == PlayerState::Idle {
+                        flags.note_finished(update.media_session, update.idle_reason);
+                    }
                     let name = flags.player_state.clone();
                     publish(&status, |s| {
                         s.player_state = name;
@@ -3423,6 +3494,12 @@ fn handle_cmd(
                 let play = if kind == "still" { true } else { autoplay };
                 let sid = link.load_url(&url, &ctype, play, origin)?;
                 flags.media_session = Some(sid);
+                flags.advanced_session = None;
+                if let Ok(mut ev) = flags.remote_event.lock() {
+                    if ev.as_deref() == Some("finished") {
+                        *ev = None;
+                    }
+                }
                 flags.media_kind = kind.clone();
                 flags.player_state = if play { "playing" } else { "paused" }.into();
                 flags.local_cmd = Some(if play { "play" } else { "pause" });
@@ -4620,6 +4697,9 @@ mod tests {
         load_state: &'static str,
         /// Unsolicited MEDIA_STATUS frames sent after the LOAD reply (requestId 0).
         follow_states: &'static [&'static str],
+        /// After the Nth successful LOAD (1-based), send IDLE with this idleReason.
+        /// Session 0 means the loaded session (7). A non-matching id is a stale item.
+        idle_after: &'static [(u32, &'static str, i32)],
     }
 
     impl Default for FakeScript {
@@ -4629,6 +4709,7 @@ mod tests {
                 load_failed: false,
                 load_state: "PLAYING",
                 follow_states: &[],
+                idle_after: &[],
             }
         }
     }
@@ -4772,16 +4853,30 @@ mod tests {
         session: i32,
         player_state: &str,
     ) {
+        send_media_status_idle(mm, request_id, session, player_state, None);
+    }
+
+    fn send_media_status_idle<S: Read + Write>(
+        mm: &MessageManager<S>,
+        request_id: u32,
+        session: i32,
+        player_state: &str,
+        idle_reason: Option<&str>,
+    ) {
+        let mut status = serde_json::json!({
+            "mediaSessionId": session,
+            "playbackRate": 1.0,
+            "playerState": player_state,
+            "currentTime": 0.0,
+            "supportedMediaCommands": 15
+        });
+        if let Some(reason) = idle_reason {
+            status["idleReason"] = serde_json::Value::String(reason.to_string());
+        }
         let body = serde_json::json!({
             "requestId": request_id,
             "type": "MEDIA_STATUS",
-            "status": [{
-                "mediaSessionId": session,
-                "playbackRate": 1.0,
-                "playerState": player_state,
-                "currentTime": 0.0,
-                "supportedMediaCommands": 15
-            }]
+            "status": [status]
         });
         fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
     }
@@ -4796,6 +4891,7 @@ mod tests {
         let mut transport_up = false;
         let mut awaiting_pong = false;
         let mut launch_id = 0u32;
+        let mut loads = 0u32;
         while !stop.load(Ordering::SeqCst) {
             let msg = match mm.receive() {
                 Ok(msg) => msg,
@@ -4870,7 +4966,13 @@ mod tests {
                     note_trace(traces, &format!("load-refused {dest}"));
                     continue;
                 }
-                note_trace(traces, &format!("load {dest}"));
+                loads += 1;
+                let item = value
+                    .pointer("/media/contentId")
+                    .and_then(|v| v.as_str())
+                    .and_then(|url| url.rsplit('/').next())
+                    .unwrap_or("");
+                note_trace(traces, &format!("load {dest} item={item}"));
                 if script.load_failed {
                     let body = serde_json::json!({
                         "requestId": id,
@@ -4885,6 +4987,14 @@ mod tests {
                 send_media_status(mm, id, 7, script.load_state);
                 for state in script.follow_states {
                     send_media_status(mm, 0, 7, state);
+                }
+                for &(n, reason, session) in script.idle_after {
+                    if n != loads {
+                        continue;
+                    }
+                    let sid = if session == 0 { 7 } else { session };
+                    note_trace(traces, &format!("idle {reason} session={sid}"));
+                    send_media_status_idle(mm, 0, sid, "IDLE", Some(reason));
                 }
                 continue;
             }
@@ -5342,6 +5452,7 @@ mod tests {
             last_rx: Instant::now(),
             media_session: Some(7),
             disconnect_origin: None,
+            advanced_session: None,
         };
         (remote, flags)
     }
@@ -5621,5 +5732,138 @@ mod tests {
         assert!(!written.contains('\\'), "{written}");
         assert!(!written.contains('/'), "{written}");
         assert!(!written.contains("redacted"), "{written}");
+    }
+
+    #[test]
+    fn finished_video_loads_the_next_photo_with_no_user_input() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            idle_after: &[(2, "FINISHED", 7)],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let photo1 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-1";
+        let video = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/video-2";
+        let photo3 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3";
+        let (_remote, mut flags) = session_after_load("still");
+        let sid = link
+            .load_url(photo1, "image/jpeg", true, CastOrigin::User)
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.media_kind = "still".into();
+        let sid = link
+            .load_url(video, "video/mp4", true, CastOrigin::Timer)
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.advanced_session = None;
+        flags.media_kind = "video".into();
+        let mut third = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && third.is_none() {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) {
+                        third = load_after_finished(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            photo3,
+                            "image/jpeg",
+                        )
+                        .unwrap();
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        assert!(third.is_some(), "FINISHED must load the third item");
+        let text = fake.trace_text();
+        let loads: Vec<_> = text.lines().filter(|l| l.starts_with("load ")).collect();
+        assert_eq!(loads, [
+            "load transport-1 item=photo-1",
+            "load transport-1 item=video-2",
+            "load transport-1 item=photo-3",
+        ], "{text}");
+        let idle_at = text.find("idle FINISHED session=7").expect(&text);
+        let third_at = text.rfind("item=photo-3").expect(&text);
+        assert!(idle_at < third_at, "{text}");
+        assert!(!text.contains("PAUSE") && !text.contains("STOP"), "{text}");
+        let written = log.text();
+        let advance = written
+            .lines()
+            .find(|l| l.contains(" advance "))
+            .expect(&written);
+        assert!(advance.contains("source=remote"), "{advance}");
+        assert!(!advance.contains('/') && !advance.contains('\\'), "{advance}");
+        let remote_loads: Vec<_> = written
+            .lines()
+            .filter(|l| l.contains(" load ") && l.contains("source=remote"))
+            .collect();
+        assert_eq!(remote_loads.len(), 1, "{written}");
+        assert_eq!(
+            written.lines().filter(|l| l.contains(" advance ")).count(),
+            1,
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn idle_from_stop_or_error_does_not_advance() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            // CANCELLED is the receiver's idleReason for a STOP. STOP is not a
+            // finished playback, and neither is ERROR or a FINISHED for another item.
+            idle_after: &[(1, "ERROR", 7), (1, "CANCELLED", 7), (1, "STOP", 7), (1, "FINISHED", 99)],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let video = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/video-2";
+        let photo3 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3";
+        let (_remote, mut flags) = session_after_load("video");
+        let sid = link
+            .load_url(video, "video/mp4", true, CastOrigin::User)
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.advanced_session = None;
+        let mut advanced = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) {
+                        if load_after_finished(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            photo3,
+                            "image/jpeg",
+                        )
+                        .unwrap()
+                        .is_some()
+                        {
+                            advanced = true;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        assert!(!advanced, "STOP, ERROR, and a stale FINISHED must not load the next item");
+        let text = fake.trace_text();
+        assert!(text.contains("idle ERROR session=7"), "{text}");
+        assert!(text.contains("idle CANCELLED session=7"), "{text}");
+        assert!(text.contains("idle STOP session=7"), "{text}");
+        assert!(text.contains("idle FINISHED session=99"), "{text}");
+        let loads: Vec<_> = text.lines().filter(|l| l.starts_with("load ")).collect();
+        assert_eq!(loads, ["load transport-1 item=video-2"], "{text}");
+        assert!(!log.text().contains(" advance "), "{}", log.text());
     }
 }
