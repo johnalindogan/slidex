@@ -1147,18 +1147,20 @@ fn cast_load(
     state: State<'_, cast::CastState>,
     path: String,
     autoplay: Option<bool>,
+    source: Option<String>,
 ) -> Result<(), String> {
-    state.load(path, autoplay.unwrap_or(true))
+    let origin = cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?;
+    state.load(path, autoplay.unwrap_or(true), origin)
 }
 
 #[tauri::command]
-fn cast_pause(state: State<'_, cast::CastState>) -> Result<(), String> {
-    state.pause()
+fn cast_pause(state: State<'_, cast::CastState>, source: Option<String>) -> Result<(), String> {
+    state.pause(cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?)
 }
 
 #[tauri::command]
-fn cast_play(state: State<'_, cast::CastState>) -> Result<(), String> {
-    state.play()
+fn cast_play(state: State<'_, cast::CastState>, source: Option<String>) -> Result<(), String> {
+    state.play(cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?)
 }
 
 #[tauri::command]

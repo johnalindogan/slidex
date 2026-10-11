@@ -913,3 +913,22 @@ test('the Cast panel can copy the Cast log path', () => {
   assert.match(perms, /allow-cast-log-path/);
   assert.match(perms, /cast_log_path/);
 });
+
+test('a cast ignores local video events and tags the command source', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /window\.__sspCastActive/);
+  assert.match(html, /window\.__sspCastGen/);
+  assert.match(html, /stopImmediatePropagation/);
+  assert.match(html, /function sspCastHook\(name, source\)/);
+  assert.match(html, /goTo\(nextMI\(\), 'timer'\)/);
+  assert.match(html, /sspCastHook\('transport', window\.__sspCastEcho \? 'remote' : 'user'\)/);
+  assert.match(html, /sspCastHook\('slide', source \|\| 'user'\)/);
+  assert.match(html, /source: src/);
+  const play = html.slice(html.indexOf('async function playCurVid'), html.indexOf('function showSlide'));
+  assert.match(play, /if \(window\.__sspCastActive\) return/);
+  const ended = html.slice(html.indexOf('med.onended'), html.indexOf('return sl;'));
+  assert.match(ended, /if \(window\.__sspCastActive\) return/);
+  const disc = html.slice(html.indexOf('castDisconnect'), html.indexOf('setInterval(watchNetwork'));
+  assert.match(disc, /stopLocalCast\(\)/);
+  assert.match(disc, /cast_disconnect/);
+});

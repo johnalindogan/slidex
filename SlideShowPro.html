@@ -1280,11 +1280,11 @@ function sspIsTauri() {
 function tauriInvoke(cmd, args) {
   return window.__TAURI__.core.invoke(cmd, args || {});
 }
-function sspCastHook(name) {
+function sspCastHook(name, source) {
   try {
     if (window.__sspCastEcho) return;
     var fn = window.__sspCast && window.__sspCast[name];
-    if (typeof fn === 'function') fn();
+    if (typeof fn === 'function') fn(source || 'user');
   } catch (e) {
     console.warn('cast hook', name, e);
   }
@@ -4595,6 +4595,13 @@ function makeVid(item) {
     const map = { 1: 'aborted', 2: 'network/read', 3: 'decode/codec', 4: 'format unsupported' };
     showToast('Video failed (' + (map[code] || 'unknown') + '): ' + (item.name || ''), 5000);
   });
+  // While a cast is active the local element must not drive the TV.
+  ['play', 'pause', 'ended'].forEach((ev) => {
+    v.addEventListener(ev, (e) => {
+      if (!window.__sspCastActive) return;
+      e.stopImmediatePropagation();
+    }, true);
+  });
   return v;
 }
 
@@ -4617,7 +4624,11 @@ function createSlideEl(item, i) {
   if (item.type === 'video') {
     const b = document.createElement('div'); b.className = 'vb'; b.textContent = '▶ video'; sl.appendChild(b);
     med.onended = () => {
-      if (playing && +sl.dataset.mi === cur) setTimeout(() => goTo(nextMI()), 300);
+      if (window.__sspCastActive) return;
+      if (playing && +sl.dataset.mi === cur) setTimeout(() => {
+        if (window.__sspCastActive) return;
+        goTo(nextMI(), 'timer');
+      }, 300);
     };
   }
   return sl;
@@ -5513,6 +5524,7 @@ function loadPlaylistJSON(file) {
 /* ── Playback ── */
 function pauseVids() { sls.forEach(s => { const v = s.querySelector('video'); if (v) v.pause(); }); }
 async function playCurVid() {
+  if (window.__sspCastActive) return;
   if (!isV(cur)) return;
   const v = getSl(cur)?.querySelector('video');
   if (!v || !playing) return;
@@ -5524,8 +5536,10 @@ async function playCurVid() {
   v.volume = wantSound ? vol : 0;
   try {
     await v.play();
+    if (window.__sspCastActive) { try { v.pause(); } catch (_) {} return; }
     if (wantSound) { v.muted = false; v.volume = vol; }
   } catch (err) {
+    if (window.__sspCastActive) return;
     const msg = (err && err.message) ? err.message : String(err);
     showToast('Video play failed: ' + msg, 5000);
   }
@@ -5545,9 +5559,12 @@ function showSlide(i) {
   applySlideSettings(i);
   pauseVids();
   showMaxCompanion(i);
-  if (isV(i)) { staticT(); playCurVid(); startVProg(i); } else { startKB(i); startProg(); }
+  if (window.__sspCastActive) {
+    if (isV(i)) { staticT(); clearTimeout(tmr); } else { startKB(i); startProg(); }
+  } else if (isV(i)) { staticT(); playCurVid(); startVProg(i); }
+  else { startKB(i); startProg(); }
   updPlCur();
-  try { sspCastHook('slide'); } catch (_) {}
+  try { sspCastHook('slide', 'user'); } catch (_) {}
 }
 
 function startKB(i) {
@@ -5718,10 +5735,10 @@ function waitForVideoFrame(video) {
 
 function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
-  tmr = setTimeout(() => { goTo(nextMI()); schedNext(); }, getEDur(cur));
+  tmr = setTimeout(() => { goTo(nextMI(), 'timer'); schedNext(); }, getEDur(cur));
 }
 
-function goTo(i) {
+function goTo(i, source) {
   clearTimeout(tmr); clearInterval(ptmr);
   if (kbId) { cancelAnimationFrame(kbId); kbId = null; }
   if (compKbId) { cancelAnimationFrame(compKbId); compKbId = null; }
@@ -5791,12 +5808,15 @@ function goTo(i) {
   g('fnov').textContent = getMediaItems()[cur]?.name || '';
   pauseVids();
   showMaxCompanion(cur);
-  if (isV(cur)) { staticT(); playCurVid(); startVProg(cur); }
+  if (window.__sspCastActive) {
+    if (isV(cur)) { staticT(); clearTimeout(tmr); }
+    else { startKB(cur); startProg(); if (playing) schedNext(); }
+  } else if (isV(cur)) { staticT(); playCurVid(); startVProg(cur); }
   else { startKB(cur); startProg(); if (playing) schedNext(); }
   updPlCur();
   scheduleStagePrune(cur);
   try { notifyPlaylistSync(); } catch (_) {}
-  try { sspCastHook('slide'); } catch (_) {}
+  try { sspCastHook('slide', source || 'user'); } catch (_) {}
 }
 
 function updPlayBtn() {
@@ -5806,6 +5826,14 @@ function updPlayBtn() {
 }
 function togglePlay() {
   playing = !playing; updPlayBtn();
+  if (window.__sspCastActive) {
+    pauseVids();
+    if (isV(cur)) { clearTimeout(tmr); clearInterval(ptmr); }
+    else if (playing) { schedNext(); startProg(); }
+    else { clearTimeout(tmr); clearInterval(ptmr); }
+    try { sspCastHook('transport', window.__sspCastEcho ? 'remote' : 'user'); } catch (_) {}
+    return;
+  }
   if (isV(cur)) {
     const v = getSl(cur)?.querySelector('video');
     if (playing) {
@@ -5814,12 +5842,16 @@ function togglePlay() {
         v.muted = !!muted;
         v.volume = muted ? 0 : vol;
         v.play().then(() => {
+          if (window.__sspCastActive) { try { v.pause(); } catch (_) {} return; }
           if (!muted && vol > 0) { v.muted = false; v.volume = vol; }
         }).catch((err) => {
+          if (window.__sspCastActive) return;
           v.muted = true;
           v.play().then(() => {
+            if (window.__sspCastActive) { try { v.pause(); } catch (_) {} return; }
             if (!muted && vol > 0) { v.muted = false; v.volume = vol; }
           }).catch((err2) => {
+            if (window.__sspCastActive) return;
             const msg = (err2 && err2.message) ? err2.message : ((err && err.message) ? err.message : String(err2 || err));
             showToast('Video play failed: ' + msg, 5000);
           });
@@ -5830,7 +5862,7 @@ function togglePlay() {
   } else {
     if (playing) { schedNext(); startProg(); } else { clearTimeout(tmr); clearInterval(ptmr); }
   }
-  try { sspCastHook('transport'); } catch (_) {}
+  try { sspCastHook('transport', 'user'); } catch (_) {}
 }
 
 /* ── Screenshot + graded export ── */
@@ -7283,6 +7315,14 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var b = document.getElementById("bcast");
     if (b) b.classList.toggle("cast-on", !!on);
   }
+  function stopLocalCast() {
+    castActive = false;
+    window.__sspCastActive = false;
+    window.__sspCastGen = (window.__sspCastGen || 0) + 1;
+    try { clearTimeout(tmr); tmr = null; } catch (e) {}
+    try { if (typeof pauseVids === "function") pauseVids(); } catch (e2) {}
+    markCast(false);
+  }
   function enqueue(fn) {
     chain = chain.then(fn, fn);
     return chain;
@@ -7407,8 +7447,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       if (skippedNotes.length) noteSkip(skippedNotes[0]);
     });
   }
-  function loadCurrent() {
-    if (!castActive) return Promise.resolve();
+  function loadCurrent(source) {
+    var src = source || "user";
+    if (!castActive || !window.__sspCastActive) return Promise.resolve();
     var path = sspCastCurrentPath();
     if (!path) {
       setStatus("Nothing in this playlist to cast.");
@@ -7422,10 +7463,10 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         setStatus("Nothing in this playlist can be cast. JPEG, PNG, and MP4 (H.264 + AAC) play.");
         return Promise.resolve();
       }
-      if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI());
+      if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
       return Promise.resolve();
     }
-    return call("cast_load", { path: path, autoplay: !!sspCastPlaying() }).then(function () {
+    return call("cast_load", { path: path, autoplay: !!sspCastPlaying(), source: src }).then(function () {
       skipBurst = 0;
       setStatus("Casting " + (sspCastCurrentName() || "the current slide") + ".");
     }).catch(function (e) {
@@ -7437,27 +7478,24 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
           setStatus("Nothing in this playlist can be cast. JPEG, PNG, and MP4 (H.264 + AAC) play.");
           return;
         }
-        if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI());
+        if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
         return;
       }
       if (/unreachable|restart SlideX|not connected/i.test(msg)) {
-        castActive = false;
-        markCast(false);
+        stopLocalCast();
         setStatus(msg);
         return;
       }
       setStatus(msg);
     });
   }
-  function syncTransport() {
-    if (!castActive) return Promise.resolve();
+  function syncTransport(source) {
+    var src = source || "user";
+    if (!castActive || !window.__sspCastActive) return Promise.resolve();
     var cmd = sspCastPlaying() ? "cast_play" : "cast_pause";
-    return call(cmd).catch(function (e) {
+    return call(cmd, { source: src }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
-      if (/unreachable|restart SlideX/i.test(msg)) {
-        castActive = false;
-        markCast(false);
-      }
+      if (/unreachable|restart SlideX/i.test(msg)) stopLocalCast();
       setStatus(msg);
     });
   }
@@ -7475,15 +7513,29 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         try { if (typeof togglePlay === "function") togglePlay(); } finally { window.__sspCastEcho = false; }
       }
       if (!field(st, "connected")) {
-        castActive = false;
-        markCast(false);
+        stopLocalCast();
         setStatus(field(st, "error") || "TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.");
       }
     }).catch(function () {});
   }
+  window.__sspCastGen = window.__sspCastGen || 0;
   window.__sspCast = {
-    slide: function () { enqueue(loadCurrent); },
-    transport: function () { enqueue(syncTransport); },
+    slide: function (source) {
+      var gen = window.__sspCastGen || 0;
+      var src = source || "user";
+      enqueue(function () {
+        if (gen !== (window.__sspCastGen || 0) || !castActive || !window.__sspCastActive) return Promise.resolve();
+        return loadCurrent(src);
+      });
+    },
+    transport: function (source) {
+      var gen = window.__sspCastGen || 0;
+      var src = source || "user";
+      enqueue(function () {
+        if (gen !== (window.__sspCastGen || 0) || !castActive || !window.__sspCastActive) return Promise.resolve();
+        return syncTransport(src);
+      });
+    },
     playlist: function () { enqueue(function () { return pushPlaylist(); }); }
   };
 
@@ -7508,6 +7560,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     enqueue(function () {
       return call("cast_connect", args).then(function (info) {
         castActive = true;
+        window.__sspCastActive = true;
+        window.__sspCastGen = (window.__sspCastGen || 0) + 1;
+        try { if (typeof pauseVids === "function") pauseVids(); } catch (e) {}
         markCast(true);
         skipBurst = 0;
         var where = (info && (field(info, "device_name") || dev.name)) || dev.host;
@@ -7516,8 +7571,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       }).then(function () {
         return loadCurrent();
       }).catch(function (e) {
-        castActive = false;
-        markCast(false);
+        stopLocalCast();
         setStatus((e && e.message) ? e.message : String(e));
       });
     });
@@ -7549,8 +7603,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     });
   });
   document.getElementById("castDisconnect") && document.getElementById("castDisconnect").addEventListener("click", function () {
-    castActive = false;
-    markCast(false);
+    stopLocalCast();
     enqueue(function () {
       return call("cast_disconnect").then(function () {
         setStatus("Cast stopped. The media server is closed. You can cast again without restarting SlideX.");
