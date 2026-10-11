@@ -52,11 +52,17 @@ The status line also names the adapters that were browsed and, when the PC has n
 
 JPEG, PNG, and MP4 (H.264 + AAC) are registered. Anything else is skipped with a note and the slideshow moves on.
 
+## Receiver handshake
+
+After TLS, the sender connects the virtual receiver (`CONNECT` to `receiver-0`), then `LAUNCH` for the Default Media Receiver (`CC1AD845`) and waits for the `RECEIVER_STATUS` with the same `requestId`. It then connects that `transportId` and sends `LOAD` on the media namespace to the transport, not to `receiver-0`. `PING` is answered with `PONG`. The sender also pings every 5 seconds. `LAUNCH_ERROR` and `LOAD_FAILED` are shown immediately. A launch that never answers, including Windows error 10060, says: "The TV didn't answer the launch request. Make sure it's on and try again."
+
+Each step is appended to `%LOCALAPPDATA%\com.johnalindogan.slideshowpro\logs\cast.log` (rotated at 1 MB). The load line records the media URL host and port so a log can show the home LAN address rather than a Tailscale address. The line does not include the media token or a file path. The Cast panel has "Copy Cast log path".
+
 ## Playback and failure
 
 The TV follows the PC order, including reverse playback, and the PC slide timer. Controls are sent on the Cast channel; the idle read is 350 ms, so a healthy LAN should land play, pause, next, and previous within a second. A TV-remote pause or play comes back as `remote_event` and the PC player follows it.
 
-If the TV is off or Wi-Fi drops, the session reports within about 4 seconds (the panel polls at 400 ms, so the status is on screen inside 5 seconds):
+If the TV is off or Wi-Fi drops, the session reports after about 15 seconds of silence (the panel polls at 400 ms):
 
 > TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.
 
@@ -98,6 +104,6 @@ Checklist:
 3. Rescan starts a fresh browse. Changing the PC's network (or toggling Wi-Fi) starts a new browse without restarting SlideX. An empty list does not stick the way Chrome's did.
 4. A 20-item mixed playlist (JPEG, PNG, MP4 H.264+AAC, plus at least one unsupported file) plays on the TV in the same order and with the same slide timing as the PC. The unsupported file is skipped with a visible note and does not stall the playlist.
 5. Play, pause, next, and previous on the PC reach the TV within 1 second. A pause from the TV remote shows as paused in SlideX.
-6. Disconnect closes the media server. Turning the TV off, or dropping Wi-Fi, shows a clear status within 5 seconds. Nothing hangs. Casting again works without restarting SlideX. Do one TV off/on cycle.
+6. Disconnect closes the media server. Turning the TV off, or dropping Wi-Fi, shows a clear status after about 15 seconds of silence. Nothing hangs. Casting again works without restarting SlideX. Do one TV off/on cycle. The Cast log under `%LOCALAPPDATA%\com.johnalindogan.slideshowpro\logs\cast.log` shows the media host as the LAN address.
 7. Leave a cast running for 30 minutes. No drops, and no script errors in the console.
 8. After a real install, `cast-firewall.txt` and the Cast panel show Private-only rules for `slideshowpro.exe`: TCP 47200–47215 and UDP 5353. Uninstall removes them. Public is absent.

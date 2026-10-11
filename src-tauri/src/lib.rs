@@ -1176,6 +1176,11 @@ fn cast_firewall_status() -> Result<cast::CastFirewallStatus, String> {
     Ok(cast::firewall_status())
 }
 
+#[tauri::command]
+fn cast_log_path() -> Result<String, String> {
+    Ok(cast::cast_log_path().to_string_lossy().into_owned())
+}
+
 /// Ask the page to save, then exit. Never wait longer than this.
 const SAVE_BEFORE_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SAVE_BEFORE_EXIT_EVENT: &str = "slidex://save-before-exit";
@@ -1303,6 +1308,7 @@ pub fn run() {
             cast_disconnect,
             cast_status,
             cast_firewall_status,
+            cast_log_path,
             slidex_save_done
         ])
         .setup(|app| {

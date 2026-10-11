@@ -45,6 +45,7 @@
     "allow-cast-disconnect",
     "allow-cast-status",
     "allow-cast-firewall-status",
+    "allow-cast-log-path",
     "allow-slidex-save-done"
   ]
 }

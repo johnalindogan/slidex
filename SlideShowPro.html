@@ -7238,6 +7238,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   <div class="row">
     <button type="button" id="castStart">Cast slideshow</button>
     <button type="button" id="castDisconnect">Disconnect</button>
+    <button type="button" id="castLog">Copy Cast log path</button>
     <button type="button" id="castClose">Close</button>
   </div>
   <div id="castStatus">Open Cast to look for a TV. Play, pause, next, and previous on this PC follow on the TV.</div>
@@ -7519,6 +7520,32 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         markCast(false);
         setStatus((e && e.message) ? e.message : String(e));
       });
+    });
+  });
+  document.getElementById("castLog") && document.getElementById("castLog").addEventListener("click", function () {
+    call("cast_log_path").then(function (path) {
+      function showCopied() { setStatus("Cast log path copied."); }
+      function fallback(value) {
+        var ta = document.createElement("textarea");
+        ta.value = value;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (err) { ok = false; }
+        ta.remove();
+        if (ok) showCopied();
+        else setStatus(value);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(String(path)).then(showCopied, function () { fallback(String(path)); });
+      } else {
+        fallback(String(path));
+      }
+    }).catch(function (e) {
+      setStatus((e && e.message) ? e.message : String(e));
     });
   });
   document.getElementById("castDisconnect") && document.getElementById("castDisconnect").addEventListener("click", function () {

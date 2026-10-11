@@ -2,8 +2,9 @@
 //! Stack: mdns-sd discovery + rust_cast (Cast V2) + a LAN-only HTTP server
 //! → Default Media Receiver. Not chrome.cast, not desktop mirror, no cloud relay.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,14 +13,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent};
 use rust_cast::channels::connection::ConnectionChannel;
 use rust_cast::channels::heartbeat::{HeartbeatChannel, HeartbeatResponse};
-use rust_cast::channels::media::{LoadOptions, Media, MediaChannel, MediaResponse, PlayerState, StreamType};
-use rust_cast::channels::receiver::{CastDeviceApp, ReceiverChannel};
-use rust_cast::message_manager::{CastMessage, MessageManager};
+use rust_cast::channels::media::{MediaChannel, MediaResponse, PlayerState};
+use rust_cast::channels::receiver::{Application, ReceiverChannel, ReceiverResponse};
+use rust_cast::message_manager::{CastMessage, CastMessagePayload, MessageManager};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
@@ -39,7 +40,23 @@ pub const CAST_PORT_HI: u16 = 47215;
 const CAST_APP_ID_PORT: u16 = 8009;
 const READ_IDLE: Duration = Duration::from_millis(350);
 const READ_RPC: Duration = Duration::from_millis(900);
-const LINK_DEAD_AFTER: Duration = Duration::from_secs(4);
+/// Slice used while waiting for LAUNCH or LOAD so a PING can be answered.
+const READ_SLICE: Duration = Duration::from_millis(400);
+/// Cold TVs often take 5–10s to answer LAUNCH. Give up at 15s.
+const LAUNCH_DEADLINE: Duration = Duration::from_secs(15);
+const LOAD_DEADLINE: Duration = Duration::from_secs(15);
+/// Our heartbeat. The TV is treated as gone after `LINK_DEAD_AFTER` of silence.
+const PING_EVERY: Duration = Duration::from_secs(5);
+const LINK_DEAD_AFTER: Duration = Duration::from_secs(15);
+/// Launch can use the full 15s, plus TCP and TLS.
+const SESSION_READY_WAIT: Duration = Duration::from_secs(20);
+const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
+const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
+const CAST_LOG_MAX: u64 = 1_000_000;
+
+pub const LAUNCH_TIMEOUT_MESSAGE: &str =
+    "The TV didn't answer the launch request. Make sure it's on and try again.";
+const LOAD_REFUSED_MESSAGE: &str = "The TV refused to play this slide.";
 
 pub const NO_TV_ERROR: &str = "No TV found on this network. Check that the PC and TV are on the same Wi-Fi, the firewall, or the router's client isolation.";
 
@@ -1570,7 +1587,10 @@ struct CastLink {
 }
 
 impl CastLink {
-    fn connect(host: Ipv4Addr, port: u16) -> Result<Self, String> {
+    /// TCP + TLS only. Does not send the virtual CONNECT. Tests use this to prove
+    /// the receiver ignores everything that arrives before CONNECT.
+    fn open_tls(host: Ipv4Addr, port: u16) -> Result<Self, String> {
+        cast_log("connect", &format!("{host}:{port}"));
         let addr = SocketAddr::from((host, port));
         let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
             format!(
@@ -1582,6 +1602,7 @@ impl CastLink {
         tcp.set_write_timeout(Some(Duration::from_secs(4))).ok();
         let tcp_ctl = tcp.try_clone().map_err(|e| format!("cast socket: {e}"))?;
 
+        let _ = default_provider().install_default();
         let config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
@@ -1597,6 +1618,7 @@ impl CastLink {
         let connection = ConnectionChannel::new("sender-0", Rc::clone(&mm));
         let receiver = ReceiverChannel::new("sender-0", "receiver-0", Rc::clone(&mm));
         let media = MediaChannel::new("sender-0", Rc::clone(&mm));
+        cast_log("tls", &format!("{host}:{port}"));
         Ok(Self {
             tcp: tcp_ctl,
             mm,
@@ -1609,52 +1631,168 @@ impl CastLink {
         })
     }
 
+    fn connect(host: Ipv4Addr, port: u16) -> Result<Self, String> {
+        let link = Self::open_tls(host, port)?;
+        link.connection
+            .connect("receiver-0")
+            .map_err(|e| format!("Could not connect to the TV ({e})."))?;
+        cast_log("receiver-connect", "receiver-0");
+        link.ping()?;
+        Ok(link)
+    }
+
     fn set_read_timeout(&self, dur: Duration) {
         self.tcp.set_read_timeout(Some(dur)).ok();
     }
 
+    fn send_json(&self, namespace: &str, destination: &str, payload: &str) -> Result<(), rust_cast::errors::Error> {
+        self.mm.send(CastMessage {
+            namespace: namespace.to_string(),
+            source: "sender-0".to_string(),
+            destination: destination.to_string(),
+            payload: CastMessagePayload::String(payload.to_string()),
+        })
+    }
+
     fn launch_receiver(&mut self) -> Result<(), String> {
-        self.set_read_timeout(Duration::from_secs(4));
-        let launched = self
-            .receiver
-            .launch_app(&CastDeviceApp::DefaultMediaReceiver)
-            .map_err(|e| format!("Could not open the TV player ({e})."))?;
+        let request_id = self.mm.generate_request_id().get();
+        self.send_json(NS_RECEIVER, "receiver-0", &launch_payload(request_id))
+            .map_err(|e| map_launch_failure(&e.to_string()))?;
+        cast_log("launch", &format!("requestId={request_id} appId=CC1AD845"));
+        let app = self.wait_launch(request_id)?;
         self.connection
-            .connect(launched.transport_id.as_str())
+            .connect(app.transport_id.as_str())
             .map_err(|e| format!("Could not connect to the TV player ({e})."))?;
-        self.transport_id = launched.transport_id;
-        self.session_id = launched.session_id;
+        cast_log("transport-connect", &app.transport_id);
+        self.transport_id = app.transport_id;
+        self.session_id = app.session_id;
         Ok(())
     }
 
     fn load_url(&self, url: &str, content_type: &str, autoplay: bool) -> Result<i32, String> {
-        self.set_read_timeout(Duration::from_secs(15));
-        let media = Media {
-            content_id: url.to_string(),
-            stream_type: StreamType::Buffered,
-            content_type: content_type.to_string(),
-            metadata: None,
-            duration: None,
-        };
-        let status = self
-            .media
-            .load_with_opts(
-                self.transport_id.as_str(),
-                self.session_id.as_str(),
-                &media,
-                LoadOptions {
-                    current_time: 0.0,
-                    autoplay,
-                },
-            )
+        let request_id = self.mm.generate_request_id().get();
+        let payload = load_payload(request_id, &self.session_id, url, content_type, autoplay);
+        self.send_json(NS_MEDIA, &self.transport_id, &payload)
             .map_err(|e| map_load_error(&e.to_string()))?;
-        let sid = status
-            .entries
-            .first()
-            .map(|e| e.media_session_id)
-            .ok_or_else(media_load_notice)?;
-        let _ = content_type;
-        Ok(sid)
+        match media_url_host(url) {
+            Some(host) => cast_log("load", &host),
+            None => cast_log("load", "host-unknown"),
+        }
+        self.wait_load(request_id)
+    }
+
+    /// CONNECT receiver-0, then LAUNCH, then wait for that requestId.
+    fn wait_launch(&self, request_id: u32) -> Result<Application, String> {
+        self.wait_matching(LAUNCH_DEADLINE, LAUNCH_TIMEOUT_MESSAGE, WaitExpect::Launch(request_id))
+            .and_then(|hit| match hit {
+                Waited::Launched(app) => Ok(app),
+                Waited::Loaded(_) => Err(LAUNCH_TIMEOUT_MESSAGE.to_string()),
+            })
+    }
+
+    fn wait_load(&self, request_id: u32) -> Result<i32, String> {
+        let notice = media_load_notice();
+        self.wait_matching(LOAD_DEADLINE, &notice, WaitExpect::Load(request_id))
+            .and_then(|hit| match hit {
+                Waited::Loaded(sid) => Ok(sid),
+                Waited::Launched(_) => Err(notice),
+            })
+    }
+
+    fn wait_matching(
+        &self,
+        deadline: Duration,
+        timeout_message: &str,
+        expect: WaitExpect,
+    ) -> Result<Waited, String> {
+        let started = Instant::now();
+        let mut last_heard = Instant::now();
+        let mut last_ping = Instant::now();
+        self.set_read_timeout(READ_SLICE);
+        loop {
+            if started.elapsed() >= deadline || last_heard.elapsed() >= LINK_DEAD_AFTER {
+                return Err(timeout_message.to_string());
+            }
+            if last_ping.elapsed() >= PING_EVERY {
+                last_ping = Instant::now();
+                self.ping()?;
+            }
+            let msg = match self.mm.receive() {
+                Ok(msg) => msg,
+                Err(e) if cast_err_is_timeout(&e) => continue,
+                Err(e) => {
+                    return Err(if is_cast_timeout(&e.to_string()) {
+                        timeout_message.to_string()
+                    } else {
+                        link_down_message()
+                    });
+                }
+            };
+            last_heard = Instant::now();
+            if self.heartbeat.can_handle(&msg) {
+                if let Ok(HeartbeatResponse::Ping) = self.heartbeat.parse(&msg) {
+                    let _ = self.heartbeat.pong();
+                }
+                continue;
+            }
+            match expect {
+                WaitExpect::Launch(id) => {
+                    if !self.receiver.can_handle(&msg) {
+                        continue;
+                    }
+                    match self.receiver.parse(&msg) {
+                        Ok(ReceiverResponse::Status(status)) if status.request_id == id => {
+                            let app = status.applications.into_iter().next().ok_or_else(|| {
+                                "The TV opened a player with no session.".to_string()
+                            })?;
+                            return Ok(Waited::Launched(app));
+                        }
+                        Ok(ReceiverResponse::LaunchError(err)) if err.request_id == id => {
+                            let reason = err
+                                .reason
+                                .filter(|r| !r.trim().is_empty())
+                                .unwrap_or_else(|| "unknown".into());
+                            return Err(format!("The TV refused to open the player ({reason})."));
+                        }
+                        Ok(ReceiverResponse::InvalidRequest(err)) if err.request_id == id => {
+                            let reason = err.reason.unwrap_or_else(|| "invalid request".into());
+                            return Err(format!("The TV refused to open the player ({reason})."));
+                        }
+                        _ => continue,
+                    }
+                }
+                WaitExpect::Load(id) => {
+                    if !self.media.can_handle(&msg) {
+                        continue;
+                    }
+                    match self.media.parse(&msg) {
+                        Ok(MediaResponse::Status(status)) if status.request_id == id => {
+                            let sid = status
+                                .entries
+                                .first()
+                                .map(|e| e.media_session_id)
+                                .ok_or_else(media_load_notice)?;
+                            return Ok(Waited::Loaded(sid));
+                        }
+                        Ok(MediaResponse::LoadFailed(err)) if err.request_id == id => {
+                            return Err(LOAD_REFUSED_MESSAGE.to_string());
+                        }
+                        Ok(MediaResponse::LoadCancelled(err)) if err.request_id == id => {
+                            return Err("The TV cancelled this slide.".to_string());
+                        }
+                        Ok(MediaResponse::InvalidRequest(err)) if err.request_id == id => {
+                            let _ = err;
+                            return Err(LOAD_REFUSED_MESSAGE.to_string());
+                        }
+                        Ok(MediaResponse::InvalidPlayerState(err)) if err.request_id == id => {
+                            let _ = err;
+                            return Err(LOAD_REFUSED_MESSAGE.to_string());
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
     }
 
     fn pause(&self, sid: i32) -> Result<PlayerState, String> {
@@ -1685,10 +1823,14 @@ impl CastLink {
         }
     }
 
-    fn pump(&self) -> Result<Option<PlayerState>, String> {
+    /// `Ok(None)` is a quiet slice. `Ok(Some(_))` means the TV sent something,
+    /// including a PONG, so the silence clock resets.
+    fn pump(&self) -> Result<Option<PumpUpdate>, String> {
         self.set_read_timeout(READ_IDLE);
         match self.mm.receive() {
-            Ok(msg) => Ok(self.apply_message(&msg)),
+            Ok(msg) => Ok(Some(PumpUpdate {
+                player: self.apply_message(&msg),
+            })),
             Err(e) if cast_err_is_timeout(&e) => Ok(None),
             Err(_) => Err(link_down_message()),
         }
@@ -1717,6 +1859,158 @@ impl CastLink {
     }
 }
 
+enum WaitExpect {
+    Launch(u32),
+    Load(u32),
+}
+
+#[derive(Debug)]
+enum Waited {
+    Launched(Application),
+    Loaded(i32),
+}
+
+struct PumpUpdate {
+    player: Option<PlayerState>,
+}
+
+fn launch_payload(request_id: u32) -> String {
+    serde_json::json!({
+        "type": "LAUNCH",
+        "requestId": request_id,
+        "appId": "CC1AD845",
+    })
+    .to_string()
+}
+
+fn load_payload(request_id: u32, session_id: &str, url: &str, content_type: &str, autoplay: bool) -> String {
+    serde_json::json!({
+        "requestId": request_id,
+        "sessionId": session_id,
+        "type": "LOAD",
+        "media": {
+            "contentId": url,
+            "streamType": "BUFFERED",
+            "contentType": content_type,
+        },
+        "currentTime": 0.0,
+        "autoplay": autoplay,
+        "customData": {},
+    })
+    .to_string()
+}
+
+/// Host and port only. The path carries the media token and must not be logged.
+fn media_url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.contains('@') || host.contains('\\') {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn map_launch_failure(err: &str) -> String {
+    if is_cast_timeout(err) {
+        LAUNCH_TIMEOUT_MESSAGE.to_string()
+    } else {
+        err.to_string()
+    }
+}
+
+thread_local! {
+    static CAST_LOG_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+static CAST_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn cast_log_path() -> PathBuf {
+    cast_log_dir().join("cast.log")
+}
+
+fn cast_log_dir() -> PathBuf {
+    if let Some(dir) = CAST_LOG_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return dir;
+    }
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(local) => PathBuf::from(local)
+            .join("com.johnalindogan.slideshowpro")
+            .join("logs"),
+        None => std::env::temp_dir()
+            .join("com.johnalindogan.slideshowpro")
+            .join("logs"),
+    }
+}
+
+fn cast_log_path_in(local_app_data: &Path) -> PathBuf {
+    local_app_data
+        .join("com.johnalindogan.slideshowpro")
+        .join("logs")
+        .join("cast.log")
+}
+
+fn cast_log(step: &str, detail: &str) {
+    let _guard = CAST_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let safe = sanitize_cast_log_detail(detail);
+    let line = format!("{} {step} {safe}", unix_to_utc(unix_now_secs()));
+    let dir = cast_log_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("cast.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len().saturating_add(line.len() as u64 + 1) > CAST_LOG_MAX {
+            let previous = dir.join("cast.log.1");
+            let _ = std::fs::remove_file(&previous);
+            let _ = std::fs::rename(&path, &previous);
+        }
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+    }
+    eprintln!("[cast] {step} {safe}");
+}
+
+fn sanitize_cast_log_detail(detail: &str) -> String {
+    let flat: String = detail
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(180)
+        .collect();
+    if flat.contains('\\') || flat.contains('/') || flat.contains("/m/") {
+        return "redacted".to_string();
+    }
+    flat
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn unix_to_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    let second = tod % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 fn map_load_error(err: &str) -> String {
     let l = err.to_ascii_lowercase();
     if l.contains("fail") || l.contains("invalid") || l.contains("not supported") {
@@ -1733,18 +2027,20 @@ fn cast_err_is_timeout(err: &rust_cast::errors::Error) -> bool {
     match err {
         rust_cast::errors::Error::Io(io) => {
             matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+                || is_cast_timeout(&io.to_string())
         }
         rust_cast::errors::Error::Timeout(_) => true,
-        _ => {
-            let l = err.to_string().to_ascii_lowercase();
-            l.contains("timed out") || l.contains("would block") || l.contains("timeout")
-        }
+        _ => is_cast_timeout(&err.to_string()),
     }
 }
 
 fn is_cast_timeout(err: &str) -> bool {
     let l = err.to_ascii_lowercase();
-    l.contains("timed out") || l.contains("would block") || l.contains("timeout")
+    l.contains("timed out")
+        || l.contains("would block")
+        || l.contains("timeout")
+        || l.contains("10060")
+        || l.contains("semaphore timeout")
 }
 
 fn link_down_message() -> String {
@@ -1865,7 +2161,7 @@ impl CastState {
             })
             .map_err(|e| format!("cast thread: {e}"))?;
 
-        let info = match ready_rx.recv_timeout(Duration::from_secs(8)) {
+        let info = match ready_rx.recv_timeout(SESSION_READY_WAIT) {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
                 let _ = worker.join();
@@ -2107,7 +2403,7 @@ fn run_session(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        if last_ping.elapsed() >= Duration::from_secs(2) {
+        if last_ping.elapsed() >= PING_EVERY {
             last_ping = Instant::now();
             if link.ping().is_err() {
                 flags.connected = false;
@@ -2122,15 +2418,17 @@ fn run_session(
         }
 
         match link.pump() {
-            Ok(Some(state)) => {
+            Ok(Some(update)) => {
                 flags.last_rx = Instant::now();
-                flags.note_state(state, false);
-                let name = flags.player_state.clone();
-                publish(&status, |s| {
-                    s.player_state = name;
-                    s.connected = true;
-                    s.error = None;
-                });
+                if let Some(state) = update.player {
+                    flags.note_state(state, false);
+                    let name = flags.player_state.clone();
+                    publish(&status, |s| {
+                        s.player_state = name;
+                        s.connected = true;
+                        s.error = None;
+                    });
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -3282,5 +3580,511 @@ mod tests {
             .map(|i| buf[i + 4..].to_vec())
             .unwrap_or_default();
         (status, body)
+    }
+
+    const NS_HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
+
+    #[derive(Clone, Copy)]
+    struct FakeScript {
+        launch_error: Option<&'static str>,
+        load_failed: bool,
+    }
+
+    struct FakeTv {
+        addr: SocketAddr,
+        stop: Arc<AtomicBool>,
+        traces: Arc<Mutex<Vec<String>>>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl FakeTv {
+        fn host_port(&self) -> (Ipv4Addr, u16) {
+            match self.addr.ip() {
+                IpAddr::V4(ip) => (ip, self.addr.port()),
+                _ => (Ipv4Addr::LOCALHOST, self.addr.port()),
+            }
+        }
+
+        fn trace_text(&self) -> String {
+            self.traces.lock().unwrap_or_else(|e| e.into_inner()).join("\n")
+        }
+    }
+
+    impl Drop for FakeTv {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(300));
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    struct LogDir(PathBuf);
+
+    impl LogDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("slidex-cast-log-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            CAST_LOG_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(dir.clone()));
+            Self(dir)
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(self.0.join("cast.log")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for LogDir {
+        fn drop(&mut self) {
+            CAST_LOG_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn note_trace(traces: &Mutex<Vec<String>>, line: &str) {
+        if let Ok(mut guard) = traces.lock() {
+            guard.push(line.to_string());
+        }
+    }
+
+    fn fake_server_config() -> Arc<rustls::ServerConfig> {
+        let _ = default_provider().install_default();
+        let cert = CertificateDer::from(include_bytes!("cast-fake/cert.der").to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(include_bytes!("cast-fake/key.der").to_vec()),
+        );
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("fake cast certificate"),
+        )
+    }
+
+    fn fake_send<S: Read + Write>(mm: &MessageManager<S>, namespace: &str, source: &str, payload: &str) {
+        let _ = mm.send(CastMessage {
+            namespace: namespace.to_string(),
+            source: source.to_string(),
+            destination: "sender-0".to_string(),
+            payload: CastMessagePayload::String(payload.to_string()),
+        });
+    }
+
+    fn send_receiver_status<S: Read + Write>(mm: &MessageManager<S>, request_id: u32, traces: &Mutex<Vec<String>>) {
+        let decoy = serde_json::json!({
+            "requestId": 999,
+            "type": "RECEIVER_STATUS",
+            "status": {
+                "applications": [{
+                    "appId": "CC1AD845",
+                    "sessionId": "session-wrong",
+                    "transportId": "wrong-transport",
+                    "namespaces": [{"name": NS_MEDIA}],
+                    "displayName": "Wrong",
+                    "statusText": "ignore"
+                }],
+                "volume": {"level": 1.0, "muted": false}
+            }
+        });
+        fake_send(mm, NS_RECEIVER, "receiver-0", &decoy.to_string());
+        let real = serde_json::json!({
+            "requestId": request_id,
+            "type": "RECEIVER_STATUS",
+            "status": {
+                "applications": [{
+                    "appId": "CC1AD845",
+                    "sessionId": "session-1",
+                    "transportId": "transport-1",
+                    "namespaces": [{"name": NS_MEDIA}],
+                    "displayName": "Default Media Receiver",
+                    "statusText": "SlideX"
+                }],
+                "isActiveInput": true,
+                "isStandBy": false,
+                "volume": {"level": 1.0, "muted": false}
+            }
+        });
+        fake_send(mm, NS_RECEIVER, "receiver-0", &real.to_string());
+        note_trace(traces, "receiver-status");
+    }
+
+    fn send_media_status<S: Read + Write>(mm: &MessageManager<S>, request_id: u32, session: i32) {
+        let body = serde_json::json!({
+            "requestId": request_id,
+            "type": "MEDIA_STATUS",
+            "status": [{
+                "mediaSessionId": session,
+                "playbackRate": 1.0,
+                "playerState": "PLAYING",
+                "currentTime": 0.0,
+                "supportedMediaCommands": 15
+            }]
+        });
+        fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
+    }
+
+    fn fake_session<S: Read + Write>(
+        mm: &MessageManager<S>,
+        script: FakeScript,
+        traces: &Mutex<Vec<String>>,
+        stop: &AtomicBool,
+    ) {
+        let mut receiver_up = false;
+        let mut transport_up = false;
+        let mut awaiting_pong = false;
+        let mut launch_id = 0u32;
+        while !stop.load(Ordering::SeqCst) {
+            let msg = match mm.receive() {
+                Ok(msg) => msg,
+                Err(e) if cast_err_is_timeout(&e) => continue,
+                Err(_) => break,
+            };
+            let payload = match &msg.payload {
+                CastMessagePayload::String(text) => text.clone(),
+                _ => continue,
+            };
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap_or(serde_json::json!({}));
+            let typ = value.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+            if !receiver_up {
+                if typ == "CONNECT" && msg.destination == "receiver-0" {
+                    receiver_up = true;
+                    note_trace(traces, "connect-receiver");
+                } else {
+                    note_trace(traces, &format!("refused-before-connect {typ} {}", msg.destination));
+                }
+                continue;
+            }
+            if typ == "PING" {
+                note_trace(traces, "ping");
+                fake_send(mm, NS_HEARTBEAT, "receiver-0", r#"{"type":"PONG"}"#);
+                note_trace(traces, "pong-sent");
+                continue;
+            }
+            if typ == "PONG" {
+                note_trace(traces, "client-pong");
+                if awaiting_pong {
+                    awaiting_pong = false;
+                    send_receiver_status(mm, launch_id, traces);
+                }
+                continue;
+            }
+            if typ == "CONNECT" && msg.destination == "transport-1" {
+                transport_up = true;
+                note_trace(traces, "connect-transport");
+                continue;
+            }
+            if typ == "LAUNCH" {
+                let id = value.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                note_trace(traces, &format!("launch {id}"));
+                if let Some(reason) = script.launch_error {
+                    let body = serde_json::json!({
+                        "requestId": id,
+                        "type": "LAUNCH_ERROR",
+                        "reason": reason,
+                    });
+                    fake_send(mm, NS_RECEIVER, "receiver-0", &body.to_string());
+                    note_trace(traces, "launch-error");
+                    continue;
+                }
+                launch_id = id;
+                awaiting_pong = true;
+                fake_send(mm, NS_HEARTBEAT, "receiver-0", r#"{"type":"PING"}"#);
+                note_trace(traces, "launch-ping");
+                continue;
+            }
+            if typ == "LOAD" {
+                let id = value.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let dest = msg.destination.clone();
+                if dest == "receiver-0" || !transport_up || dest != "transport-1" {
+                    note_trace(traces, &format!("load-refused {dest}"));
+                    continue;
+                }
+                note_trace(traces, &format!("load {dest}"));
+                if script.load_failed {
+                    let body = serde_json::json!({
+                        "requestId": id,
+                        "type": "LOAD_FAILED",
+                    });
+                    fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
+                    note_trace(traces, "load-failed");
+                    continue;
+                }
+                send_media_status(mm, 999, 1);
+                send_media_status(mm, id, 7);
+                note_trace(traces, "media-status");
+            }
+        }
+    }
+
+    fn spawn_fake(script: FakeScript) -> FakeTv {
+        let _ = default_provider().install_default();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let traces = Arc::new(Mutex::new(Vec::new()));
+        let stop_t = Arc::clone(&stop);
+        let traces_t = Arc::clone(&traces);
+        let config = fake_server_config();
+        let join = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((tcp, _)) => {
+                        tcp.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                        tcp.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                        tcp.set_nodelay(true).ok();
+                        let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&config)) else {
+                            note_trace(&traces_t, "tls-config");
+                            continue;
+                        };
+                        let stream = StreamOwned::new(conn, tcp);
+                        let mm = MessageManager::new(stream);
+                        fake_session(&mm, script, traces_t.as_ref(), &stop_t);
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(15));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        FakeTv {
+            addr,
+            stop,
+            traces,
+            join: Some(join),
+        }
+    }
+
+    #[test]
+    fn heartbeat_deadlines_and_launch_timeout_sentence() {
+        assert_eq!(PING_EVERY, Duration::from_secs(5));
+        assert_eq!(LINK_DEAD_AFTER, Duration::from_secs(15));
+        assert_eq!(LAUNCH_DEADLINE, Duration::from_secs(15));
+        assert_eq!(LOAD_DEADLINE, Duration::from_secs(15));
+        assert!(SESSION_READY_WAIT > LAUNCH_DEADLINE);
+        assert_eq!(
+            map_launch_failure(
+                "A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (os error 10060)"
+            ),
+            LAUNCH_TIMEOUT_MESSAGE
+        );
+        let refused = "The TV refused to open the player (NOT_FOUND).";
+        assert_eq!(map_launch_failure(refused), refused);
+        assert_eq!(unix_to_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix_to_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            media_url_host("http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/1").as_deref(),
+            Some("192.168.1.52:47200")
+        );
+    }
+
+    #[test]
+    fn cast_log_is_under_localappdata_names_the_lan_host_and_stays_under_one_megabyte() {
+        let base = Path::new(r"C:\Users\qa\AppData\Local");
+        let path = cast_log_path_in(base);
+        assert_eq!(
+            path.strip_prefix(base).unwrap(),
+            Path::new("com.johnalindogan.slideshowpro")
+                .join("logs")
+                .join("cast.log")
+        );
+        assert!(path.ends_with("cast.log"));
+        let dir = LogDir::new();
+        let token = "0123456789abcdef0123456789abcdef";
+        let host = media_url_host(&format!("http://192.168.1.52:47200/m/{token}/1")).unwrap();
+        cast_log("load", &host);
+        cast_log("load", &format!("http://192.168.1.52:47200/m/{token}/1"));
+        cast_log("load", r"D:\Photos\vacation.jpg");
+        let text = dir.text();
+        assert!(text.contains("load 192.168.1.52:47200"), "{text}");
+        assert!(!text.contains(token), "{text}");
+        assert!(!text.contains("vacation"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(dir.0.join("cast.log"))
+                .unwrap();
+            file.write_all(&vec![b'x'; CAST_LOG_MAX as usize]).unwrap();
+        }
+        cast_log("connect", "127.0.0.1:8009");
+        let current = std::fs::metadata(dir.0.join("cast.log")).unwrap().len();
+        let rotated = std::fs::metadata(dir.0.join("cast.log.1")).unwrap().len();
+        assert!(current < CAST_LOG_MAX, "cast.log is {current} bytes");
+        assert_eq!(rotated, CAST_LOG_MAX);
+        let fresh = dir.text();
+        assert!(fresh.contains("127.0.0.1:8009"), "{fresh}");
+        assert!(!fresh.contains(&"x".repeat(80)), "{fresh}");
+    }
+
+    #[test]
+    fn fake_tv_refuses_anything_sent_before_connect() {
+        let fake = spawn_fake(FakeScript {
+            launch_error: None,
+            load_failed: false,
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::open_tls(ip, port).unwrap();
+        let id = link.mm.generate_request_id().get();
+        link.send_json(NS_RECEIVER, "receiver-0", &launch_payload(id))
+            .unwrap();
+        let err = link
+            .wait_matching(
+                Duration::from_millis(700),
+                "no-reply-before-connect",
+                WaitExpect::Launch(id),
+            )
+            .unwrap_err();
+        assert_eq!(err, "no-reply-before-connect");
+        link.ping().unwrap();
+        assert!(
+            link.pump().unwrap().is_none(),
+            "PING before CONNECT must get no PONG"
+        );
+        link.connection.connect("receiver-0").unwrap();
+        link.launch_receiver().unwrap();
+        assert_eq!(link.transport_id, "transport-1");
+        let text = fake.trace_text();
+        let refused_launch = text.find("refused-before-connect LAUNCH").expect(&text);
+        let refused_ping = text.find("refused-before-connect PING").expect(&text);
+        let connected = text.find("connect-receiver").expect(&text);
+        assert!(refused_launch < connected, "{text}");
+        assert!(refused_ping < connected, "{text}");
+        let pong = text.find("client-pong").expect(&text);
+        let status = text.find("receiver-status").expect(&text);
+        assert!(pong < status, "{text}");
+    }
+
+    #[test]
+    fn cast_link_connects_before_launch_and_loads_the_transport() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            launch_error: None,
+            load_failed: false,
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        assert_eq!(link.transport_id, "transport-1");
+        assert_eq!(link.session_id, "session-1");
+        let token = "0123456789abcdef0123456789abcdef";
+        let url = format!("http://192.168.1.52:47200/m/{token}/1");
+        let sid = link.load_url(&url, "image/jpeg", true).unwrap();
+        assert_eq!(sid, 7);
+        let text = fake.trace_text();
+        assert!(!text.contains("refused-before-connect"), "{text}");
+        let connect_at = text.find("connect-receiver").expect(&text);
+        let launch_at = text.find("launch ").expect(&text);
+        assert!(connect_at < launch_at, "{text}");
+        let pong = text.find("client-pong").expect(&text);
+        let status = text.find("receiver-status").expect(&text);
+        assert!(pong < status, "{text}");
+        assert!(text.contains("connect-transport"), "{text}");
+        assert!(text.contains("load transport-1"), "{text}");
+        assert!(!text.contains("load-refused"), "{text}");
+        let written = log.text();
+        assert!(written.contains("receiver-connect receiver-0"), "{written}");
+        assert!(written.contains("load 192.168.1.52:47200"), "{written}");
+        assert!(!written.contains(token), "{written}");
+        assert!(!written.contains("vacation"), "{written}");
+        link.ping().unwrap();
+        match link.pump().unwrap() {
+            Some(update) => assert!(update.player.is_none()),
+            None => panic!("a PONG from the TV must count as the TV speaking"),
+        }
+    }
+
+    #[test]
+    fn fake_tv_refuses_load_addressed_to_receiver_0() {
+        let fake = spawn_fake(FakeScript {
+            launch_error: None,
+            load_failed: false,
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let id = link.mm.generate_request_id().get();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/2";
+        link.send_json(
+            NS_MEDIA,
+            "receiver-0",
+            &load_payload(id, &link.session_id, url, "image/jpeg", true),
+        )
+        .unwrap();
+        let err = link
+            .wait_matching(
+                Duration::from_millis(800),
+                "load-to-receiver-0-unanswered",
+                WaitExpect::Load(id),
+            )
+            .unwrap_err();
+        assert_eq!(err, "load-to-receiver-0-unanswered");
+        assert!(
+            fake.trace_text().contains("load-refused receiver-0"),
+            "{}",
+            fake.trace_text()
+        );
+        let sid = link.load_url(url, "image/jpeg", true).unwrap();
+        assert_eq!(sid, 7);
+        assert!(
+            fake.trace_text().contains("load transport-1"),
+            "{}",
+            fake.trace_text()
+        );
+    }
+
+    #[test]
+    fn launch_error_is_not_reported_as_a_timeout() {
+        let fake = spawn_fake(FakeScript {
+            launch_error: Some("NOT_FOUND"),
+            load_failed: false,
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        let started = Instant::now();
+        let err = link.launch_receiver().unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "LAUNCH_ERROR took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err, "The TV refused to open the player (NOT_FOUND).");
+        assert_ne!(err, LAUNCH_TIMEOUT_MESSAGE);
+        assert!(!err.to_ascii_lowercase().contains("timed out"));
+        assert!(!err.contains("didn't answer"));
+        assert!(fake.trace_text().contains("launch-error"), "{}", fake.trace_text());
+    }
+
+    #[test]
+    fn load_failed_is_not_reported_as_a_timeout() {
+        let fake = spawn_fake(FakeScript {
+            launch_error: None,
+            load_failed: true,
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let started = Instant::now();
+        let err = link
+            .load_url(
+                "http://192.168.1.52:47201/m/tokentokentokentokentokentoken/3",
+                "image/jpeg",
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "LOAD_FAILED took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err, LOAD_REFUSED_MESSAGE);
+        assert_ne!(err, UNSUPPORTED_MEDIA);
+        assert!(!err.contains("15 seconds"));
+        assert!(!err.to_ascii_lowercase().contains("timed out"));
+        assert!(!err.contains("didn't answer"));
+        assert!(fake.trace_text().contains("load-failed"), "{}", fake.trace_text());
     }
 }

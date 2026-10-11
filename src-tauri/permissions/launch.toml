@@ -144,6 +144,11 @@ description = "Allow reading whether the Private Cast firewall rules are install
 commands.allow = ["cast_firewall_status"]
 
 [[permission]]
+identifier = "allow-cast-log-path"
+description = "Allow copying the path of the size-capped Cast log"
+commands.allow = ["cast_log_path"]
+
+[[permission]]
 identifier = "allow-slidex-save-done"
 description = "Allow the page to ack a save before the window exits"
 commands.allow = ["slidex_save_done"]

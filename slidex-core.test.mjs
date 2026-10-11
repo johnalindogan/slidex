@@ -901,3 +901,15 @@ test('HTML and JS have no bare confirm() and the four prompts await a dialog', (
   assert.match(html, /async function restoreTauriSession/);
   assert.match(html, /toggleTimer/);
 });
+
+test('the Cast panel can copy the Cast log path', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /id="castLog"/);
+  assert.match(html, /Copy Cast log path/);
+  assert.match(html, /cast_log_path/);
+  const caps = fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8');
+  assert.match(caps, /allow-cast-log-path/);
+  const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  assert.match(perms, /allow-cast-log-path/);
+  assert.match(perms, /cast_log_path/);
+});
