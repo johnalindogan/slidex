@@ -1801,16 +1801,20 @@ impl CastLink {
     fn open_tls(host: Ipv4Addr, port: u16) -> Result<Self, String> {
         cast_log("connect", &format!("{host}:{port}"));
         let addr = SocketAddr::from((host, port));
-        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
+        let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
             format!(
                 "TV unreachable at {host}. It may be off, or this PC and the TV are not on the same Wi-Fi."
             )
         })?;
         tcp.set_nodelay(true).ok();
-        // Blocking only for the TLS handshake. Cleared in `arm_idle` before any
-        // read loop — a Windows read timeout must not be left on this socket.
-        tcp.set_read_timeout(Some(Duration::from_secs(4))).ok();
-        tcp.set_write_timeout(Some(Duration::from_secs(4))).ok();
+        // No SO_RCVTIMEO. On Windows a read timeout is TimedOut (10060), rustls
+        // treats only WouldBlock as idle, and the socket is left undefined.
+        // Non-blocking has to be set on this handle: a later clone does not
+        // inherit it. The handshake retries WouldBlock until its own deadline.
+        tcp.set_read_timeout(None).ok();
+        tcp.set_write_timeout(None).ok();
+        tcp.set_nonblocking(true)
+            .map_err(|e| format!("cast socket: {e}"))?;
         let tcp_ctl = tcp.try_clone().map_err(|e| format!("cast socket: {e}"))?;
 
         let _ = default_provider().install_default();
@@ -1821,9 +1825,10 @@ impl CastLink {
         let name = ServerName::try_from(host.to_string().as_str())
             .map_err(|_| "TV address is not a valid cast host.".to_string())?
             .to_owned();
-        let conn = ClientConnection::new(Arc::new(config), name)
+        let mut conn = ClientConnection::new(Arc::new(config), name)
             .map_err(|e| format!("cast tls: {e}"))?;
-        let pace = Arc::new(Mutex::new(Duration::from_secs(4)));
+        drive_tls(&mut conn, &mut tcp)?;
+        let pace = Arc::new(Mutex::new(READ_SLICE));
         let stream = CastPlain::new(StreamOwned::new(conn, IdleSocket { inner: tcp }), Arc::clone(&pace));
         let mm = Rc::new(MessageManager::new(stream));
         let heartbeat = HeartbeatChannel::new("sender-0", "receiver-0", Rc::clone(&mm));
@@ -1863,6 +1868,9 @@ impl CastLink {
     }
 
     fn arm_idle(&self) {
+        // The read handle was set in `open_tls`. Repeat on the clone so a
+        // shared socket option cannot put SO_RCVTIMEO back. Non-blocking mode
+        // itself is per handle on Windows and is not inherited by this clone.
         self.tcp.set_read_timeout(None).ok();
         self.tcp.set_write_timeout(None).ok();
         self.tcp.set_nonblocking(true).ok();
@@ -1911,26 +1919,32 @@ impl CastLink {
 
     /// CONNECT receiver-0, then LAUNCH, then wait for that requestId.
     fn wait_launch(&self, request_id: u32) -> Result<Application, String> {
-        self.wait_matching(LAUNCH_DEADLINE, LAUNCH_TIMEOUT_MESSAGE, WaitExpect::Launch(request_id))
-            .and_then(|hit| match hit {
-                Waited::Launched(app) => Ok(app),
-                Waited::Loaded(_) => Err(LAUNCH_TIMEOUT_MESSAGE.to_string()),
-            })
+        self.wait_matching(
+            LAUNCH_DEADLINE,
+            WaitMsg::Text(LAUNCH_TIMEOUT_MESSAGE),
+            WaitExpect::Launch(request_id),
+        )
+        .and_then(|hit| match hit {
+            Waited::Launched(app) => Ok(app),
+            Waited::Loaded(_) => Err(LAUNCH_TIMEOUT_MESSAGE.to_string()),
+        })
     }
 
     fn wait_load(&self, request_id: u32) -> Result<i32, String> {
-        let notice = media_load_notice();
-        self.wait_matching(LOAD_DEADLINE, &notice, WaitExpect::Load(request_id))
+        // The timeout sentence asks Windows for the network category. Do that
+        // only after the wait gives up — a LOAD_FAILED must not sit behind
+        // PowerShell, and the read loop has to be running while the TV answers.
+        self.wait_matching(LOAD_DEADLINE, WaitMsg::LoadNotice, WaitExpect::Load(request_id))
             .and_then(|hit| match hit {
                 Waited::Loaded(sid) => Ok(sid),
-                Waited::Launched(_) => Err(notice),
+                Waited::Launched(_) => Err(media_load_notice()),
             })
     }
 
     fn wait_matching(
         &self,
         deadline: Duration,
-        timeout_message: &str,
+        timeout_message: WaitMsg<'_>,
         expect: WaitExpect,
     ) -> Result<Waited, String> {
         let started = Instant::now();
@@ -1947,7 +1961,7 @@ impl CastLink {
                 Ok(msg) => msg,
                 Err(e) if cast_err_is_timeout(&e) => {
                     if slice.is_zero() {
-                        return Err(timeout_message.to_string());
+                        return Err(timeout_message.resolve());
                     }
                     if last_ping.elapsed() >= PING_EVERY {
                         last_ping = Instant::now();
@@ -1957,7 +1971,7 @@ impl CastLink {
                 }
                 Err(e) => {
                     return Err(if is_cast_timeout(&e.to_string()) {
-                        timeout_message.to_string()
+                        timeout_message.resolve()
                     } else {
                         link_down_message()
                     });
@@ -2101,6 +2115,49 @@ impl CastLink {
 enum WaitExpect {
     Launch(u32),
     Load(u32),
+}
+
+/// Resolved only when a wait actually times out. `LoadNotice` shells out to
+/// PowerShell on Windows, which must not run before the read loop.
+enum WaitMsg<'a> {
+    Text(&'a str),
+    LoadNotice,
+}
+
+impl WaitMsg<'_> {
+    fn resolve(&self) -> String {
+        match self {
+            WaitMsg::Text(text) => (*text).to_string(),
+            WaitMsg::LoadNotice => media_load_notice(),
+        }
+    }
+}
+
+/// Finish TLS on a non-blocking socket. `complete_io` returns `WouldBlock`
+/// (or Windows `TimedOut`) while the peer has not answered yet.
+fn drive_tls(conn: &mut ClientConnection, tcp: &mut TcpStream) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while conn.is_handshaking() {
+        match conn.complete_io(tcp) {
+            Ok((0, 0)) => {
+                if Instant::now() >= deadline {
+                    return Err("Could not open a secure connection to the TV.".into());
+                }
+                thread::sleep(READ_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            Ok(_) => {}
+            Err(err) if io_is_idle(&err) => {
+                if Instant::now() >= deadline {
+                    return Err("Could not open a secure connection to the TV.".into());
+                }
+                thread::sleep(READ_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            Err(err) => {
+                return Err(format!("Could not open a secure connection to the TV ({err})."));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4183,7 +4240,7 @@ mod tests {
         let err = link
             .wait_matching(
                 Duration::from_millis(700),
-                "no-reply-before-connect",
+                WaitMsg::Text("no-reply-before-connect"),
                 WaitExpect::Launch(id),
             )
             .unwrap_err();
@@ -4266,7 +4323,7 @@ mod tests {
         let err = link
             .wait_matching(
                 Duration::from_millis(800),
-                "load-to-receiver-0-unanswered",
+                WaitMsg::Text("load-to-receiver-0-unanswered"),
                 WaitExpect::Load(id),
             )
             .unwrap_err();
