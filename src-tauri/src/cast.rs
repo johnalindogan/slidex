@@ -88,6 +88,12 @@ fn connect_fail(detail: String) -> String {
     detail
 }
 
+/// Connect failures use the same key=value shape as the other cast.log lines.
+/// The reason stays the sentence the panel shows. The host is an address, never a path.
+fn log_connect_error(reason: &str, host: Ipv4Addr) {
+    cast_log("error", &format!("reason=\"{reason}\" host={host}"));
+}
+
 /// One Disconnect, one line, including when the session and the caller both try.
 fn log_disconnect_once(flag: &AtomicBool, detail: &str) {
     if flag
@@ -2108,9 +2114,11 @@ impl CastLink {
         cast_log("connect", &format!("{host}:{port}"));
         let addr = SocketAddr::from((host, port));
         let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
-            connect_fail(format!(
+            let reason = format!(
                 "TV unreachable at {host}. It may be off, or this PC and the TV are not on the same Wi-Fi."
-            ))
+            );
+            log_connect_error(&reason, host);
+            reason
         })?;
         tcp.set_nodelay(true).ok();
         // No SO_RCVTIMEO. On Windows a read timeout is TimedOut (10060), rustls
@@ -3055,7 +3063,8 @@ impl CastState {
         let bind = choose_bind_for_device(&snap.preferred, ip)
             .cloned()
             .ok_or_else(|| NO_HOME_LAN_MESSAGE.to_string())?;
-        self.disconnect()?;
+        // Replacing a session that was never opened is not a user Disconnect.
+        self.disconnect_session(false)?;
 
         let device_name = name.unwrap_or_else(|| "Chromecast".into());
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -3101,7 +3110,7 @@ impl CastState {
                 });
                 let _ = worker.join();
                 let reason = with_public_network(link_down_message());
-                cast_log("error", &reason);
+                log_connect_error(&reason, ip);
                 return Err(reason);
             }
         };
@@ -3181,12 +3190,20 @@ impl CastState {
     }
 
     pub fn disconnect(&self) -> Result<(), String> {
+        self.disconnect_session(true)
+    }
+
+    /// `log_if_absent` is true for a user Disconnect, including a dead link.
+    /// Cast slideshow passes false so clearing an empty session writes nothing.
+    fn disconnect_session(&self, log_if_absent: bool) -> Result<(), String> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| "cast state lock".to_string())?;
         let Some(mut live) = guard.take() else {
-            cast_log("disconnect", "source=user error=not connected");
+            if log_if_absent {
+                cast_log("disconnect", "source=user error=not connected");
+            }
             return Ok(());
         };
         // Cancel before the Disconnect command so a queued slideshow LOAD is dropped.
@@ -5729,9 +5746,41 @@ mod tests {
         let lines: Vec<_> = written.lines().filter(|l| l.contains(" error ")).collect();
         assert_eq!(lines.len(), 1, "{written}");
         assert!(lines[0].contains("TV unreachable"), "{written}");
+        assert!(lines[0].contains("reason=\"TV unreachable"), "{written}");
+        assert!(lines[0].contains("host=127.0.0.1"), "{written}");
         assert!(!written.contains('\\'), "{written}");
         assert!(!written.contains('/'), "{written}");
         assert!(!written.contains("redacted"), "{written}");
+    }
+
+    #[test]
+    fn starting_a_cast_with_no_prior_session_writes_no_disconnect_line() {
+        let log = LogDir::new();
+        let snap = snapshot_ifaces();
+        let iface = snap
+            .bind
+            .clone()
+            .or_else(|| snap.preferred.first().cloned())
+            .expect("a home-LAN address is required to start a cast");
+        let state = CastState::default();
+        let err = state
+            .connect(&iface.ip.to_string(), Some(1), None)
+            .expect_err("port 1 is not a cast receiver");
+        assert_ne!(err, NO_HOME_LAN_MESSAGE, "{err}");
+        let written = log.text();
+        assert!(
+            !written.contains(" disconnect "),
+            "clearing an empty session must not log disconnect: {written}"
+        );
+        state.disconnect().unwrap();
+        let written = log.text();
+        let lines: Vec<_> = written
+            .lines()
+            .filter(|l| l.contains(" disconnect "))
+            .collect();
+        assert_eq!(lines.len(), 1, "{written}");
+        assert!(lines[0].contains("source=user"), "{}", lines[0]);
+        assert!(lines[0].contains("error=not connected"), "{}", lines[0]);
     }
 
     #[test]
