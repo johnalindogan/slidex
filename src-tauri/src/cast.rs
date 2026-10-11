@@ -436,6 +436,9 @@ pub struct CastConnectInfo {
 pub struct PlaylistUpdate {
     pub registered: usize,
     pub skipped: Vec<String>,
+    /// 1-based index in the path list the page sent, for each file that was registered.
+    /// A skipped file keeps its slot, so later items stay aligned with the page's `cur`.
+    pub page_index: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1103,6 +1106,8 @@ struct AllowEntry {
     path: PathBuf,
     content_type: String,
     kind: String,
+    /// 1-based index in the path list the page sent.
+    page_index: u32,
 }
 
 struct AllowBook {
@@ -1182,7 +1187,9 @@ fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
     book.by_path.clear();
     book.order.clear();
     let mut skipped = Vec::new();
-    for path in paths {
+    let mut page_index = Vec::new();
+    for (idx, path) in paths.iter().enumerate() {
+        let page = (idx as u32).saturating_add(1);
         match classify_playlist_file(path) {
             Ok((ctype, kind)) => {
                 let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
@@ -1192,12 +1199,14 @@ fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
                 let key = new_token();
                 book.by_path.insert(canon.clone(), key.clone());
                 book.order.push(canon.clone());
+                page_index.push(page);
                 book.files.insert(
                     key,
                     AllowEntry {
                         path: canon,
                         content_type: ctype.to_string(),
                         kind,
+                        page_index: page,
                     },
                 );
             }
@@ -1207,6 +1216,7 @@ fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
     PlaylistUpdate {
         registered: book.files.len(),
         skipped,
+        page_index,
     }
 }
 
@@ -1326,52 +1336,52 @@ impl MediaHttp {
         Ok(lookup_playlist(&book, path)?.kind.clone())
     }
 
-    /// 1-based position in the playlist the page registered.
+    /// 1-based page index of `path` in the list the page sent.
     fn index_of(&self, path: &Path) -> Result<u32, String> {
         let book = self.book.lock().map_err(|_| "playlist lock".to_string())?;
-        let canon = path
-            .canonicalize()
-            .map_err(|_| "That slide is not in the current playlist.".to_string())?;
-        let pos = book
-            .order
-            .iter()
-            .position(|p| p == &canon)
-            .ok_or_else(|| "That slide is not in the current playlist.".to_string())?;
-        Ok((pos as u32) + 1)
+        Ok(lookup_playlist(&book, path)?.page_index)
     }
 
-    /// The slide after `item_index` (1-based), wrapping to item 1 at the end.
+    /// The next castable slide after `item_index` (a page index), wrapping to
+    /// the first. Skipped files keep their page slot, so the index does not compact.
     fn successor(&self, item_index: u32) -> Result<Successor, String> {
         let book = self.book.lock().map_err(|_| "playlist lock".to_string())?;
-        let len = book.order.len();
-        if len == 0 {
+        if book.order.is_empty() {
             return Err("empty playlist".into());
         }
-        if item_index == 0 || item_index as usize > len {
+        if item_index == 0 {
             return Err("current item unknown".into());
         }
-        let next = if item_index as usize == len {
-            1
-        } else {
-            item_index + 1
-        };
-        let path = book.order[(next as usize) - 1].clone();
-        let key = book
-            .by_path
-            .get(&path)
+        let mut ranked: Vec<(u32, String)> = Vec::new();
+        for path in &book.order {
+            let key = book
+                .by_path
+                .get(path)
+                .ok_or_else(|| "current item unknown".to_string())?;
+            let entry = book
+                .files
+                .get(key)
+                .ok_or_else(|| "current item unknown".to_string())?;
+            ranked.push((entry.page_index, key.clone()));
+        }
+        ranked.sort_by_key(|(page, _)| *page);
+        let next = ranked
+            .iter()
+            .find(|(page, _)| *page > item_index)
+            .or_else(|| ranked.first())
             .ok_or_else(|| "current item unknown".to_string())?;
         let entry = book
             .files
-            .get(key)
+            .get(&next.1)
             .ok_or_else(|| "current item unknown".to_string())?;
         let url = format!(
             "http://{}:{}/m/{}/{}",
-            self.bind_ip, self.port, book.token, key
+            self.bind_ip, self.port, book.token, next.1
         );
         Ok(Successor {
             url,
             content_type: entry.content_type.clone(),
-            item: next,
+            item: next.0,
             media_type: media_type_label(&entry.kind),
         })
     }
@@ -2828,6 +2838,15 @@ fn media_type_label(kind: &str) -> &'static str {
     }
 }
 
+/// `0` is not a page index. The log says `item=?` instead of inventing one.
+fn item_log_token(item: u32) -> String {
+    if item == 0 {
+        "?".to_string()
+    } else {
+        item.to_string()
+    }
+}
+
 fn load_log_detail(
     host: &str,
     request_id: u32,
@@ -2836,6 +2855,7 @@ fn load_log_detail(
     media_type: &str,
     tail: &str,
 ) -> String {
+    let item = item_log_token(item);
     format!("{host} requestId={request_id} source={source} item={item} type={media_type} {tail}")
 }
 
@@ -3083,7 +3103,7 @@ impl SessionFlags {
             return false;
         }
         self.failed_session = Some(session);
-        let item = if self.item_index == 0 { 1 } else { self.item_index };
+        let item = item_log_token(self.item_index);
         cast_log("load_failed", &format!("item={item} reason=ERROR"));
         let msg = format!(
             "The TV could not load item {item}. It may be blocked from reaching this PC."
@@ -3101,7 +3121,7 @@ impl SessionFlags {
             return;
         }
         self.ignored_photo = Some(session);
-        let item = if self.item_index == 0 { 1 } else { self.item_index };
+        let item = item_log_token(self.item_index);
         cast_log("photo_finished_ignored", &format!("item={item}"));
     }
 }
@@ -3146,7 +3166,7 @@ fn on_media_idle(
     let next = match next {
         Ok(next) => next,
         Err(why) => {
-            let item = if flags.item_index == 0 { 1 } else { flags.item_index };
+            let item = item_log_token(flags.item_index);
             cast_log("load_skipped", &format!("item={item} reason={why}"));
             return Ok(false);
         }
@@ -3180,16 +3200,23 @@ fn on_media_idle(
         Err(err) if err == CAST_CANCELLED => {
             cast_log(
                 "load_skipped",
-                &format!("item={} reason=cast stopped", next.item),
+                &format!("item={} reason=cast stopped", item_log_token(next.item)),
             );
             Err(err)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            if !err.contains("unreachable") {
+                flags.error = Some(err.clone());
+            }
+            Err(err)
+        }
     }
 }
 
 /// Slideshow timer for the photo now on the TV. A video, or a paused slideshow,
 /// does not step. No finished event: the page already moved.
+/// Test stand-in for the page timer. Production advances photos from `schedNext`.
+#[cfg(test)]
 fn on_photo_timer(
     link: &CastLink,
     flags: &mut SessionFlags,
@@ -3227,7 +3254,7 @@ fn on_photo_timer(
         Err(err) if err == CAST_CANCELLED => {
             cast_log(
                 "load_skipped",
-                &format!("item={} reason=cast stopped", next.item),
+                &format!("item={} reason=cast stopped", item_log_token(next.item)),
             );
             Err(err)
         }
@@ -3799,7 +3826,7 @@ fn handle_cmd(
                 }
                 let (url, ctype) = http.media_url(&path)?;
                 let kind = http.kind_of(&path)?;
-                let item = http.index_of(&path)?;
+                let item = http.index_of(&path).unwrap_or(0);
                 let play = if kind == "still" { true } else { autoplay };
                 let sid = link.load_url(&url, &ctype, play, origin, item, &kind)?;
                 flags.media_session = Some(sid);
@@ -6714,21 +6741,30 @@ mod tests {
     #[test]
     fn successor_is_the_next_playlist_item() {
         let first = scratch("one.jpg", &jpeg_bytes());
+        let skipped = scratch("skip.webp", b"RIFF");
         let second = scratch("two.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
         let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
-        http.set_playlist(&[first.clone(), second.clone()]).unwrap();
+        let update = http
+            .set_playlist(&[first.clone(), skipped.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(update.registered, 2);
+        assert_eq!(update.page_index, vec![1, 3]);
         assert_eq!(http.index_of(&first).unwrap(), 1);
-        assert_eq!(http.index_of(&second).unwrap(), 2);
+        assert_eq!(http.index_of(&second).unwrap(), 3);
+        assert!(http.index_of(&skipped).is_err());
         let next = http.successor(1).unwrap();
-        assert_eq!(next.item, 2);
+        assert_eq!(next.item, 3);
         assert_eq!(next.media_type, "video");
         assert!(next.url.starts_with(&format!("http://127.0.0.1:{}", http.port)));
-        let wrapped = http.successor(2).unwrap();
+        let wrapped = http.successor(3).unwrap();
         assert_eq!(wrapped.item, 1);
         assert_eq!(wrapped.media_type, "photo");
         match http.successor(0) {
             Err(err) => assert_eq!(err, "current item unknown"),
             Ok(_) => panic!("item 0 is not a playlist index"),
         }
+        let unknown = load_log_detail("192.168.1.52:47200", 2, "user", 0, "photo", "reply=7");
+        assert!(unknown.contains("item=?"), "{unknown}");
+        assert!(!unknown.contains('/') && !unknown.contains('\\'), "{unknown}");
     }
 }

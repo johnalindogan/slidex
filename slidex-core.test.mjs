@@ -925,15 +925,17 @@ test('a cast ignores local video events and tags the command source', () => {
   assert.match(sched, /if \(!playing \|\| isV\(cur\)\) return/);
   assert.match(html, /ev === "finished"/);
   assert.match(html, /else if \(ev === "finished" && sspCastPlaying\(\)\)/);
-  assert.match(html, /goTo\(nextMI\(\), 'remote'\)/);
+  assert.match(html, /loaded > 0 && loaded - 1 !== cur\) goTo\(loaded - 1, 'remote'\)/);
+  assert.doesNotMatch(html, /__sspCastMoved/);
   assert.match(html, /ev === "load_failed"/);
   const failed = html.slice(html.indexOf('ev === "load_failed"'), html.indexOf('ev === "paused"'));
   assert.doesNotMatch(failed, /goTo\(/);
   const finished = html.slice(html.indexOf('ev === "finished"'), html.indexOf('if (!field(st, "connected"))'));
   assert.match(finished, /sspCastPlaying\(\)/);
   assert.match(finished, /__sspCastEcho = true/);
-  assert.match(finished, /__sspCastMoved/);
-  assert.match(finished, /goTo\(nextMI\(\), 'remote'\)/);
+  assert.doesNotMatch(finished, /__sspCastMoved/);
+  assert.match(finished, /loaded - 1 !== cur/);
+  assert.match(finished, /goTo\(loaded - 1, 'remote'\)/);
   assert.match(finished, /item_index/);
   assert.match(html, /sspCastHook\('transport', window\.__sspCastEcho \? 'remote' : 'user'\)/);
   assert.match(html, /sspCastHook\('slide', source \|\| 'user'\)/);
@@ -945,4 +947,75 @@ test('a cast ignores local video events and tags the command source', () => {
   const disc = html.slice(html.indexOf('castDisconnect'), html.indexOf('setInterval(watchNetwork'));
   assert.match(disc, /stopLocalCast\(\)/);
   assert.match(disc, /cast_disconnect/);
+});
+
+test('a photo timer then a video FINISHED leaves cur on item 3', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const goToSrc = html.slice(html.indexOf('function goTo('), html.indexOf('function updPlayBtn'));
+  const finishedSrc = html.slice(
+    html.indexOf('else if (ev === "finished" && sspCastPlaying())'),
+    html.indexOf('if (!field(st, "connected"))')
+  );
+  const sandbox = {
+    console,
+    clearTimeout,
+    clearInterval,
+    setTimeout,
+    cancelAnimationFrame() {},
+    cur: 0,
+    playing: true,
+    tmr: null,
+    ptmr: null,
+    kbId: null,
+    compKbId: null,
+    kbManualHold: false,
+    transitionType: 'none',
+    sls: [],
+    stage: { classList: { remove() {} } },
+    getMediaItems() {
+      return [
+        { name: 'one.jpg', path: '/p/one.jpg' },
+        { name: 'two.mp4', path: '/p/two.mp4' },
+        { name: 'three.jpg', path: '/p/three.jpg' },
+      ];
+    },
+    isV(i) { return i === 1; },
+    remountStageWindow() {},
+    getSl() { return null; },
+    sspCastHook() {},
+    applySlideSettings() {},
+    scrollStripTo() {},
+    updStripActive() {},
+    g() { return { textContent: '' }; },
+    pauseVids() {},
+    showMaxCompanion() {},
+    staticT() {},
+    startKB() {},
+    startProg() {},
+    schedNext() {},
+    updPlCur() {},
+    scheduleStagePrune() {},
+    notifyPlaylistSync() {},
+    playCurVid() {},
+    startVProg() {},
+    window: { __sspCastActive: true },
+  };
+  vm.runInNewContext(`
+    function field(obj, name) {
+      if (!obj) return undefined;
+      if (obj[name] != null) return obj[name];
+      return undefined;
+    }
+    function sspCastPlaying() { return !!playing; }
+    ${goToSrc}
+    function applyFinished(st) {
+      var ev = field(st, "remote_event");
+      if (false) {}
+      ${finishedSrc}
+    }
+  `, sandbox);
+  sandbox.goTo(1, 'timer');
+  assert.equal(sandbox.cur, 1);
+  sandbox.applyFinished({ remote_event: 'finished', item_index: 3 });
+  assert.equal(sandbox.cur, 2);
 });
