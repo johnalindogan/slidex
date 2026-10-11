@@ -712,51 +712,76 @@ Section WebView2
  ${EndIf}
 SectionEnd
 
+; $R8 is a finished temp status. Replace cast-firewall.txt only after that write succeeds.
+; IfFileExists offsets: +1 is the next line. A missing temp file skips both writes.
+!macro CAST_FW_COMMIT
+ IfFileExists "$R8" +1 +3
+ Delete "$1"
+ Rename /REBOOTOK "$R8" "$1"
+!macroend
+
 Function CastFirewallInstall
  ; Rules are added by one elevated cmd.exe /c, or skipped when cast-fw-check.ps1 reports a match.
  ; The pre-check is unelevated. PowerShell is the System32 binary, never PATH.
+ ; A silent install (/S) never calls ExecShell runas. The live status file is replaced
+ ; only after the new text is fully written to cast-firewall.new.
  Delete "$INSTDIR\cast-firewall-add.cmd"
  Delete "$INSTDIR\cast-firewall.ok"
  Delete "$TEMP\slidex-cast-firewall-remove.cmd"
  Delete "$TEMP\slidex-cast-firewall-removed.txt"
  StrCpy $1 "$INSTDIR\cast-firewall.txt"
+ StrCpy $R8 "$INSTDIR\cast-firewall.new"
+ Delete "$R8"
  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\cast-fw-check.ps1" -ExePath "$INSTDIR\${MAINBINARYNAME}.exe" -MediaName "${CAST_FW_MEDIA_NAME}" -MdnsName "${CAST_FW_MDNS_NAME}" -TcpPorts "${CAST_FW_TCP}" -UdpPort "${CAST_FW_UDP}"'
  Pop $0
  Pop $R5
  ${StrLoc} $0 $R5 "status=match" ">"
  StrCmp $0 "" cast_fw_need_add
- FileOpen $2 "$1" w
+ FileOpen $2 "$R8" w
  FileWrite $2 "status=present$\r$\n"
  FileWrite $2 "program=$INSTDIR\${MAINBINARYNAME}.exe$\r$\n"
  FileWrite $2 "profile=private$\r$\n"
  FileWrite $2 "tcp=${CAST_FW_TCP}$\r$\n"
  FileWrite $2 "udp=${CAST_FW_UDP}$\r$\n"
  FileClose $2
+ !insertmacro CAST_FW_COMMIT
  DetailPrint "Cast firewall: both Private rules already match $INSTDIR\${MAINBINARYNAME}.exe. No Windows prompt."
  Return
 cast_fw_need_add:
- Delete "$1"
+ IfSilent +1 cast_fw_elevate
+ ${StrLoc} $0 $R5 "status=nomatch" ">"
+ StrCmp $0 "" cast_fw_install_end
+ FileOpen $2 "$R8" w
+ FileWrite $2 "status=skipped_silent$\r$\n"
+ FileClose $2
+ !insertmacro CAST_FW_COMMIT
+ DetailPrint "Cast firewall: silent install left the rules unchanged. No Windows prompt."
+ Goto cast_fw_install_end
+cast_fw_elevate:
  ; cmd /c strips only the first and last quote. Inner quotes are plain ", never \".
- StrCpy $R9 '/c $\"netsh advfirewall firewall delete rule name=$\"${CAST_FW_MEDIA_NAME}$\" >nul 2>&1 & netsh advfirewall firewall delete rule name=$\"${CAST_FW_MDNS_NAME}$\" >nul 2>&1 & (netsh advfirewall firewall add rule name=$\"${CAST_FW_MEDIA_NAME}$\" dir=in action=allow protocol=TCP localport=${CAST_FW_TCP} profile=private remoteip=localsubnet program=$\"$INSTDIR\${MAINBINARYNAME}.exe$\" enable=yes && netsh advfirewall firewall add rule name=$\"${CAST_FW_MDNS_NAME}$\" dir=in action=allow protocol=UDP localport=${CAST_FW_UDP} profile=private remoteip=localsubnet program=$\"$INSTDIR\${MAINBINARYNAME}.exe$\" enable=yes && (echo status=added>$\"$INSTDIR\cast-firewall.txt$\") || (echo status=failed>$\"$INSTDIR\cast-firewall.txt$\"))$\"'
+ ; The elevated command writes the temp file. This function renames it onto cast-firewall.txt.
+ StrCpy $R9 '/c $\"netsh advfirewall firewall delete rule name=$\"${CAST_FW_MEDIA_NAME}$\" >nul 2>&1 & netsh advfirewall firewall delete rule name=$\"${CAST_FW_MDNS_NAME}$\" >nul 2>&1 & (netsh advfirewall firewall add rule name=$\"${CAST_FW_MEDIA_NAME}$\" dir=in action=allow protocol=TCP localport=${CAST_FW_TCP} profile=private remoteip=localsubnet program=$\"$INSTDIR\${MAINBINARYNAME}.exe$\" enable=yes && netsh advfirewall firewall add rule name=$\"${CAST_FW_MDNS_NAME}$\" dir=in action=allow protocol=UDP localport=${CAST_FW_UDP} profile=private remoteip=localsubnet program=$\"$INSTDIR\${MAINBINARYNAME}.exe$\" enable=yes && (echo status=added>$\"$INSTDIR\cast-firewall.new$\") || (echo status=failed>$\"$INSTDIR\cast-firewall.new$\"))$\"'
  DetailPrint "Cast firewall elevated command: $\"$SYSDIR\cmd.exe$\" $R9"
  ExecShell "runas" "$SYSDIR\cmd.exe" '$R9' SW_HIDE
  StrCpy $3 0
 ${Do}
  Sleep 500
- IfFileExists "$1" cast_fw_install_done
+ IfFileExists "$R8" cast_fw_install_done
  IntOp $3 $3 + 1
 ${LoopUntil} $3 > 90
- FileOpen $2 "$1" w
+ FileOpen $2 "$R8" w
  FileWrite $2 "status=declined$\r$\n"
  FileWrite $2 "The Windows prompt was declined or timed out.$\r$\n"
  FileWrite $2 "Cast needs Private inbound rules for $INSTDIR\${MAINBINARYNAME}.exe, TCP ${CAST_FW_TCP} and UDP ${CAST_FW_UDP}.$\r$\n"
  FileClose $2
+ !insertmacro CAST_FW_COMMIT
  DetailPrint "Cast firewall: not added. See $1"
  ${IfNot} ${Silent}
   MessageBox MB_OK|MB_ICONEXCLAMATION "SlideX could not add the Private-network firewall rules.$\r$\n$\r$\nCast needs them so the TV can load photos and video. Re-run the installer and accept the Windows prompt.$\r$\n$\r$\nA per-user install cannot add a port-scoped Private rule without that prompt."
  ${EndIf}
  Goto cast_fw_install_end
 cast_fw_install_done:
+ !insertmacro CAST_FW_COMMIT
  DetailPrint "Cast firewall result file: $1"
  StrCpy $R7 0
  ClearErrors
@@ -790,15 +815,16 @@ Function un.CastFirewallUninstall
  Delete "$INSTDIR\cast-firewall.ok"
  Delete "$TEMP\slidex-cast-firewall-remove.cmd"
  Delete "$TEMP\slidex-cast-firewall-removed.txt"
- Delete "$INSTDIR\cast-firewall.txt"
  StrCpy $1 "$INSTDIR\cast-firewall.txt"
- StrCpy $R9 '/c $\"netsh advfirewall firewall delete rule name=$\"${CAST_FW_MEDIA_NAME}$\" & netsh advfirewall firewall delete rule name=$\"${CAST_FW_MDNS_NAME}$\" & echo status=removed>$\"$INSTDIR\cast-firewall.txt$\"$\"'
+ StrCpy $R8 "$INSTDIR\cast-firewall.new"
+ Delete "$R8"
+ StrCpy $R9 '/c $\"netsh advfirewall firewall delete rule name=$\"${CAST_FW_MEDIA_NAME}$\" & netsh advfirewall firewall delete rule name=$\"${CAST_FW_MDNS_NAME}$\" & echo status=removed>$\"$INSTDIR\cast-firewall.new$\"$\"'
  DetailPrint "Cast firewall elevated command: $\"$SYSDIR\cmd.exe$\" $R9"
  ExecShell "runas" "$SYSDIR\cmd.exe" '$R9' SW_HIDE
  StrCpy $3 0
 ${Do}
  Sleep 500
- IfFileExists "$1" cast_fw_un_done
+ IfFileExists "$R8" cast_fw_un_done
  IntOp $3 $3 + 1
 ${LoopUntil} $3 > 90
  DetailPrint "Cast firewall: rules were not removed (prompt declined or timed out). Remove $\"${CAST_FW_MEDIA_NAME}$\" and $\"${CAST_FW_MDNS_NAME}$\" in Windows Firewall if they remain."
@@ -807,9 +833,11 @@ ${LoopUntil} $3 > 90
  ${EndIf}
  Goto cast_fw_un_end
 cast_fw_un_done:
+ !insertmacro CAST_FW_COMMIT
  DetailPrint "Cast firewall rules removed. See $1"
+ Delete "$1"
 cast_fw_un_end:
- Delete "$INSTDIR\cast-firewall.txt"
+ Delete "$INSTDIR\cast-firewall.new"
  Delete "$INSTDIR\cast-firewall.ok"
  Delete "$INSTDIR\cast-firewall-add.cmd"
  Delete "$INSTDIR\cast-fw-check.ps1"

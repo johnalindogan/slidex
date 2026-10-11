@@ -2,7 +2,7 @@
 //! Stack: mdns-sd discovery + rust_cast (Cast V2) + a LAN-only HTTP server
 //! → Default Media Receiver. Not chrome.cast, not desktop mirror, no cloud relay.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -41,7 +41,6 @@ pub const CAST_PORT_LO: u16 = 47200;
 pub const CAST_PORT_HI: u16 = 47215;
 const CAST_APP_ID_PORT: u16 = 8009;
 const READ_IDLE: Duration = Duration::from_millis(350);
-const READ_RPC: Duration = Duration::from_millis(900);
 /// Slice used while waiting for LAUNCH or LOAD so a PING can be answered.
 const READ_SLICE: Duration = Duration::from_millis(400);
 /// Cold TVs often take 5–10s to answer LAUNCH. Give up at 15s.
@@ -2002,6 +2001,9 @@ struct CastLink {
     media: MediaChannel<'static, CastStream>,
     transport_id: String,
     session_id: String,
+    /// The first outbound PING and the first PONG are logged. Later heartbeats are quiet.
+    logged_ping: Cell<bool>,
+    logged_pong: Cell<bool>,
 }
 
 impl CastLink {
@@ -2055,6 +2057,8 @@ impl CastLink {
             media,
             transport_id: String::new(),
             session_id: String::new(),
+            logged_ping: Cell::new(false),
+            logged_pong: Cell::new(false),
         })
     }
 
@@ -2117,13 +2121,22 @@ impl CastLink {
     fn load_url(&self, url: &str, content_type: &str, autoplay: bool) -> Result<i32, String> {
         let request_id = self.mm.generate_request_id().get();
         let payload = load_payload(request_id, &self.session_id, url, content_type, autoplay);
-        self.send_json(NS_MEDIA, &self.transport_id, &payload)
-            .map_err(|e| map_load_error(&e.to_string()))?;
-        match media_url_host(url) {
-            Some(host) => cast_log("load", &host),
-            None => cast_log("load", "host-unknown"),
+        let host = media_url_host(url).unwrap_or_else(|| "host-unknown".into());
+        if let Err(e) = self.send_json(NS_MEDIA, &self.transport_id, &payload) {
+            let err = map_load_error(&e.to_string());
+            cast_log("load", &format!("{host} requestId={request_id} error={err}"));
+            return Err(err);
         }
-        self.wait_load(request_id)
+        match self.wait_load(request_id) {
+            Ok(sid) => {
+                cast_log("load", &format!("{host} requestId={request_id} reply={sid}"));
+                Ok(sid)
+            }
+            Err(err) => {
+                cast_log("load", &format!("{host} requestId={request_id} error={err}"));
+                Err(err)
+            }
+        }
     }
 
     /// CONNECT receiver-0, then LAUNCH, then wait for that requestId.
@@ -2135,7 +2148,7 @@ impl CastLink {
         )
         .and_then(|hit| match hit {
             Waited::Launched(app) => Ok(app),
-            Waited::Loaded(_) => Err(LAUNCH_TIMEOUT_MESSAGE.to_string()),
+            Waited::Loaded(_) | Waited::Media(_) => Err(LAUNCH_TIMEOUT_MESSAGE.to_string()),
         })
     }
 
@@ -2146,7 +2159,7 @@ impl CastLink {
         self.wait_matching(LOAD_DEADLINE, WaitMsg::LoadNotice, WaitExpect::Load(request_id))
             .and_then(|hit| match hit {
                 Waited::Loaded(sid) => Ok(sid),
-                Waited::Launched(_) => Err(media_load_notice()),
+                Waited::Launched(_) | Waited::Media(_) => Err(media_load_notice()),
             })
     }
 
@@ -2170,7 +2183,7 @@ impl CastLink {
                 Ok(msg) => msg,
                 Err(e) if cast_err_is_timeout(&e) => {
                     if slice.is_zero() {
-                        return Err(timeout_message.resolve());
+                        return Err(self.note_timeout(&timeout_message));
                     }
                     if last_ping.elapsed() >= PING_EVERY {
                         last_ping = Instant::now();
@@ -2180,17 +2193,14 @@ impl CastLink {
                 }
                 Err(e) => {
                     return Err(if is_cast_timeout(&e.to_string()) {
-                        timeout_message.resolve()
+                        self.note_timeout(&timeout_message)
                     } else {
                         link_down_message()
                     });
                 }
             };
             last_heard = Instant::now();
-            if self.heartbeat.can_handle(&msg) {
-                if let Ok(HeartbeatResponse::Ping) = self.heartbeat.parse(&msg) {
-                    let _ = self.heartbeat.pong();
-                }
+            if self.answer_heartbeat(&msg) {
                 continue;
             }
             match expect {
@@ -2249,36 +2259,137 @@ impl CastLink {
                         _ => continue,
                     }
                 }
+                WaitExpect::Media(id) => {
+                    if !self.media.can_handle(&msg) {
+                        continue;
+                    }
+                    match self.media.parse(&msg) {
+                        Ok(MediaResponse::Status(status)) if status.request_id == id => {
+                            let state = status.entries.first().map(|e| e.player_state).ok_or_else(
+                                || "The TV answered without a player state.".to_string(),
+                            )?;
+                            return Ok(Waited::Media(state));
+                        }
+                        Ok(MediaResponse::InvalidRequest(err)) if err.request_id == id => {
+                            let reason = err.reason.unwrap_or_else(|| "invalid request".into());
+                            return Err(format!("The TV refused the media command ({reason})."));
+                        }
+                        Ok(MediaResponse::InvalidPlayerState(err)) if err.request_id == id => {
+                            let _ = err;
+                            return Err(
+                                "The TV refused the media command (invalid player state).".into(),
+                            );
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    /// PAUSE, PLAY, STOP, and SEEK go to the transport id with this mediaSessionId.
+    /// One log line carries the requestId and the TV's reply or error.
+    fn media_cmd(
+        &self,
+        typ: &str,
+        sid: i32,
+        current_time: Option<f32>,
+        deadline: Duration,
+    ) -> Result<PlayerState, String> {
+        let request_id = self.mm.generate_request_id().get();
+        let payload = match current_time {
+            Some(secs) => serde_json::json!({
+                "requestId": request_id,
+                "mediaSessionId": sid,
+                "type": typ,
+                "currentTime": secs,
+            }),
+            None => serde_json::json!({
+                "requestId": request_id,
+                "mediaSessionId": sid,
+                "type": typ,
+            }),
+        };
+        let step = typ.to_ascii_lowercase();
+        let ids = format!("requestId={request_id} mediaSessionId={sid}");
+        if let Err(e) = self.send_json(NS_MEDIA, &self.transport_id, &payload.to_string()) {
+            let err = format!("The TV did not take {typ} ({e}).");
+            cast_log(&step, &format!("{ids} error={err}"));
+            return Err(err);
+        }
+        match self.wait_matching(
+            deadline,
+            WaitMsg::Text("The TV didn't answer the media command."),
+            WaitExpect::Media(request_id),
+        ) {
+            Ok(Waited::Media(state)) => {
+                cast_log(&step, &format!("{ids} reply={state}"));
+                Ok(state)
+            }
+            Ok(_) => {
+                let err = "The TV didn't answer the media command.".to_string();
+                cast_log(&step, &format!("{ids} error={err}"));
+                Err(err)
+            }
+            Err(err) => {
+                cast_log(&step, &format!("{ids} error={err}"));
+                Err(err)
             }
         }
     }
 
     fn pause(&self, sid: i32) -> Result<PlayerState, String> {
-        self.set_read_timeout(READ_RPC);
-        let entry = self
-            .media
-            .pause(self.transport_id.as_str(), sid)
-            .map_err(|e| format!("Pause did not reach the TV ({e})."))?;
-        Ok(entry.player_state)
+        self.media_cmd("PAUSE", sid, None, Duration::from_secs(4))
     }
 
     fn play(&self, sid: i32) -> Result<PlayerState, String> {
-        self.set_read_timeout(READ_RPC);
-        let entry = self
-            .media
-            .play(self.transport_id.as_str(), sid)
-            .map_err(|e| format!("Play did not reach the TV ({e})."))?;
-        Ok(entry.player_state)
+        self.media_cmd("PLAY", sid, None, Duration::from_secs(4))
+    }
+
+    fn seek(&self, sid: i32, seconds: f32) -> Result<PlayerState, String> {
+        self.media_cmd("SEEK", sid, Some(seconds), Duration::from_secs(4))
+    }
+
+    fn stop(&self, sid: i32) -> Result<PlayerState, String> {
+        self.media_cmd("STOP", sid, None, Duration::from_millis(800))
     }
 
     fn stop_app(&self, sid: Option<i32>) {
-        self.set_read_timeout(Duration::from_millis(800));
         if let Some(sid) = sid {
-            let _ = self.media.stop(self.transport_id.as_str(), sid);
+            let _ = self.stop(sid);
         }
         if !self.session_id.is_empty() {
+            self.set_read_timeout(Duration::from_millis(800));
             let _ = self.receiver.stop_app(self.session_id.as_str());
         }
+    }
+
+    /// One line for the first PING we send and the first PONG either way.
+    fn answer_heartbeat(&self, msg: &CastMessage) -> bool {
+        if !self.heartbeat.can_handle(msg) {
+            return false;
+        }
+        match self.heartbeat.parse(msg) {
+            Ok(HeartbeatResponse::Ping) => {
+                let _ = self.heartbeat.pong();
+                self.note_pong("sent");
+            }
+            Ok(HeartbeatResponse::Pong) => self.note_pong("received"),
+            _ => {}
+        }
+        true
+    }
+
+    fn note_pong(&self, which: &str) {
+        if !self.logged_pong.replace(true) {
+            cast_log("pong", which);
+        }
+    }
+
+    fn note_timeout(&self, timeout_message: &WaitMsg<'_>) -> String {
+        let msg = timeout_message.resolve();
+        cast_log("timeout", &msg);
+        msg
     }
 
     /// `Ok(None)` is a quiet slice. `Ok(Some(_))` means the TV sent something,
@@ -2295,10 +2406,7 @@ impl CastLink {
     }
 
     fn apply_message(&self, msg: &CastMessage) -> Option<PlayerState> {
-        if self.heartbeat.can_handle(msg) {
-            if let Ok(HeartbeatResponse::Ping) = self.heartbeat.parse(msg) {
-                let _ = self.heartbeat.pong();
-            }
+        if self.answer_heartbeat(msg) {
             return None;
         }
         if self.media.can_handle(msg) {
@@ -2315,7 +2423,12 @@ impl CastLink {
 
     fn ping(&self) -> Result<(), String> {
         match self.heartbeat.ping() {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if !self.logged_ping.replace(true) {
+                    cast_log("ping", "sent");
+                }
+                Ok(())
+            }
             Err(err) if cast_err_is_timeout(&err) => Ok(()),
             Err(_) => Err(link_down_message()),
         }
@@ -2325,6 +2438,7 @@ impl CastLink {
 enum WaitExpect {
     Launch(u32),
     Load(u32),
+    Media(u32),
 }
 
 /// Resolved only when a wait actually times out. `LoadNotice` shells out to
@@ -2374,6 +2488,7 @@ fn drive_tls(conn: &mut ClientConnection, tcp: &mut TcpStream) -> Result<(), Str
 enum Waited {
     Launched(Application),
     Loaded(i32),
+    Media(PlayerState),
 }
 
 struct PumpUpdate {
@@ -2575,14 +2690,24 @@ struct SessionFlags {
 }
 
 impl SessionFlags {
+    /// Still images ignore `playerState`. The Default Media Receiver reports
+    /// PAUSED for every photo, which is not a remote pause. A remote pause is
+    /// a video going from PLAYING to PAUSED.
     fn note_state(&mut self, state: PlayerState, from_local: bool) {
+        if self.media_kind == "still" && !from_local {
+            return;
+        }
         let name = player_name(state);
         let prev = self.player_state.clone();
         self.player_state = name.to_string();
         if from_local || name == prev {
             return;
         }
-        if name != "paused" && name != "playing" {
+        if name == "paused" {
+            if self.media_kind != "video" || prev != "playing" {
+                return;
+            }
+        } else if name != "playing" {
             return;
         }
         let matches_local = self.local_cmd == Some(if name == "paused" { "pause" } else { "play" })
@@ -2891,6 +3016,7 @@ fn run_session(
 
     while running {
         if flags.last_rx.elapsed() > LINK_DEAD_AFTER {
+            cast_log("timeout", "no message from the TV for 15s");
             flags.connected = false;
             flags.error = Some(link_down_message());
             publish(&status, |s| {
@@ -3033,13 +3159,9 @@ fn handle_cmd(
             flags.local_cmd_at = Instant::now();
             let result = (|| {
                 let sid = flags.media_session.ok_or_else(|| "Nothing is casting.".to_string())?;
-                if flags.media_kind == "still" {
-                    flags.player_state = "paused".into();
-                    publish(status, |s| s.player_state = "paused".into());
-                    return Ok(());
-                }
-                let state = link.pause(sid)?;
-                flags.note_state(state, true);
+                // Photos and video both send PAUSE. The reply's playerState is
+                // not a remote event; stills ignore playerState entirely.
+                link.pause(sid)?;
                 flags.player_state = "paused".into();
                 flags.last_rx = Instant::now();
                 publish(status, |s| s.player_state = "paused".into());
@@ -3053,13 +3175,7 @@ fn handle_cmd(
             flags.local_cmd_at = Instant::now();
             let result = (|| {
                 let sid = flags.media_session.ok_or_else(|| "Nothing is casting.".to_string())?;
-                if flags.media_kind == "still" {
-                    flags.player_state = "playing".into();
-                    publish(status, |s| s.player_state = "playing".into());
-                    return Ok(());
-                }
-                let state = link.play(sid)?;
-                flags.note_state(state, true);
+                link.play(sid)?;
                 flags.player_state = "playing".into();
                 flags.last_rx = Instant::now();
                 publish(status, |s| s.player_state = "playing".into());
@@ -3972,6 +4088,10 @@ mod tests {
         assert_eq!(parse_firewall_script_output("status=match").state, "added");
         assert_eq!(parse_firewall_script_output("status=partial").state, "partial");
         assert_eq!(parse_firewall_script_output("status=nomatch").state, "missing");
+        let silent = parse_firewall_script_output("status=skipped_silent");
+        let nomatch = parse_firewall_script_output("status=nomatch");
+        assert_eq!(silent.state, "missing");
+        assert_eq!(silent.detail, nomatch.detail);
         assert_eq!(
             parse_firewall_script_output("query failed: denied").state,
             "unknown"
@@ -4098,6 +4218,21 @@ mod tests {
     struct FakeScript {
         launch_error: Option<&'static str>,
         load_failed: bool,
+        /// playerState on the LOAD reply.
+        load_state: &'static str,
+        /// Unsolicited MEDIA_STATUS frames sent after the LOAD reply (requestId 0).
+        follow_states: &'static [&'static str],
+    }
+
+    impl Default for FakeScript {
+        fn default() -> Self {
+            Self {
+                launch_error: None,
+                load_failed: false,
+                load_state: "PLAYING",
+                follow_states: &[],
+            }
+        }
     }
 
     struct FakeTv {
@@ -4220,14 +4355,19 @@ mod tests {
         fake_send(mm, NS_RECEIVER, "receiver-0", &real.to_string());
     }
 
-    fn send_media_status<S: Read + Write>(mm: &MessageManager<S>, request_id: u32, session: i32) {
+    fn send_media_status<S: Read + Write>(
+        mm: &MessageManager<S>,
+        request_id: u32,
+        session: i32,
+        player_state: &str,
+    ) {
         let body = serde_json::json!({
             "requestId": request_id,
             "type": "MEDIA_STATUS",
             "status": [{
                 "mediaSessionId": session,
                 "playbackRate": 1.0,
-                "playerState": "PLAYING",
+                "playerState": player_state,
                 "currentTime": 0.0,
                 "supportedMediaCommands": 15
             }]
@@ -4322,8 +4462,29 @@ mod tests {
                     continue;
                 }
                 note_trace(traces, "media-status");
-                send_media_status(mm, 999, 1);
-                send_media_status(mm, id, 7);
+                send_media_status(mm, 999, 1, "PLAYING");
+                send_media_status(mm, id, 7, script.load_state);
+                for state in script.follow_states {
+                    send_media_status(mm, 0, 7, state);
+                }
+                continue;
+            }
+            if matches!(typ.as_str(), "PAUSE" | "PLAY" | "STOP" | "SEEK") {
+                let id = value.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let sid = value.get("mediaSessionId").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let dest = msg.destination.clone();
+                note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id}"));
+                if dest != "transport-1" || !transport_up {
+                    note_trace(traces, &format!("media-refused {typ} {dest}"));
+                    continue;
+                }
+                let state = match typ.as_str() {
+                    "PAUSE" => "PAUSED",
+                    "STOP" => "IDLE",
+                    _ => "PLAYING",
+                };
+                note_trace(traces, "media-status");
+                send_media_status(mm, id, sid, state);
             }
         }
     }
@@ -4503,14 +4664,28 @@ mod tests {
         let fresh = dir.text();
         assert!(fresh.contains("127.0.0.1:8009"), "{fresh}");
         assert!(!fresh.contains(&"x".repeat(80)), "{fresh}");
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(dir.0.join("cast.log"))
+                .unwrap();
+            file.write_all(&vec![b'y'; CAST_LOG_MAX as usize + 64]).unwrap();
+        }
+        cast_log("timeout", "past-one-megabyte");
+        let past = std::fs::metadata(dir.0.join("cast.log")).unwrap().len();
+        let past_rotated = std::fs::metadata(dir.0.join("cast.log.1")).unwrap().len();
+        assert!(past < CAST_LOG_MAX, "cast.log is {past} bytes");
+        assert_eq!(past_rotated, CAST_LOG_MAX + 64);
+        let after = dir.text();
+        assert!(after.contains("past-one-megabyte"), "{after}");
+        assert!(!after.contains(&"y".repeat(80)), "{after}");
     }
 
     #[test]
     fn fake_tv_refuses_anything_sent_before_connect() {
-        let fake = spawn_fake(FakeScript {
-            launch_error: None,
-            load_failed: false,
-        });
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript::default());
         let (ip, port) = fake.host_port();
         let mut link = CastLink::open_tls(ip, port).unwrap();
         let id = link.mm.generate_request_id().get();
@@ -4541,15 +4716,19 @@ mod tests {
         let pong = text.find("client-pong").expect(&text);
         let status = text.find("receiver-status").expect(&text);
         assert!(pong < status, "{text}");
+        let written = log.text();
+        assert!(
+            written.contains("timeout") && written.contains("no-reply-before-connect"),
+            "{written}"
+        );
+        assert_eq!(written.lines().filter(|l| l.contains(" ping ")).count(), 1, "{written}");
+        assert_eq!(written.lines().filter(|l| l.contains(" pong ")).count(), 1, "{written}");
     }
 
     #[test]
     fn cast_link_connects_before_launch_and_loads_the_transport() {
         let log = LogDir::new();
-        let fake = spawn_fake(FakeScript {
-            launch_error: None,
-            load_failed: false,
-        });
+        let fake = spawn_fake(FakeScript::default());
         let (ip, port) = fake.host_port();
         let mut link = CastLink::connect(ip, port).unwrap();
         link.launch_receiver().unwrap();
@@ -4576,6 +4755,15 @@ mod tests {
         assert!(!written.contains(token), "{written}");
         assert!(!written.contains("vacation"), "{written}");
         link.ping().unwrap();
+        let after_ping = log.text();
+        assert_eq!(
+            after_ping.lines().filter(|l| l.contains(" ping ")).count(),
+            1,
+            "{after_ping}"
+        );
+        assert!(after_ping.contains(" pong "), "{after_ping}");
+        assert!(after_ping.contains("requestId="), "{after_ping}");
+        assert!(after_ping.contains("reply=7"), "{after_ping}");
         match link.pump().unwrap() {
             Some(update) => assert!(update.player.is_none()),
             None => panic!("a PONG from the TV must count as the TV speaking"),
@@ -4584,10 +4772,7 @@ mod tests {
 
     #[test]
     fn fake_tv_refuses_load_addressed_to_receiver_0() {
-        let fake = spawn_fake(FakeScript {
-            launch_error: None,
-            load_failed: false,
-        });
+        let fake = spawn_fake(FakeScript::default());
         let (ip, port) = fake.host_port();
         let mut link = CastLink::connect(ip, port).unwrap();
         link.launch_receiver().unwrap();
@@ -4625,7 +4810,7 @@ mod tests {
     fn launch_error_is_not_reported_as_a_timeout() {
         let fake = spawn_fake(FakeScript {
             launch_error: Some("NOT_FOUND"),
-            load_failed: false,
+            ..FakeScript::default()
         });
         let (ip, port) = fake.host_port();
         let mut link = CastLink::connect(ip, port).unwrap();
@@ -4646,8 +4831,8 @@ mod tests {
     #[test]
     fn load_failed_is_not_reported_as_a_timeout() {
         let fake = spawn_fake(FakeScript {
-            launch_error: None,
             load_failed: true,
+            ..FakeScript::default()
         });
         let (ip, port) = fake.host_port();
         let mut link = CastLink::connect(ip, port).unwrap();
@@ -4671,5 +4856,126 @@ mod tests {
         assert!(!err.to_ascii_lowercase().contains("timed out"));
         assert!(!err.contains("didn't answer"));
         assert!(fake.trace_text().contains("load-failed"), "{}", fake.trace_text());
+    }
+
+    fn session_after_load(kind: &str) -> (Arc<Mutex<Option<String>>>, SessionFlags) {
+        let remote = Arc::new(Mutex::new(None));
+        let flags = SessionFlags {
+            connected: true,
+            player_state: "playing".into(),
+            remote_event: Arc::clone(&remote),
+            error: None,
+            media_kind: kind.into(),
+            local_cmd: Some("play"),
+            local_cmd_at: Instant::now(),
+            last_rx: Instant::now(),
+            media_session: Some(7),
+        };
+        (remote, flags)
+    }
+
+    fn pump_player_states(link: &CastLink, n: usize) -> Vec<PlayerState> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while out.len() < n && Instant::now() < deadline {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if let Some(state) = update.player {
+                        out.push(state);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn photo_paused_status_does_not_show_a_remote_pause() {
+        let fake = spawn_fake(FakeScript {
+            follow_states: &["PAUSED"],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/9";
+        assert_eq!(link.load_url(url, "image/jpeg", true).unwrap(), 7);
+        let (remote, mut flags) = session_after_load("still");
+        let states = pump_player_states(&link, 1);
+        assert_eq!(states, vec![PlayerState::Paused], "the photo must report PAUSED");
+        for state in states {
+            flags.note_state(state, false);
+        }
+        assert!(
+            remote.lock().unwrap().is_none(),
+            "a still image must not raise Paused from the TV remote"
+        );
+        assert_eq!(flags.player_state, "playing");
+    }
+
+    #[test]
+    fn video_playing_to_paused_shows_a_remote_pause() {
+        let fake = spawn_fake(FakeScript {
+            follow_states: &["PLAYING", "PAUSED"],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/8";
+        assert_eq!(link.load_url(url, "video/mp4", true).unwrap(), 7);
+        let (remote, mut flags) = session_after_load("video");
+        let states = pump_player_states(&link, 2);
+        assert_eq!(
+            states,
+            vec![PlayerState::Playing, PlayerState::Paused],
+            "the video must go PLAYING to PAUSED"
+        );
+        for state in states {
+            flags.note_state(state, false);
+        }
+        assert_eq!(remote.lock().unwrap().as_deref(), Some("paused"));
+        assert_eq!(flags.player_state, "paused");
+    }
+
+    #[test]
+    fn pause_play_stop_and_seek_log_the_request_and_the_tv_reply() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/4";
+        assert_eq!(link.load_url(url, "video/mp4", true).unwrap(), 7);
+        assert_eq!(link.pause(7).unwrap(), PlayerState::Paused);
+        assert_eq!(link.play(7).unwrap(), PlayerState::Playing);
+        assert_eq!(link.seek(7, 3.5).unwrap(), PlayerState::Playing);
+        assert_eq!(link.stop(7).unwrap(), PlayerState::Idle);
+        link.ping().unwrap();
+        let text = fake.trace_text();
+        assert!(
+            text.contains("PAUSE transport-1 session=7 requestId="),
+            "{text}"
+        );
+        assert!(text.contains("PLAY transport-1 session=7 requestId="), "{text}");
+        assert!(text.contains("SEEK transport-1 session=7 requestId="), "{text}");
+        assert!(text.contains("STOP transport-1 session=7 requestId="), "{text}");
+        let written = log.text();
+        for step in ["load ", "pause ", "play ", "seek ", "stop "] {
+            let line = written
+                .lines()
+                .find(|l| l.contains(step))
+                .unwrap_or_else(|| panic!("missing {step} in {written}"));
+            assert!(line.contains("requestId="), "{line}");
+            assert!(line.contains("reply="), "{line}");
+        }
+        assert!(written.contains("load 192.168.1.52:47200"), "{written}");
+        assert!(written.contains("reply=PAUSED"), "{written}");
+        assert!(written.contains("mediaSessionId=7"), "{written}");
+        assert!(!written.contains("0123456789abcdef0123456789abcdef"), "{written}");
+        assert_eq!(written.lines().filter(|l| l.contains(" ping ")).count(), 1, "{written}");
+        assert_eq!(written.lines().filter(|l| l.contains(" pong ")).count(), 1, "{written}");
     }
 }

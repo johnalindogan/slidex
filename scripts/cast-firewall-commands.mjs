@@ -362,7 +362,7 @@ function assertPlainQuotes(label, params, instDir, binary) {
   const quotes = [...command].filter((ch) => ch === '"').length;
   if (quotes % 2 !== 0) fail(`${label} has unbalanced inner quotes (${quotes})`);
   const exe = `${instDir}\\${binary}.exe`;
-  const result = `${instDir}\\cast-firewall.txt`;
+  const result = `${instDir}\\cast-firewall.new`;
   for (const piece of [
     'name="SlideX Cast media (Private)"',
     'name="SlideX Cast mDNS (Private)"',
@@ -616,6 +616,55 @@ function readStatus(file) {
   return fs.readFileSync(file, 'utf8');
 }
 
+// Same replace the installer does: the new bytes are complete before the live name changes.
+function commitFirewallStatus(dir) {
+  const live = path.join(dir, 'cast-firewall.txt');
+  const temp = path.join(dir, 'cast-firewall.new');
+  if (!fs.existsSync(temp)) fail(`missing ${temp}`);
+  const body = fs.readFileSync(temp);
+  const staged = path.join(dir, 'cast-firewall.replacing');
+  fs.writeFileSync(staged, body);
+  if (fs.existsSync(live)) fs.rmSync(live);
+  fs.renameSync(staged, live);
+  fs.rmSync(temp, { force: true });
+  return readStatus(live);
+}
+
+function assertSilentSkipsElevation(installBody) {
+  const silentAt = installBody.indexOf('IfSilent');
+  const elevateAt = installBody.indexOf('cast_fw_elevate:');
+  const runasAt = installBody.indexOf('ExecShell "runas"');
+  const endAt = installBody.indexOf('cast_fw_install_end:');
+  const skippedAt = installBody.indexOf('status=skipped_silent');
+  if (silentAt < 0 || elevateAt < 0 || runasAt < 0 || endAt < 0 || skippedAt < 0) {
+    fail('silent install path is missing IfSilent, status=skipped_silent, or cast_fw_elevate');
+  }
+  if (!(silentAt < skippedAt && skippedAt < elevateAt && elevateAt <= runasAt && runasAt < endAt)) {
+    fail('silent install must write status=skipped_silent before cast_fw_elevate, and ExecShell must stay after that label');
+  }
+  const silentLine = installBody.slice(silentAt, installBody.indexOf('\n', silentAt));
+  if (!silentLine.includes('cast_fw_elevate')) {
+    fail('IfSilent does not send an interactive install to cast_fw_elevate');
+  }
+  const silentSlice = installBody.slice(silentAt, elevateAt);
+  if (/ExecShell|runas/i.test(silentSlice)) fail('silent branch contains an elevation attempt');
+  if (!silentSlice.includes('status=nomatch')) fail('silent skip does not check status=nomatch');
+  if (!silentSlice.includes('Goto cast_fw_install_end')) {
+    fail('/S with no rules can fall through to ExecShell runas');
+  }
+  const nsi = fs.readFileSync(nsiPath, 'utf8');
+  const macroAt = nsi.indexOf('!macro CAST_FW_COMMIT');
+  const renameAt = nsi.indexOf('Rename /REBOOTOK "$R8" "$1"');
+  if (macroAt < 0 || renameAt < macroAt || !installBody.includes('!insertmacro CAST_FW_COMMIT')) {
+    fail('cast-firewall.txt is not replaced with Rename /REBOOTOK after the temp file is written');
+  }
+  const head = installBody.slice(0, installBody.indexOf('nsExec::ExecToStack'));
+  if (head.includes('Delete "$1"') || head.includes('Delete "$INSTDIR\\cast-firewall.txt"')) {
+    fail('CastFirewallInstall deletes cast-firewall.txt before the new status exists');
+  }
+  console.log('CAST_FIREWALL_SILENT_NO_ELEVATION=ok');
+}
+
 // os.tmpdir() on the GitHub runner is an 8.3 path (C:\Users\RUNNER~1\...).
 // netsh reports "The application name could not be resolved" for that form,
 // and also for a zero-byte file. Use the long path and a real PE image.
@@ -677,6 +726,7 @@ if (!ps1.includes('return @((Get-Content -Raw -LiteralPath $Fixture | ConvertFro
 if (!loaded.skipsElevation) {
   fail('CastFirewallInstall does not return before ExecShell when the pre-check reports status=match');
 }
+assertSilentSkipsElevation(functionBody(fs.readFileSync(nsiPath, 'utf8'), 'Function CastFirewallInstall'));
 if (!fs.readFileSync(nsiPath, 'utf8').includes('Delete "$INSTDIR\\cast-fw-check.ps1"')) {
   fail('uninstaller does not delete cast-fw-check.ps1');
 }
@@ -731,9 +781,25 @@ try {
   }
   const firstState = first.text.includes('status=nomatch') ? 'nomatch' : 'added';
   console.log(`CAST_FIREWALL_FIRST_INSTALL=${firstState}`);
+  if (firstState === 'nomatch') {
+    fs.writeFileSync(statusFile, 'status=present\r\n');
+    fs.writeFileSync(path.join(instDir, 'cast-firewall.new'), 'status=skipped_silent\r\n');
+    if (!readStatus(statusFile).includes('status=present')) {
+      fail('silent nomatch clobbered cast-firewall.txt before the commit');
+    }
+    const silentStatus = commitFirewallStatus(instDir);
+    if (!silentStatus.includes('status=skipped_silent')) {
+      fail(`silent install did not commit status=skipped_silent:\n${silentStatus}`);
+    }
+    console.log('CAST_FIREWALL_SILENT_INSTALL=skipped_silent');
+  }
 
+  fs.writeFileSync(statusFile, 'status=present\r\n');
   runCmd(sysDir, loaded.installParams);
-  const added = readStatus(statusFile);
+  if (!readStatus(statusFile).includes('status=present')) {
+    fail('elevated command replaced cast-firewall.txt before the installer commit');
+  }
+  const added = commitFirewallStatus(instDir);
   console.log(`CAST_FIREWALL_STATUS_AFTER_INSTALL=${JSON.stringify(added)}`);
   if (!added.includes('status=added')) fail(`cast-firewall.txt did not record status=added:\n${added}`);
 
@@ -757,8 +823,12 @@ try {
   }
   console.log('CAST_FIREWALL_SECOND_INSTALL=skip-elevation');
 
+  fs.writeFileSync(statusFile, 'status=added\r\n');
   runCmd(sysDir, loaded.uninstallParams);
-  const removed = readStatus(statusFile);
+  if (!readStatus(statusFile).includes('status=added')) {
+    fail('elevated uninstall replaced cast-firewall.txt before the installer commit');
+  }
+  const removed = commitFirewallStatus(instDir);
   console.log(`CAST_FIREWALL_STATUS_AFTER_UNINSTALL=${JSON.stringify(removed)}`);
   if (!removed.includes('status=removed')) fail(`cast-firewall.txt did not record status=removed:\n${removed}`);
 
