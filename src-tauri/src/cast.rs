@@ -89,9 +89,14 @@ fn connect_fail(detail: String) -> String {
 }
 
 /// Connect failures use the same key=value shape as the other cast.log lines.
-/// The reason stays the sentence the panel shows. The host is an address, never a path.
-fn log_connect_error(reason: &str, host: Ipv4Addr) {
-    cast_log("error", &format!("reason=\"{reason}\" host={host}"));
+/// `host` is the TV address. `bind` is this PC's address when the session knows it.
+/// The reason stays the sentence the panel shows. Neither value is a path.
+fn log_connect_error(reason: &str, host: Ipv4Addr, bind: Option<Ipv4Addr>) {
+    let mut detail = format!("reason=\"{reason}\" host={host}");
+    if let Some(bind) = bind {
+        detail.push_str(&format!(" bind={bind}"));
+    }
+    cast_log("error", &detail);
 }
 
 /// One Disconnect, one line, including when the session and the caller both try.
@@ -2110,14 +2115,14 @@ struct CastLink {
 impl CastLink {
     /// TCP + TLS only. Does not send the virtual CONNECT. Tests use this to prove
     /// the receiver ignores everything that arrives before CONNECT.
-    fn open_tls(host: Ipv4Addr, port: u16) -> Result<Self, String> {
+    fn open_tls(host: Ipv4Addr, port: u16, bind: Option<Ipv4Addr>) -> Result<Self, String> {
         cast_log("connect", &format!("{host}:{port}"));
         let addr = SocketAddr::from((host, port));
         let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
             let reason = format!(
                 "TV unreachable at {host}. It may be off, or this PC and the TV are not on the same Wi-Fi."
             );
-            log_connect_error(&reason, host);
+            log_connect_error(&reason, host, bind);
             reason
         })?;
         tcp.set_nodelay(true).ok();
@@ -2189,7 +2194,13 @@ impl CastLink {
     }
 
     fn connect(host: Ipv4Addr, port: u16) -> Result<Self, String> {
-        let link = Self::open_tls(host, port)?;
+        Self::connect_bound(host, port, None)
+    }
+
+    /// `bind` is the local address the media server listens on. It is logged
+    /// separately and is not the address in "TV unreachable at".
+    fn connect_bound(host: Ipv4Addr, port: u16, bind: Option<Ipv4Addr>) -> Result<Self, String> {
+        let link = Self::open_tls(host, port, bind)?;
         link.connection
             .connect("receiver-0")
             .map_err(|e| connect_fail(format!("Could not connect to the TV ({e}).")))?;
@@ -3110,7 +3121,7 @@ impl CastState {
                 });
                 let _ = worker.join();
                 let reason = with_public_network(link_down_message());
-                log_connect_error(&reason, ip);
+                log_connect_error(&reason, ip, Some(bind.ip));
                 return Err(reason);
             }
         };
@@ -3327,7 +3338,7 @@ fn run_session(
             return;
         }
     };
-    let mut link = match CastLink::connect(host, port) {
+    let mut link = match CastLink::connect_bound(host, port, Some(bind_ip)) {
         Ok(mut l) => {
             l.use_cancel(cancel);
             l.use_disconnect_logged(disconnect_logged);
@@ -5264,7 +5275,7 @@ mod tests {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript::default());
         let (ip, port) = fake.host_port();
-        let mut link = CastLink::open_tls(ip, port).unwrap();
+        let mut link = CastLink::open_tls(ip, port, None).unwrap();
         let id = link.mm.generate_request_id().get();
         link.send_json(NS_RECEIVER, "receiver-0", &launch_payload(id))
             .unwrap();
@@ -5748,6 +5759,29 @@ mod tests {
         assert!(lines[0].contains("TV unreachable"), "{written}");
         assert!(lines[0].contains("reason=\"TV unreachable"), "{written}");
         assert!(lines[0].contains("host=127.0.0.1"), "{written}");
+        assert!(!written.contains('\\'), "{written}");
+        assert!(!written.contains('/'), "{written}");
+        assert!(!written.contains("redacted"), "{written}");
+    }
+
+    #[test]
+    fn failed_connect_logs_the_tv_address_not_the_bind_address() {
+        let log = LogDir::new();
+        let tv = Ipv4Addr::new(192, 168, 1, 56);
+        let bind = Ipv4Addr::new(192, 168, 1, 49);
+        let err = match CastLink::connect_bound(tv, 1, Some(bind)) {
+            Ok(_) => panic!("port 1 must not accept a cast connection"),
+            Err(err) => err,
+        };
+        assert!(err.contains("TV unreachable at 192.168.1.56"), "{err}");
+        assert!(!err.contains("192.168.1.49"), "{err}");
+        let written = log.text();
+        let lines: Vec<_> = written.lines().filter(|l| l.contains(" error ")).collect();
+        assert_eq!(lines.len(), 1, "{written}");
+        assert!(lines[0].contains("TV unreachable at 192.168.1.56"), "{written}");
+        assert!(lines[0].contains("host=192.168.1.56"), "{written}");
+        assert!(lines[0].contains("bind=192.168.1.49"), "{written}");
+        assert!(!lines[0].contains("TV unreachable at 192.168.1.49"), "{written}");
         assert!(!written.contains('\\'), "{written}");
         assert!(!written.contains('/'), "{written}");
         assert!(!written.contains("redacted"), "{written}");
