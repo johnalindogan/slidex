@@ -924,6 +924,15 @@ test('a cast ignores local video events and tags the command source', () => {
   assert.match(html, /ev === "finished"/);
   assert.match(html, /else if \(ev === "finished" && sspCastPlaying\(\)\)/);
   assert.match(html, /goTo\(nextMI\(\), 'remote'\)/);
+  assert.match(html, /ev === "load_failed"/);
+  const failed = html.slice(html.indexOf('ev === "load_failed"'), html.indexOf('ev === "paused"'));
+  assert.doesNotMatch(failed, /goTo\(/);
+  const finished = html.slice(html.indexOf('ev === "finished"'), html.indexOf('if (!field(st, "connected"))'));
+  assert.match(finished, /sspCastPlaying\(\)/);
+  assert.match(finished, /__sspCastEcho = true/);
+  assert.match(finished, /__sspCastMoved/);
+  assert.match(finished, /goTo\(nextMI\(\), 'remote'\)/);
+  assert.match(finished, /item_index/);
   assert.match(html, /sspCastHook\('transport', window\.__sspCastEcho \? 'remote' : 'user'\)/);
   assert.match(html, /sspCastHook\('slide', source \|\| 'user'\)/);
   assert.match(html, /source: src/);

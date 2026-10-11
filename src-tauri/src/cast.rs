@@ -447,6 +447,8 @@ pub struct CastLiveStatus {
     pub media_kind: String,
     pub http_port: u16,
     pub bind_ip: String,
+    /// 1-based playlist index now on the TV. 0 until the first LOAD.
+    pub item_index: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1107,6 +1109,8 @@ struct AllowBook {
     token: String,
     files: HashMap<String, AllowEntry>,
     by_path: HashMap<PathBuf, String>,
+    /// Playlist order. Auto-advance walks this; the map alone has no order.
+    order: Vec<PathBuf>,
 }
 
 impl AllowBook {
@@ -1115,12 +1119,14 @@ impl AllowBook {
             token: new_token(),
             files: HashMap::new(),
             by_path: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
     fn revoke(&mut self) {
         self.files.clear();
         self.by_path.clear();
+        self.order.clear();
         self.token = new_token();
     }
 }
@@ -1174,6 +1180,7 @@ fn resolve_media_url<'a>(url: &str, book: &'a AllowBook) -> Result<&'a AllowEntr
 fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
     book.files.clear();
     book.by_path.clear();
+    book.order.clear();
     let mut skipped = Vec::new();
     for path in paths {
         match classify_playlist_file(path) {
@@ -1184,6 +1191,7 @@ fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
                 }
                 let key = new_token();
                 book.by_path.insert(canon.clone(), key.clone());
+                book.order.push(canon.clone());
                 book.files.insert(
                     key,
                     AllowEntry {
@@ -1316,6 +1324,56 @@ impl MediaHttp {
     fn kind_of(&self, path: &Path) -> Result<String, String> {
         let book = self.book.lock().map_err(|_| "playlist lock".to_string())?;
         Ok(lookup_playlist(&book, path)?.kind.clone())
+    }
+
+    /// 1-based position in the playlist the page registered.
+    fn index_of(&self, path: &Path) -> Result<u32, String> {
+        let book = self.book.lock().map_err(|_| "playlist lock".to_string())?;
+        let canon = path
+            .canonicalize()
+            .map_err(|_| "That slide is not in the current playlist.".to_string())?;
+        let pos = book
+            .order
+            .iter()
+            .position(|p| p == &canon)
+            .ok_or_else(|| "That slide is not in the current playlist.".to_string())?;
+        Ok((pos as u32) + 1)
+    }
+
+    /// The slide after `item_index` (1-based), wrapping to item 1 at the end.
+    fn successor(&self, item_index: u32) -> Result<Successor, String> {
+        let book = self.book.lock().map_err(|_| "playlist lock".to_string())?;
+        let len = book.order.len();
+        if len == 0 {
+            return Err("empty playlist".into());
+        }
+        if item_index == 0 || item_index as usize > len {
+            return Err("current item unknown".into());
+        }
+        let next = if item_index as usize == len {
+            1
+        } else {
+            item_index + 1
+        };
+        let path = book.order[(next as usize) - 1].clone();
+        let key = book
+            .by_path
+            .get(&path)
+            .ok_or_else(|| "current item unknown".to_string())?;
+        let entry = book
+            .files
+            .get(key)
+            .ok_or_else(|| "current item unknown".to_string())?;
+        let url = format!(
+            "http://{}:{}/m/{}/{}",
+            self.bind_ip, self.port, book.token, key
+        );
+        Ok(Successor {
+            url,
+            content_type: entry.content_type.clone(),
+            item: next,
+            media_type: media_type_label(&entry.kind),
+        })
     }
 
     fn shutdown(&mut self) {
@@ -2256,6 +2314,8 @@ impl CastLink {
         content_type: &str,
         autoplay: bool,
         origin: CastOrigin,
+        item: u32,
+        media_type: &str,
     ) -> Result<i32, String> {
         if self.cancelled() {
             return Err(CAST_CANCELLED.to_string());
@@ -2264,11 +2324,12 @@ impl CastLink {
         let payload = load_payload(request_id, &self.session_id, url, content_type, autoplay);
         let host = media_url_host(url).unwrap_or_else(|| "host-unknown".into());
         let source = origin.as_str();
+        let media_type = media_type_label(media_type);
         if let Err(e) = self.send_json(NS_MEDIA, &self.transport_id, &payload) {
             let err = map_load_error(&e.to_string());
             cast_log(
                 "load",
-                &format!("{host} requestId={request_id} source={source} error={err}"),
+                &load_log_detail(&host, request_id, source, item, media_type, &format!("error={err}")),
             );
             return Err(err);
         }
@@ -2276,7 +2337,14 @@ impl CastLink {
             Ok(sid) => {
                 cast_log(
                     "load",
-                    &format!("{host} requestId={request_id} source={source} reply={sid}"),
+                    &load_log_detail(
+                        &host,
+                        request_id,
+                        source,
+                        item,
+                        media_type,
+                        &format!("reply={sid}"),
+                    ),
                 );
                 Ok(sid)
             }
@@ -2284,7 +2352,14 @@ impl CastLink {
             Err(err) => {
                 cast_log(
                     "load",
-                    &format!("{host} requestId={request_id} source={source} error={err}"),
+                    &load_log_detail(
+                        &host,
+                        request_id,
+                        source,
+                        item,
+                        media_type,
+                        &format!("error={err}"),
+                    ),
                 );
                 Err(err)
             }
@@ -2745,6 +2820,33 @@ fn load_payload(
     .to_string()
 }
 
+/// `still` and image content types are photos. Only a video is logged as video.
+fn media_type_label(kind: &str) -> &'static str {
+    match kind {
+        "video" | "video/mp4" => "video",
+        _ => "photo",
+    }
+}
+
+fn load_log_detail(
+    host: &str,
+    request_id: u32,
+    source: &str,
+    item: u32,
+    media_type: &str,
+    tail: &str,
+) -> String {
+    format!("{host} requestId={request_id} source={source} item={item} type={media_type} {tail}")
+}
+
+/// The next playlist item a FINISHED status should LOAD.
+struct Successor {
+    url: String,
+    content_type: String,
+    item: u32,
+    media_type: &'static str,
+}
+
 /// Host and port only. The path carries the media token and must not be logged.
 fn media_url_host(url: &str) -> Option<String> {
     let rest = url
@@ -2914,6 +3016,10 @@ struct SessionFlags {
     disconnect_origin: Option<CastOrigin>,
     /// mediaSessionId we already advanced from, so a repeated FINISHED is one step.
     advanced_session: Option<i32>,
+    /// 1-based playlist index of the item now on the TV. 0 means we do not know.
+    item_index: u32,
+    /// mediaSessionId we already reported as a failed fetch, so IDLE/ERROR is one line.
+    failed_session: Option<i32>,
 }
 
 impl SessionFlags {
@@ -2963,30 +3069,98 @@ impl SessionFlags {
         }
         self.advanced_session = Some(session);
         cast_log("advance", "source=remote");
+        true
+    }
+
+    /// IDLE/ERROR for the item now on the TV. A stale session is ignored.
+    fn note_load_failed(&mut self, session: i32) -> bool {
+        if self.failed_session == Some(session) {
+            return false;
+        }
+        self.failed_session = Some(session);
+        let item = if self.item_index == 0 { 1 } else { self.item_index };
+        cast_log("load_failed", &format!("item={item} reason=ERROR"));
+        let msg = format!(
+            "The TV could not load item {item}. It may be blocked from reaching this PC."
+        );
+        self.error = Some(msg);
         if let Ok(mut ev) = self.remote_event.lock() {
-            *ev = Some("finished".to_string());
+            *ev = Some("load_failed".to_string());
         }
         true
     }
 }
 
-/// What `goTo(next, 'remote')` asks Cast to do: load the successor only after
-/// the current item finished. A false decision sends nothing.
-#[cfg(test)]
-fn load_after_finished(
+/// IDLE for the current media session.
+/// FINISHED loads `next`, or logs why that LOAD was not sent.
+/// ERROR is a failed fetch: tell the user and do not skip to the next slide.
+/// `Ok(true)` means the next LOAD was sent. The caller publishes `item_index`
+/// before raising the finished event, so the page moves to that item.
+fn on_media_idle(
     link: &CastLink,
     flags: &mut SessionFlags,
     session: Option<i32>,
     reason: Option<IdleReason>,
-    next_url: &str,
-    next_type: &str,
-) -> Result<Option<i32>, String> {
-    if !flags.note_finished(session, reason) {
-        return Ok(None);
+    next: Result<Successor, &'static str>,
+) -> Result<bool, String> {
+    let Some(session) = session else {
+        return Ok(false);
+    };
+    let Some(current) = flags.media_session else {
+        return Ok(false);
+    };
+    if session != current {
+        return Ok(false);
     }
-    Ok(Some(
-        link.load_url(next_url, next_type, true, CastOrigin::Remote)?,
-    ))
+    if reason == Some(IdleReason::Error) {
+        flags.note_load_failed(session);
+        return Ok(false);
+    }
+    if !flags.note_finished(Some(session), reason) {
+        return Ok(false);
+    }
+    let next = match next {
+        Ok(next) => next,
+        Err(why) => {
+            let item = if flags.item_index == 0 { 1 } else { flags.item_index };
+            cast_log("load_skipped", &format!("item={item} reason={why}"));
+            return Ok(false);
+        }
+    };
+    match link.load_url(
+        &next.url,
+        &next.content_type,
+        true,
+        CastOrigin::Remote,
+        next.item,
+        next.media_type,
+    ) {
+        Ok(sid) => {
+            flags.media_session = Some(sid);
+            flags.advanced_session = None;
+            flags.failed_session = None;
+            flags.item_index = next.item;
+            flags.media_kind = if next.media_type == "video" {
+                "video"
+            } else {
+                "still"
+            }
+            .into();
+            flags.player_state = "playing".into();
+            flags.error = None;
+            flags.local_cmd = Some("play");
+            flags.local_cmd_at = Instant::now();
+            Ok(true)
+        }
+        Err(err) if err == CAST_CANCELLED => {
+            cast_log(
+                "load_skipped",
+                &format!("item={} reason=cast stopped", next.item),
+            );
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 enum CastCmd {
@@ -3078,6 +3252,7 @@ impl CastState {
             media_kind: String::new(),
             http_port: 0,
             bind_ip: bind.ip.to_string(),
+            item_index: 0,
         }));
         let remote_event = Arc::new(Mutex::new(None));
         let status_t = Arc::clone(&status);
@@ -3245,6 +3420,7 @@ impl CastState {
                     media_kind: String::new(),
                     http_port: 0,
                     bind_ip: String::new(),
+                    item_index: 0,
                 };
             }
         };
@@ -3257,6 +3433,7 @@ impl CastState {
                 media_kind: String::new(),
                 http_port: 0,
                 bind_ip: String::new(),
+                item_index: 0,
             };
         };
         let mut status = live
@@ -3271,6 +3448,7 @@ impl CastState {
                 media_kind: String::new(),
                 http_port: 0,
                 bind_ip: String::new(),
+                item_index: 0,
             });
         status.remote_event = live.remote_event.lock().ok().and_then(|mut g| g.take());
         status
@@ -3374,6 +3552,8 @@ fn run_session(
         media_session: None,
         disconnect_origin: None,
         advanced_session: None,
+        item_index: 0,
+        failed_session: None,
     };
     let mut last_ping = Instant::now();
     let mut running = true;
@@ -3426,15 +3606,51 @@ fn run_session(
                 flags.last_rx = Instant::now();
                 if let Some(state) = update.player {
                     flags.note_state(state, false);
+                    let mut advanced = false;
                     if state == PlayerState::Idle {
-                        flags.note_finished(update.media_session, update.idle_reason);
+                        let next = match http.successor(flags.item_index) {
+                            Ok(next) => Ok(next),
+                            Err(err) if err == "empty playlist" => Err("empty playlist"),
+                            Err(err) if err == "current item unknown" => Err("current item unknown"),
+                            Err(_) => Err("playlist lock"),
+                        };
+                        match on_media_idle(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            next,
+                        ) {
+                            Ok(did) => advanced = did,
+                            Err(err) if err.contains("TV unreachable") => {
+                                flags.connected = false;
+                                flags.error = Some(link_down_message());
+                                publish(&status, |s| {
+                                    s.connected = false;
+                                    s.error = Some(link_down_message());
+                                });
+                                fail_pending(&cmd_rx, &err, &link);
+                                break;
+                            }
+                            Err(_) => {}
+                        }
                     }
                     let name = flags.player_state.clone();
+                    let err = flags.error.clone();
+                    let kind = flags.media_kind.clone();
+                    let item_index = flags.item_index;
                     publish(&status, |s| {
                         s.player_state = name;
-                        s.connected = true;
-                        s.error = None;
+                        s.media_kind = kind;
+                        s.connected = flags.connected;
+                        s.error = err;
+                        s.item_index = item_index;
                     });
+                    if advanced {
+                        if let Ok(mut ev) = flags.remote_event.lock() {
+                            *ev = Some("finished".to_string());
+                        }
+                    }
                 }
             }
             Ok(None) => {}
@@ -3509,10 +3725,14 @@ fn handle_cmd(
                 }
                 let (url, ctype) = http.media_url(&path)?;
                 let kind = http.kind_of(&path)?;
+                let item = http.index_of(&path)?;
                 let play = if kind == "still" { true } else { autoplay };
-                let sid = link.load_url(&url, &ctype, play, origin)?;
+                let sid = link.load_url(&url, &ctype, play, origin, item, &kind)?;
                 flags.media_session = Some(sid);
                 flags.advanced_session = None;
+                flags.failed_session = None;
+                flags.item_index = item;
+                flags.error = None;
                 if let Ok(mut ev) = flags.remote_event.lock() {
                     if ev.as_deref() == Some("finished") {
                         *ev = None;
@@ -3528,6 +3748,7 @@ fn handle_cmd(
                     s.media_kind = kind;
                     s.player_state = flags.player_state.clone();
                     s.error = None;
+                    s.item_index = flags.item_index;
                 });
                 eprintln!("[cast] loaded {}", flags.media_kind);
                 Ok(())
@@ -5323,7 +5544,7 @@ mod tests {
         let token = "0123456789abcdef0123456789abcdef";
         let url = format!("http://192.168.1.52:47200/m/{token}/1");
         let sid = link
-            .load_url(&url, "image/jpeg", true, CastOrigin::User)
+            .load_url(&url, "image/jpeg", true, CastOrigin::User, 1, "photo")
             .unwrap();
         assert_eq!(sid, 7);
         let text = fake.trace_text();
@@ -5340,6 +5561,7 @@ mod tests {
         let written = log.text();
         assert!(written.contains("receiver-connect receiver-0"), "{written}");
         assert!(written.contains("load 192.168.1.52:47200"), "{written}");
+        assert!(written.contains("item=1 type=photo"), "{written}");
         assert!(!written.contains(token), "{written}");
         assert!(!written.contains("vacation"), "{written}");
         link.ping().unwrap();
@@ -5386,7 +5608,7 @@ mod tests {
             fake.trace_text()
         );
         let sid = link
-            .load_url(url, "image/jpeg", true, CastOrigin::User)
+            .load_url(url, "image/jpeg", true, CastOrigin::User, 1, "photo")
             .unwrap();
         assert_eq!(sid, 7);
         assert!(
@@ -5438,6 +5660,8 @@ mod tests {
                 "image/jpeg",
                 true,
                 CastOrigin::User,
+                1,
+                "photo",
             )
             .unwrap_err();
         assert!(
@@ -5471,6 +5695,8 @@ mod tests {
             media_session: Some(7),
             disconnect_origin: None,
             advanced_session: None,
+            item_index: 1,
+            failed_session: None,
         };
         (remote, flags)
     }
@@ -5503,7 +5729,7 @@ mod tests {
         link.launch_receiver().unwrap();
         let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/9";
         assert_eq!(
-            link.load_url(url, "image/jpeg", true, CastOrigin::User)
+            link.load_url(url, "image/jpeg", true, CastOrigin::User, 1, "photo")
                 .unwrap(),
             7
         );
@@ -5535,7 +5761,7 @@ mod tests {
         link.launch_receiver().unwrap();
         let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/8";
         assert_eq!(
-            link.load_url(url, "video/mp4", true, CastOrigin::User)
+            link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
                 .unwrap(),
             7
         );
@@ -5562,7 +5788,7 @@ mod tests {
         link.launch_receiver().unwrap();
         let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/4";
         assert_eq!(
-            link.load_url(url, "video/mp4", true, CastOrigin::User)
+            link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
                 .unwrap(),
             7
         );
@@ -5608,6 +5834,7 @@ mod tests {
             assert!(line.contains("source=user"), "{line}");
         }
         assert!(written.contains("load 192.168.1.52:47200"), "{written}");
+        assert!(written.contains("item=1 type=video"), "{written}");
         assert!(written.contains("reply=PAUSED"), "{written}");
         assert!(written.contains("mediaSessionId=7"), "{written}");
         assert!(
@@ -5634,7 +5861,7 @@ mod tests {
         link.launch_receiver().unwrap();
         let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/11";
         assert_eq!(
-            link.load_url(url, "video/mp4", true, CastOrigin::User)
+            link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
                 .unwrap(),
             7
         );
@@ -5670,6 +5897,8 @@ mod tests {
                 "video/mp4",
                 true,
                 CastOrigin::Timer,
+                1,
+                "video",
             )
             .unwrap_err();
         assert_eq!(err, CAST_CANCELLED);
@@ -5818,38 +6047,45 @@ mod tests {
         let photo3 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3";
         let (_remote, mut flags) = session_after_load("still");
         let sid = link
-            .load_url(photo1, "image/jpeg", true, CastOrigin::User)
+            .load_url(photo1, "image/jpeg", true, CastOrigin::User, 1, "photo")
             .unwrap();
         flags.media_session = Some(sid);
         flags.media_kind = "still".into();
+        flags.item_index = 1;
         let sid = link
-            .load_url(video, "video/mp4", true, CastOrigin::Timer)
+            .load_url(video, "video/mp4", true, CastOrigin::Timer, 2, "video")
             .unwrap();
         flags.media_session = Some(sid);
         flags.advanced_session = None;
         flags.media_kind = "video".into();
-        let mut third = None;
+        flags.item_index = 2;
+        let mut third = false;
         let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && third.is_none() {
+        while Instant::now() < deadline && !third {
             match link.pump() {
                 Ok(Some(update)) => {
                     if update.player == Some(PlayerState::Idle) {
-                        third = load_after_finished(
+                        on_media_idle(
                             &link,
                             &mut flags,
                             update.media_session,
                             update.idle_reason,
-                            photo3,
-                            "image/jpeg",
+                            Ok(Successor {
+                                url: photo3.to_string(),
+                                content_type: "image/jpeg".into(),
+                                item: 3,
+                                media_type: "photo",
+                            }),
                         )
                         .unwrap();
+                        third = flags.item_index == 3;
                     }
                 }
                 Ok(None) => {}
                 Err(e) => panic!("pump: {e}"),
             }
         }
-        assert!(third.is_some(), "FINISHED must load the third item");
+        assert!(third, "FINISHED must load the third item");
         let text = fake.trace_text();
         let loads: Vec<_> = text.lines().filter(|l| l.starts_with("load ")).collect();
         assert_eq!(loads, [
@@ -5873,11 +6109,18 @@ mod tests {
             .filter(|l| l.contains(" load ") && l.contains("source=remote"))
             .collect();
         assert_eq!(remote_loads.len(), 1, "{written}");
+        assert!(
+            remote_loads[0].contains("item=3 type=photo"),
+            "{}",
+            remote_loads[0]
+        );
         assert_eq!(
             written.lines().filter(|l| l.contains(" advance ")).count(),
             1,
             "{written}"
         );
+        assert!(written.contains("item=1 type=photo"), "{written}");
+        assert!(written.contains("item=2 type=video"), "{written}");
     }
 
     #[test]
@@ -5896,27 +6139,32 @@ mod tests {
         let photo3 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3";
         let (_remote, mut flags) = session_after_load("video");
         let sid = link
-            .load_url(video, "video/mp4", true, CastOrigin::User)
+            .load_url(video, "video/mp4", true, CastOrigin::User, 2, "video")
             .unwrap();
         flags.media_session = Some(sid);
         flags.advanced_session = None;
+        flags.item_index = 2;
         let mut advanced = false;
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             match link.pump() {
                 Ok(Some(update)) => {
                     if update.player == Some(PlayerState::Idle) {
-                        if load_after_finished(
+                        let before = flags.item_index;
+                        on_media_idle(
                             &link,
                             &mut flags,
                             update.media_session,
                             update.idle_reason,
-                            photo3,
-                            "image/jpeg",
+                            Ok(Successor {
+                                url: photo3.to_string(),
+                                content_type: "image/jpeg".into(),
+                                item: 3,
+                                media_type: "photo",
+                            }),
                         )
-                        .unwrap()
-                        .is_some()
-                        {
+                        .unwrap();
+                        if flags.item_index != before {
                             advanced = true;
                         }
                     }
@@ -5934,5 +6182,99 @@ mod tests {
         let loads: Vec<_> = text.lines().filter(|l| l.starts_with("load ")).collect();
         assert_eq!(loads, ["load transport-1 item=video-2"], "{text}");
         assert!(!log.text().contains(" advance "), "{}", log.text());
+        assert!(
+            log.text().contains("load_failed item=2 reason=ERROR"),
+            "{}",
+            log.text()
+        );
+    }
+
+    #[test]
+    fn photo_fetch_error_stops_without_loading_the_next_item() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            idle_after: &[(1, "ERROR", 7)],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let photo1 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-1";
+        let photo2 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-2";
+        let (remote, mut flags) = session_after_load("still");
+        let sid = link
+            .load_url(photo1, "image/jpeg", true, CastOrigin::User, 1, "photo")
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.item_index = 1;
+        flags.media_kind = "still".into();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_error = false;
+        while Instant::now() < deadline && !saw_error {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) {
+                        on_media_idle(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            Ok(Successor {
+                                url: photo2.to_string(),
+                                content_type: "image/jpeg".into(),
+                                item: 2,
+                                media_type: "photo",
+                            }),
+                        )
+                        .unwrap();
+                        saw_error = flags.error.is_some();
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        assert!(saw_error, "a failed fetch must be shown to the user");
+        let shown = flags.error.clone().unwrap_or_default();
+        assert!(shown.contains("item 1"), "{shown}");
+        assert!(!shown.contains('/') && !shown.contains('\\'), "{shown}");
+        assert_eq!(
+            remote.lock().unwrap().as_deref(),
+            Some("load_failed"),
+            "the panel reads this event"
+        );
+        let text = fake.trace_text();
+        let loads: Vec<_> = text.lines().filter(|l| l.starts_with("load ")).collect();
+        assert_eq!(
+            loads,
+            ["load transport-1 item=photo-1"],
+            "ERROR must not send the LOAD for item 2: {text}"
+        );
+        let written = log.text();
+        assert!(written.contains("load_failed item=1 reason=ERROR"), "{written}");
+        assert!(written.contains("item=1 type=photo"), "{written}");
+        assert!(!written.contains(" advance "), "{written}");
+        assert!(!written.contains("photo-2"), "{written}");
+    }
+
+    #[test]
+    fn successor_is_the_next_playlist_item() {
+        let first = scratch("one.jpg", &jpeg_bytes());
+        let second = scratch("two.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(http.index_of(&first).unwrap(), 1);
+        assert_eq!(http.index_of(&second).unwrap(), 2);
+        let next = http.successor(1).unwrap();
+        assert_eq!(next.item, 2);
+        assert_eq!(next.media_type, "video");
+        assert!(next.url.starts_with(&format!("http://127.0.0.1:{}", http.port)));
+        let wrapped = http.successor(2).unwrap();
+        assert_eq!(wrapped.item, 1);
+        assert_eq!(wrapped.media_type, "photo");
+        match http.successor(0) {
+            Err(err) => assert_eq!(err, "current item unknown"),
+            Ok(_) => panic!("item 0 is not a playlist index"),
+        }
     }
 }

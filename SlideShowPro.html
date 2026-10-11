@@ -5739,6 +5739,7 @@ function schedNext() {
 }
 
 function goTo(i, source) {
+  if (window.__sspCastActive && source && source !== 'remote') window.__sspCastMoved = true;
   clearTimeout(tmr); clearInterval(ptmr);
   if (kbId) { cancelAnimationFrame(kbId); kbId = null; }
   if (compKbId) { cancelAnimationFrame(compKbId); compKbId = null; }
@@ -5787,7 +5788,11 @@ function goTo(i, source) {
 
   const outSl = getSl(prevCur);
   const inSl = getSl(next);
-  if (!inSl) return;
+  if (!inSl) {
+    cur = next;
+    try { sspCastHook('slide', source || 'user'); } catch (_) {}
+    return;
+  }
 
   if (outSl && outSl !== inSl) {
     if (outgoingClass) {
@@ -5808,11 +5813,13 @@ function goTo(i, source) {
   g('fnov').textContent = getMediaItems()[cur]?.name || '';
   pauseVids();
   showMaxCompanion(cur);
-  if (window.__sspCastActive) {
-    if (isV(cur)) { staticT(); clearTimeout(tmr); }
+  try {
+    if (window.__sspCastActive) {
+      if (isV(cur)) { staticT(); clearTimeout(tmr); }
+      else { startKB(cur); startProg(); if (playing) schedNext(); }
+    } else if (isV(cur)) { staticT(); playCurVid(); startVProg(cur); }
     else { startKB(cur); startProg(); if (playing) schedNext(); }
-  } else if (isV(cur)) { staticT(); playCurVid(); startVProg(cur); }
-  else { startKB(cur); startProg(); if (playing) schedNext(); }
+  } catch (_) {}
   updPlCur();
   scheduleStagePrune(cur);
   try { notifyPlaylistSync(); } catch (_) {}
@@ -7504,7 +7511,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     call("cast_status").then(function (st) {
       if (!st || !castActive) return;
       var ev = field(st, "remote_event");
-      if (ev === "paused" && sspCastPlaying()) {
+      if (ev === "load_failed") {
+        setStatus(field(st, "error") || "The TV could not load this slide.");
+      } else if (ev === "paused" && sspCastPlaying()) {
         window.__sspCastEcho = true;
         try { if (typeof togglePlay === "function") togglePlay(); } finally { window.__sspCastEcho = false; }
         setStatus("Paused from the TV remote.");
@@ -7512,7 +7521,16 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         window.__sspCastEcho = true;
         try { if (typeof togglePlay === "function") togglePlay(); } finally { window.__sspCastEcho = false; }
       } else if (ev === "finished" && sspCastPlaying()) {
-        if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), 'remote');
+        var already = window.__sspCastMoved;
+        window.__sspCastMoved = false;
+        if (!already) {
+          window.__sspCastEcho = true;
+          try {
+            var loaded = field(st, "item_index");
+            if (typeof goTo === "function" && loaded > 0) goTo(loaded - 1, 'remote');
+            else if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), 'remote');
+          } finally { window.__sspCastEcho = false; }
+        }
       }
       if (!field(st, "connected")) {
         stopLocalCast();
