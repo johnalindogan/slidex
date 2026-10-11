@@ -6,7 +6,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1573,10 +1575,217 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-type CastStream = StreamOwned<ClientConnection, TcpStream>;
+/// Largest Cast frame we will assemble. A hostile length must not pin memory.
+const CAST_FRAME_MAX: usize = 1_048_576;
+const READ_POLL: Duration = Duration::from_millis(15);
+
+/// `TimedOut` (Windows 10060) and `WouldBlock` both mean the socket has no
+/// bytes ready. rustls treats only `WouldBlock` as idle, and a Windows
+/// `SO_RCVTIMEO` leaves the socket undefined, so the cast socket never uses one.
+fn io_is_idle(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+        || matches!(err.raw_os_error(), Some(10060) | Some(10035) | Some(11) | Some(110))
+        || is_cast_timeout(&err.to_string())
+}
+
+struct IdleSocket {
+    inner: TcpStream,
+}
+
+impl Read for IdleSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.inner.read(buf) {
+            Err(err) if io_is_idle(&err) => Err(ErrorKind::WouldBlock.into()),
+            other => other,
+        }
+    }
+}
+
+impl Write for IdleSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.inner.write(buf) {
+            Err(err) if io_is_idle(&err) => Err(ErrorKind::WouldBlock.into()),
+            other => other,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.inner.flush() {
+            Err(err) if io_is_idle(&err) => Err(ErrorKind::WouldBlock.into()),
+            other => other,
+        }
+    }
+}
+
+/// Plaintext framing in front of rustls.
+///
+/// `MessageManager` uses `read_exact`. A short read followed by `TimedOut`
+/// drops the bytes already taken and desynchronizes the stream. This reader
+/// keeps every byte it has seen, releases a length prefix only after the whole
+/// frame is buffered, and turns either idle error into "no data yet".
+struct CastPlain<C, S> {
+    inner: StreamOwned<C, IdleSocket>,
+    pending: Vec<u8>,
+    /// Bytes of the current frame not yet handed to `read_exact`, including the
+    /// 4-byte length. Zero means the next read must start a new frame.
+    frame_left: usize,
+    pace: Arc<Mutex<Duration>>,
+    _side: PhantomData<S>,
+}
+
+impl<C, S> CastPlain<C, S>
+where
+    C: DerefMut + Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+    StreamOwned<C, IdleSocket>: Read + Write,
+{
+    fn new(inner: StreamOwned<C, IdleSocket>, pace: Arc<Mutex<Duration>>) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            frame_left: 0,
+            pace,
+            _side: PhantomData,
+        }
+    }
+
+    fn pace(&self) -> Duration {
+        self.pace.lock().map(|g| *g).unwrap_or(READ_SLICE)
+    }
+
+    fn have_full_frame(&self) -> bool {
+        if self.pending.len() < 4 {
+            return false;
+        }
+        let len = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
+        len <= CAST_FRAME_MAX && self.pending.len() >= 4 + len
+    }
+
+    /// Copy already-decrypted TLS plaintext into `pending` before any further
+    /// socket read. `Stream::read` can return `TimedOut`/`WouldBlock` from
+    /// `complete_io` even after rustls has plaintext waiting.
+    fn drain_plain(&mut self) -> std::io::Result<()> {
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = match self.inner.conn.reader().read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if io_is_idle(&err) => break,
+                Err(err) => return Err(err),
+            };
+            self.pending.extend_from_slice(&tmp[..n]);
+        }
+        Ok(())
+    }
+
+    fn pull_some(&mut self) -> std::io::Result<bool> {
+        let before = self.pending.len();
+        self.drain_plain()?;
+        if self.have_full_frame() {
+            return Ok(true);
+        }
+        let mut tmp = [0u8; 8192];
+        match self.inner.read(&mut tmp) {
+            Ok(0) => Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                self.pending.extend_from_slice(&tmp[..n]);
+                Ok(true)
+            }
+            Err(err) if io_is_idle(&err) => {
+                self.drain_plain()?;
+                Ok(self.pending.len() > before || self.have_full_frame())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn buffer_full_frame(&mut self) -> std::io::Result<()> {
+        let idle_deadline = Instant::now() + self.pace();
+        let mut started_frame = Instant::now();
+        let mut saw_byte = !self.pending.is_empty();
+        loop {
+            if self.pending.len() >= 4 {
+                let len = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
+                if len > CAST_FRAME_MAX {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "cast frame is too large",
+                    ));
+                }
+            }
+            if self.have_full_frame() {
+                return Ok(());
+            }
+            let got = self.pull_some()?;
+            if got {
+                if !saw_byte && !self.pending.is_empty() {
+                    saw_byte = true;
+                    started_frame = Instant::now();
+                }
+                continue;
+            }
+            let now = Instant::now();
+            // A frame that has already started must be finished. Returning idle
+            // here would drop the length prefix on the next `read_exact`.
+            let deadline = if saw_byte {
+                idle_deadline.max(started_frame + LINK_DEAD_AFTER)
+            } else {
+                idle_deadline
+            };
+            if now >= deadline {
+                return Err(ErrorKind::WouldBlock.into());
+            }
+            thread::sleep(READ_POLL.min(deadline.saturating_duration_since(now)));
+        }
+    }
+}
+
+impl<C, S> Read for CastPlain<C, S>
+where
+    C: DerefMut + Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+    StreamOwned<C, IdleSocket>: Read + Write,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.frame_left == 0 {
+            self.buffer_full_frame()?;
+            let len = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
+            self.frame_left = 4 + len;
+        }
+        let n = buf.len().min(self.frame_left);
+        if self.pending.len() < n {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        buf[..n].copy_from_slice(&self.pending[..n]);
+        self.pending.drain(..n);
+        self.frame_left -= n;
+        Ok(n)
+    }
+}
+
+impl<C, S> Write for CastPlain<C, S>
+where
+    C: DerefMut + Deref<Target = rustls::ConnectionCommon<S>>,
+    S: rustls::SideData,
+    StreamOwned<C, IdleSocket>: Read + Write,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+type CastStream = CastPlain<ClientConnection, rustls::client::ClientConnectionData>;
 
 struct CastLink {
     tcp: TcpStream,
+    pace: Arc<Mutex<Duration>>,
     mm: Rc<MessageManager<CastStream>>,
     heartbeat: HeartbeatChannel<'static, CastStream>,
     connection: ConnectionChannel<'static, CastStream>,
@@ -1598,6 +1807,8 @@ impl CastLink {
             )
         })?;
         tcp.set_nodelay(true).ok();
+        // Blocking only for the TLS handshake. Cleared in `arm_idle` before any
+        // read loop — a Windows read timeout must not be left on this socket.
         tcp.set_read_timeout(Some(Duration::from_secs(4))).ok();
         tcp.set_write_timeout(Some(Duration::from_secs(4))).ok();
         let tcp_ctl = tcp.try_clone().map_err(|e| format!("cast socket: {e}"))?;
@@ -1612,7 +1823,8 @@ impl CastLink {
             .to_owned();
         let conn = ClientConnection::new(Arc::new(config), name)
             .map_err(|e| format!("cast tls: {e}"))?;
-        let stream = StreamOwned::new(conn, tcp);
+        let pace = Arc::new(Mutex::new(Duration::from_secs(4)));
+        let stream = CastPlain::new(StreamOwned::new(conn, IdleSocket { inner: tcp }), Arc::clone(&pace));
         let mm = Rc::new(MessageManager::new(stream));
         let heartbeat = HeartbeatChannel::new("sender-0", "receiver-0", Rc::clone(&mm));
         let connection = ConnectionChannel::new("sender-0", Rc::clone(&mm));
@@ -1621,6 +1833,7 @@ impl CastLink {
         cast_log("tls", &format!("{host}:{port}"));
         Ok(Self {
             tcp: tcp_ctl,
+            pace,
             mm,
             heartbeat,
             connection,
@@ -1637,12 +1850,27 @@ impl CastLink {
             .connect("receiver-0")
             .map_err(|e| format!("Could not connect to the TV ({e})."))?;
         cast_log("receiver-connect", "receiver-0");
+        // Handshake is done. Further reads must not use SO_RCVTIMEO.
+        link.arm_idle();
         link.ping()?;
         Ok(link)
     }
 
+    fn set_pace(&self, dur: Duration) {
+        if let Ok(mut pace) = self.pace.lock() {
+            *pace = dur;
+        }
+    }
+
+    fn arm_idle(&self) {
+        self.tcp.set_read_timeout(None).ok();
+        self.tcp.set_write_timeout(None).ok();
+        self.tcp.set_nonblocking(true).ok();
+    }
+
     fn set_read_timeout(&self, dur: Duration) {
-        self.tcp.set_read_timeout(Some(dur)).ok();
+        self.set_pace(dur);
+        self.arm_idle();
     }
 
     fn send_json(&self, namespace: &str, destination: &str, payload: &str) -> Result<(), rust_cast::errors::Error> {
@@ -1708,18 +1936,25 @@ impl CastLink {
         let started = Instant::now();
         let mut last_heard = Instant::now();
         let mut last_ping = Instant::now();
-        self.set_read_timeout(READ_SLICE);
+        self.arm_idle();
         loop {
-            if started.elapsed() >= deadline || last_heard.elapsed() >= LINK_DEAD_AFTER {
-                return Err(timeout_message.to_string());
-            }
-            if last_ping.elapsed() >= PING_EVERY {
-                last_ping = Instant::now();
-                self.ping()?;
-            }
+            let remaining = deadline.saturating_sub(started.elapsed());
+            let silence = LINK_DEAD_AFTER.saturating_sub(last_heard.elapsed());
+            // A zero slice still drains plaintext rustls already decrypted.
+            let slice = remaining.min(silence).min(READ_SLICE);
+            self.set_pace(slice);
             let msg = match self.mm.receive() {
                 Ok(msg) => msg,
-                Err(e) if cast_err_is_timeout(&e) => continue,
+                Err(e) if cast_err_is_timeout(&e) => {
+                    if slice.is_zero() {
+                        return Err(timeout_message.to_string());
+                    }
+                    if last_ping.elapsed() >= PING_EVERY {
+                        last_ping = Instant::now();
+                        let _ = self.ping();
+                    }
+                    continue;
+                }
                 Err(e) => {
                     return Err(if is_cast_timeout(&e.to_string()) {
                         timeout_message.to_string()
@@ -1855,7 +2090,11 @@ impl CastLink {
     }
 
     fn ping(&self) -> Result<(), String> {
-        self.heartbeat.ping().map_err(|_| link_down_message())
+        match self.heartbeat.ping() {
+            Ok(()) => Ok(()),
+            Err(err) if cast_err_is_timeout(&err) => Ok(()),
+            Err(_) => Err(link_down_message()),
+        }
     }
 }
 
@@ -3672,6 +3911,8 @@ mod tests {
     }
 
     fn send_receiver_status<S: Read + Write>(mm: &MessageManager<S>, request_id: u32, traces: &Mutex<Vec<String>>) {
+        // Record before the write so a fast client cannot observe the frame first.
+        note_trace(traces, "receiver-status");
         let decoy = serde_json::json!({
             "requestId": 999,
             "type": "RECEIVER_STATUS",
@@ -3706,7 +3947,6 @@ mod tests {
             }
         });
         fake_send(mm, NS_RECEIVER, "receiver-0", &real.to_string());
-        note_trace(traces, "receiver-status");
     }
 
     fn send_media_status<S: Read + Write>(mm: &MessageManager<S>, request_id: u32, session: i32) {
@@ -3783,8 +4023,8 @@ mod tests {
                         "type": "LAUNCH_ERROR",
                         "reason": reason,
                     });
-                    fake_send(mm, NS_RECEIVER, "receiver-0", &body.to_string());
                     note_trace(traces, "launch-error");
+                    fake_send(mm, NS_RECEIVER, "receiver-0", &body.to_string());
                     continue;
                 }
                 launch_id = id;
@@ -3806,13 +4046,13 @@ mod tests {
                         "requestId": id,
                         "type": "LOAD_FAILED",
                     });
-                    fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
                     note_trace(traces, "load-failed");
+                    fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
                     continue;
                 }
+                note_trace(traces, "media-status");
                 send_media_status(mm, 999, 1);
                 send_media_status(mm, id, 7);
-                note_trace(traces, "media-status");
             }
         }
     }
@@ -3831,15 +4071,20 @@ mod tests {
             while !stop_t.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((tcp, _)) => {
-                        tcp.set_read_timeout(Some(Duration::from_millis(200))).ok();
-                        tcp.set_write_timeout(Some(Duration::from_secs(2))).ok();
                         tcp.set_nodelay(true).ok();
+                        tcp.set_read_timeout(None).ok();
+                        tcp.set_write_timeout(None).ok();
+                        tcp.set_nonblocking(true).ok();
                         let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&config)) else {
                             note_trace(&traces_t, "tls-config");
                             continue;
                         };
-                        let stream = StreamOwned::new(conn, tcp);
-                        let mm = MessageManager::new(stream);
+                        let pace = Arc::new(Mutex::new(READ_SLICE));
+                        let plain = CastPlain::new(
+                            StreamOwned::new(conn, IdleSocket { inner: tcp }),
+                            pace,
+                        );
+                        let mm = MessageManager::new(plain);
                         fake_session(&mm, script, traces_t.as_ref(), &stop_t);
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -3872,6 +4117,10 @@ mod tests {
         );
         let refused = "The TV refused to open the player (NOT_FOUND).";
         assert_eq!(map_launch_failure(refused), refused);
+        let timed_out = std::io::Error::new(ErrorKind::TimedOut, "os error 10060");
+        assert!(io_is_idle(&timed_out));
+        assert!(io_is_idle(&std::io::Error::new(ErrorKind::WouldBlock, "would block")));
+        assert!(io_is_idle(&std::io::Error::from_raw_os_error(10060)));
         assert_eq!(unix_to_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_utc(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(
