@@ -7511,7 +7511,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       } else if (ev === "playing" && !sspCastPlaying()) {
         window.__sspCastEcho = true;
         try { if (typeof togglePlay === "function") togglePlay(); } finally { window.__sspCastEcho = false; }
-      } else if (ev === "finished") {
+      } else if (ev === "finished" && sspCastPlaying()) {
         if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), 'remote');
       }
       if (!field(st, "connected")) {
