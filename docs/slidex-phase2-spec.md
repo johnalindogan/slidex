@@ -191,14 +191,23 @@ Two entries start the same pipeline. Both run in the background, report progress
 
 | Trigger | Input | Output |
 | --- | --- | --- |
-| Watched folder | A folder named **Make a video**. Files that land there are the input. | A sibling output folder, beside the watched folder. |
-| In-app **Make video** | A playlist or a selection, a music track, and a target length. | The finished video for that command. |
+| Watched folder | A folder named **Make a video**. A file is picked up only after its size has been stable for 5s. | A sibling output folder, beside the watched folder. That output folder is ignored. |
+| In-app **Make video** | A playlist or a selection, a music track, and a target length. Placeholders the user picked are downloaded, with progress and cancel. | The finished video for that command. |
 
-The watched folder needs no extra step once it is being watched: new media in that folder is the input, and the finished file is written next to it. The in-app command is the one that takes the music track and the target length with the playlist or the selection.
+**Watched folder**
+
+- A file is picked up only after its size has been stable for 5 seconds.
+- SlideX ignores its own output folder, the sibling folder the finished video is written to.
+- Cloud-only placeholder files are skipped, and each skip is logged. A placeholder carries `FILE_ATTRIBUTE_OFFLINE`, `RECALL_ON_OPEN`, or `RECALL_ON_DATA_ACCESS` (Nextcloud virtual files are the example). The watch does not download them.
+- On a network share (`\\host\...`), the watch does not use change notifications. A background thread polls every 30–60 seconds. Each root uses the same per-root timeout as `paths_exist` (2.5s). If that root does not answer in time, the UI shows **folder unreachable** and the poll does not hang.
+
+**In-app Make video**
+
+The in-app command takes the music track and the target length with the playlist or the selection. It differs from the watch: placeholders the user picked are downloaded, with progress and cancel.
 
 ### Points-of-interest analysis
 
-The analysis runs once per file. A repeat run with the same bytes and the same mtime reads the cache described below.
+The analysis runs once per file. A repeat run with the same size, the same mtime, and the same first-and-last 4 MB hash reads the cache described below.
 
 Videos are scored about once a second. Each sample records faces, saliency, motion, sharpness, exposure, and audio peaks. The pass keeps the best windows and skips stretches that are blurry, shaky, or dark.
 
@@ -225,7 +234,7 @@ Shake is measured from optical flow. It is not a separate learned model.
 
 ### Cache
 
-The cache key is the content hash together with the file mtime. One entry per file. The entry is written after the first successful analysis and read on later runs.
+The cache key is the file size, the mtime, and a hash of the first 4 MB and the last 4 MB. It is not a full-file hash. One entry per file. The entry is written after the first successful analysis and read on later runs.
 
 **Hard requirement.** The analysis cache stores only boxes, scores and timestamps. It never stores face crops, face embeddings, or anything that identifies a person, and it lives only beside SlideX's own app data under `%LOCALAPPDATA%`.
 
@@ -262,7 +271,7 @@ Auto-video feeds that planner the points of interest. Pans and zooms start and e
 
 1. 20 mixed files plus a song produce a finished video with no input.
 2. Cuts land on beats within one frame.
-3. Subjects are framed and faces are never cut off.
+3. Every detected face box stays 100% inside the frame on every rendered frame.
 4. Bad footage is skipped.
 5. A rerun uses the cache and is much faster (target at least 5×).
 6. A log records each chosen window and why (scores).
