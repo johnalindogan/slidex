@@ -3020,6 +3020,11 @@ struct SessionFlags {
     item_index: u32,
     /// mediaSessionId we already reported as a failed fetch, so IDLE/ERROR is one line.
     failed_session: Option<i32>,
+    /// The page's play/pause, separate from the TV's playerState. Photo advances
+    /// and a video FINISHED both wait on this. The TV status must not change it.
+    slideshow_playing: bool,
+    /// mediaSessionId whose photo FINISHED we already logged.
+    ignored_photo: Option<i32>,
 }
 
 impl SessionFlags {
@@ -3089,11 +3094,23 @@ impl SessionFlags {
         }
         true
     }
+
+    /// Receiver FINISHED on a still. Logged once per media session, then ignored.
+    fn note_photo_finished_ignored(&mut self, session: i32) {
+        if self.ignored_photo == Some(session) {
+            return;
+        }
+        self.ignored_photo = Some(session);
+        let item = if self.item_index == 0 { 1 } else { self.item_index };
+        cast_log("photo_finished_ignored", &format!("item={item}"));
+    }
 }
 
 /// IDLE for the current media session.
-/// FINISHED loads `next`, or logs why that LOAD was not sent.
-/// ERROR is a failed fetch: tell the user and do not skip to the next slide.
+/// A video FINISHED loads `next` while the slideshow is playing, or logs why
+/// that LOAD was not sent. A photo FINISHED is logged and ignored: the
+/// slideshow timer is the only photo advance. ERROR is a failed fetch: tell
+/// the user and do not skip to the next slide.
 /// `Ok(true)` means the next LOAD was sent. The caller publishes `item_index`
 /// before raising the finished event, so the page moves to that item.
 fn on_media_idle(
@@ -3114,6 +3131,13 @@ fn on_media_idle(
     }
     if reason == Some(IdleReason::Error) {
         flags.note_load_failed(session);
+        return Ok(false);
+    }
+    if flags.media_kind == "still" && reason == Some(IdleReason::Finished) {
+        flags.note_photo_finished_ignored(session);
+        return Ok(false);
+    }
+    if reason == Some(IdleReason::Finished) && !flags.slideshow_playing {
         return Ok(false);
     }
     if !flags.note_finished(Some(session), reason) {
@@ -3139,6 +3163,54 @@ fn on_media_idle(
             flags.media_session = Some(sid);
             flags.advanced_session = None;
             flags.failed_session = None;
+            flags.ignored_photo = None;
+            flags.item_index = next.item;
+            flags.media_kind = if next.media_type == "video" {
+                "video"
+            } else {
+                "still"
+            }
+            .into();
+            flags.player_state = "playing".into();
+            flags.error = None;
+            flags.local_cmd = Some("play");
+            flags.local_cmd_at = Instant::now();
+            Ok(true)
+        }
+        Err(err) if err == CAST_CANCELLED => {
+            cast_log(
+                "load_skipped",
+                &format!("item={} reason=cast stopped", next.item),
+            );
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Slideshow timer for the photo now on the TV. A video, or a paused slideshow,
+/// does not step. No finished event: the page already moved.
+fn on_photo_timer(
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    next: Successor,
+) -> Result<bool, String> {
+    if !flags.slideshow_playing || flags.media_kind != "still" {
+        return Ok(false);
+    }
+    match link.load_url(
+        &next.url,
+        &next.content_type,
+        true,
+        CastOrigin::Timer,
+        next.item,
+        next.media_type,
+    ) {
+        Ok(sid) => {
+            flags.media_session = Some(sid);
+            flags.advanced_session = None;
+            flags.failed_session = None;
+            flags.ignored_photo = None;
             flags.item_index = next.item;
             flags.media_kind = if next.media_type == "video" {
                 "video"
@@ -3554,6 +3626,8 @@ fn run_session(
         advanced_session: None,
         item_index: 0,
         failed_session: None,
+        slideshow_playing: true,
+        ignored_photo: None,
     };
     let mut last_ping = Instant::now();
     let mut running = true;
@@ -3731,6 +3805,8 @@ fn handle_cmd(
                 flags.media_session = Some(sid);
                 flags.advanced_session = None;
                 flags.failed_session = None;
+                flags.ignored_photo = None;
+                flags.slideshow_playing = autoplay;
                 flags.item_index = item;
                 flags.error = None;
                 if let Ok(mut ev) = flags.remote_event.lock() {
@@ -3779,6 +3855,7 @@ fn handle_cmd(
                 // not a remote event; stills ignore playerState entirely.
                 link.pause(sid, origin)?;
                 flags.player_state = "paused".into();
+                flags.slideshow_playing = false;
                 flags.last_rx = Instant::now();
                 publish(status, |s| s.player_state = "paused".into());
                 Ok(())
@@ -3795,6 +3872,7 @@ fn handle_cmd(
                     .ok_or_else(|| "Nothing is casting.".to_string())?;
                 link.play(sid, origin)?;
                 flags.player_state = "playing".into();
+                flags.slideshow_playing = true;
                 flags.last_rx = Instant::now();
                 publish(status, |s| s.player_state = "playing".into());
                 Ok(())
@@ -4939,6 +5017,9 @@ mod tests {
         /// After the Nth successful LOAD (1-based), send IDLE with this idleReason.
         /// Session 0 means the loaded session (7). A non-matching id is a stale item.
         idle_after: &'static [(u32, &'static str, i32)],
+        /// When non-zero, `idle_after` waits this long after the LOAD instead of
+        /// being sent inside the LOAD handler. Zero keeps the immediate send.
+        idle_delay: Duration,
     }
 
     impl Default for FakeScript {
@@ -4949,6 +5030,7 @@ mod tests {
                 load_state: "PLAYING",
                 follow_states: &[],
                 idle_after: &[],
+                idle_delay: Duration::ZERO,
             }
         }
     }
@@ -5120,6 +5202,30 @@ mod tests {
         fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
     }
 
+    struct DueIdle {
+        at: Instant,
+        reason: &'static str,
+        session: i32,
+    }
+
+    fn flush_due_idles<S: Read + Write>(
+        mm: &MessageManager<S>,
+        traces: &Mutex<Vec<String>>,
+        due: &mut Vec<DueIdle>,
+    ) {
+        let now = Instant::now();
+        let mut i = 0;
+        while i < due.len() {
+            if due[i].at > now {
+                i += 1;
+                continue;
+            }
+            let idle = due.remove(i);
+            note_trace(traces, &format!("idle {} session={}", idle.reason, idle.session));
+            send_media_status_idle(mm, 0, idle.session, "IDLE", Some(idle.reason));
+        }
+    }
+
     fn fake_session<S: Read + Write>(
         mm: &MessageManager<S>,
         script: FakeScript,
@@ -5131,7 +5237,9 @@ mod tests {
         let mut awaiting_pong = false;
         let mut launch_id = 0u32;
         let mut loads = 0u32;
+        let mut due: Vec<DueIdle> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
+            flush_due_idles(mm, traces, &mut due);
             let msg = match mm.receive() {
                 Ok(msg) => msg,
                 Err(e) if cast_err_is_timeout(&e) => continue,
@@ -5232,8 +5340,16 @@ mod tests {
                         continue;
                     }
                     let sid = if session == 0 { 7 } else { session };
-                    note_trace(traces, &format!("idle {reason} session={sid}"));
-                    send_media_status_idle(mm, 0, sid, "IDLE", Some(reason));
+                    if script.idle_delay.is_zero() {
+                        note_trace(traces, &format!("idle {reason} session={sid}"));
+                        send_media_status_idle(mm, 0, sid, "IDLE", Some(reason));
+                    } else {
+                        due.push(DueIdle {
+                            at: Instant::now() + script.idle_delay,
+                            reason,
+                            session: sid,
+                        });
+                    }
                 }
                 continue;
             }
@@ -5697,6 +5813,8 @@ mod tests {
             advanced_session: None,
             item_index: 1,
             failed_session: None,
+            slideshow_playing: true,
+            ignored_photo: None,
         };
         (remote, flags)
     }
@@ -6255,6 +6373,342 @@ mod tests {
         assert!(written.contains("item=1 type=photo"), "{written}");
         assert!(!written.contains(" advance "), "{written}");
         assert!(!written.contains("photo-2"), "{written}");
+    }
+
+    fn socket_loads(fake: &FakeTv) -> Vec<String> {
+        fake.trace_text()
+            .lines()
+            .filter(|line| line.starts_with("load "))
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn photo_finished_at_10s_loads_the_next_item_only_at_15s() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            idle_after: &[(1, "FINISHED", 7)],
+            idle_delay: Duration::from_secs(10),
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let photo1 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-1";
+        let photo2 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-2";
+        let (remote, mut flags) = session_after_load("still");
+        let sid = link
+            .load_url(photo1, "image/jpeg", true, CastOrigin::User, 1, "photo")
+            .unwrap();
+        let started = Instant::now();
+        flags.media_session = Some(sid);
+        flags.media_kind = "still".into();
+        flags.item_index = 1;
+        flags.slideshow_playing = true;
+        flags.advanced_session = None;
+        flags.ignored_photo = None;
+        let mut saw_finished = false;
+        let mut finished_at = Duration::ZERO;
+        let mut timer_at = None;
+        let mut next_ping = Instant::now();
+        let deadline = started + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if Instant::now() >= next_ping {
+                link.ping().expect("ping");
+                next_ping = Instant::now() + PING_EVERY;
+            }
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) && !saw_finished {
+                        saw_finished = true;
+                        finished_at = started.elapsed();
+                        assert_eq!(
+                            socket_loads(&fake),
+                            ["load transport-1 item=photo-1"],
+                            "FINISHED must not load the next photo"
+                        );
+                        let did = on_media_idle(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            Ok(Successor {
+                                url: photo2.to_string(),
+                                content_type: "image/jpeg".into(),
+                                item: 2,
+                                media_type: "photo",
+                            }),
+                        )
+                        .unwrap();
+                        assert!(!did, "a photo FINISHED must not advance");
+                        assert_eq!(flags.item_index, 1);
+                        assert!(flags.error.is_none(), "{:?}", flags.error);
+                        let ev = remote.lock().unwrap().clone();
+                        assert_ne!(ev.as_deref(), Some("finished"));
+                        assert_ne!(ev.as_deref(), Some("load_failed"));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+            if timer_at.is_none() && started.elapsed() >= Duration::from_secs(15) {
+                assert_eq!(
+                    socket_loads(&fake),
+                    ["load transport-1 item=photo-1"],
+                    "the slideshow timer is the only photo advance"
+                );
+                let did = on_photo_timer(
+                    &link,
+                    &mut flags,
+                    Successor {
+                        url: photo2.to_string(),
+                        content_type: "image/jpeg".into(),
+                        item: 2,
+                        media_type: "photo",
+                    },
+                )
+                .unwrap();
+                assert!(did, "the 15s timer must load the next photo");
+                timer_at = Some(started.elapsed());
+            }
+            if timer_at.is_some() && saw_finished && started.elapsed() >= Duration::from_secs(18) {
+                break;
+            }
+        }
+        assert!(saw_finished, "the fake TV never sent FINISHED");
+        assert!(
+            finished_at >= Duration::from_millis(8500)
+                && finished_at <= Duration::from_millis(12500),
+            "FINISHED arrived at {finished_at:?}"
+        );
+        let timer_at = timer_at.expect("the slideshow timer did not fire");
+        assert!(
+            timer_at >= Duration::from_secs(14) && timer_at <= Duration::from_secs(17),
+            "next LOAD went out at {timer_at:?}"
+        );
+        assert_eq!(
+            socket_loads(&fake),
+            [
+                "load transport-1 item=photo-1",
+                "load transport-1 item=photo-2",
+            ],
+            "the next photo is loaded once"
+        );
+        let written = log.text();
+        let ignored: Vec<_> = written
+            .lines()
+            .filter(|line| line.contains("photo_finished_ignored"))
+            .collect();
+        assert_eq!(ignored.len(), 1, "{written}");
+        assert!(ignored[0].contains("item=1"), "{}", ignored[0]);
+        let timer_loads: Vec<_> = written
+            .lines()
+            .filter(|line| line.contains(" load ") && line.contains("source=timer"))
+            .collect();
+        assert_eq!(timer_loads.len(), 1, "{written}");
+        assert!(timer_loads[0].contains("item=2 type=photo"), "{}", timer_loads[0]);
+        assert!(!written.contains(" advance "), "{written}");
+        assert!(!written.contains("source=remote"), "{written}");
+        assert!(!written.contains("load_failed"), "{written}");
+        assert!(flags.error.is_none(), "{:?}", flags.error);
+    }
+
+    #[test]
+    fn video_finished_advances_exactly_once() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            idle_after: &[(1, "FINISHED", 7)],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let video = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/video-1";
+        let photo2 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-2";
+        let (_remote, mut flags) = session_after_load("video");
+        flags.slideshow_playing = true;
+        let sid = link
+            .load_url(video, "video/mp4", true, CastOrigin::User, 1, "video")
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.media_kind = "video".into();
+        flags.item_index = 1;
+        flags.advanced_session = None;
+        let mut advances = 0u32;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) {
+                        let before = flags.item_index;
+                        on_media_idle(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            Ok(Successor {
+                                url: photo2.to_string(),
+                                content_type: "image/jpeg".into(),
+                                item: 2,
+                                media_type: "photo",
+                            }),
+                        )
+                        .unwrap();
+                        if flags.item_index != before {
+                            advances += 1;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        assert_eq!(advances, 1, "a video FINISHED advances once");
+        assert_eq!(
+            socket_loads(&fake),
+            [
+                "load transport-1 item=video-1",
+                "load transport-1 item=photo-2",
+            ],
+        );
+        let written = log.text();
+        assert_eq!(
+            written.lines().filter(|line| line.contains(" advance ")).count(),
+            1,
+            "{written}"
+        );
+        let remote_loads: Vec<_> = written
+            .lines()
+            .filter(|line| line.contains(" load ") && line.contains("source=remote"))
+            .collect();
+        assert_eq!(remote_loads.len(), 1, "{written}");
+        assert!(remote_loads[0].contains("item=2 type=photo"), "{}", remote_loads[0]);
+        assert!(!written.contains("photo_finished_ignored"), "{written}");
+    }
+
+    #[test]
+    fn paused_slideshow_does_not_advance_on_a_photo_timer_or_a_video_finished() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 7)],
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let photo1 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-1";
+        let video = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/video-2";
+        let photo3 = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3";
+        let (remote, mut flags) = session_after_load("still");
+        flags.slideshow_playing = false;
+        let sid = link
+            .load_url(photo1, "image/jpeg", true, CastOrigin::User, 1, "photo")
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.media_kind = "still".into();
+        flags.item_index = 1;
+        flags.slideshow_playing = false;
+        let next_photo = Successor {
+            url: photo3.to_string(),
+            content_type: "image/jpeg".into(),
+            item: 2,
+            media_type: "photo",
+        };
+        let mut saw_photo = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !saw_photo {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) {
+                        let did = on_media_idle(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            Ok(Successor {
+                                url: next_photo.url.clone(),
+                                content_type: next_photo.content_type.clone(),
+                                item: next_photo.item,
+                                media_type: next_photo.media_type,
+                            }),
+                        )
+                        .unwrap();
+                        assert!(!did);
+                        saw_photo = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        assert!(saw_photo, "the photo FINISHED never arrived");
+        let stepped = on_photo_timer(
+            &link,
+            &mut flags,
+            Successor {
+                url: next_photo.url.clone(),
+                content_type: next_photo.content_type.clone(),
+                item: next_photo.item,
+                media_type: next_photo.media_type,
+            },
+        )
+        .unwrap();
+        assert!(!stepped, "a paused slideshow must not step on the photo timer");
+        assert_eq!(flags.item_index, 1);
+        assert_eq!(socket_loads(&fake), ["load transport-1 item=photo-1"]);
+
+        let sid = link
+            .load_url(video, "video/mp4", false, CastOrigin::User, 2, "video")
+            .unwrap();
+        flags.media_session = Some(sid);
+        flags.media_kind = "video".into();
+        flags.item_index = 2;
+        flags.slideshow_playing = false;
+        flags.advanced_session = None;
+        flags.error = None;
+        let mut saw_video = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !saw_video {
+            match link.pump() {
+                Ok(Some(update)) => {
+                    if update.player == Some(PlayerState::Idle) {
+                        let did = on_media_idle(
+                            &link,
+                            &mut flags,
+                            update.media_session,
+                            update.idle_reason,
+                            Ok(Successor {
+                                url: photo3.to_string(),
+                                content_type: "image/jpeg".into(),
+                                item: 3,
+                                media_type: "photo",
+                            }),
+                        )
+                        .unwrap();
+                        assert!(!did, "a paused video FINISHED must not advance");
+                        saw_video = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => panic!("pump: {e}"),
+            }
+        }
+        assert!(saw_video, "the video FINISHED never arrived");
+        assert_eq!(flags.item_index, 2);
+        assert!(flags.error.is_none(), "{:?}", flags.error);
+        assert_ne!(remote.lock().unwrap().as_deref(), Some("finished"));
+        assert_eq!(
+            socket_loads(&fake),
+            [
+                "load transport-1 item=photo-1",
+                "load transport-1 item=video-2",
+            ],
+        );
+        let written = log.text();
+        assert!(written.contains("photo_finished_ignored item=1"), "{written}");
+        assert!(!written.contains(" advance "), "{written}");
+        assert!(!written.contains("source=remote"), "{written}");
+        assert!(!written.contains("load_failed"), "{written}");
     }
 
     #[test]

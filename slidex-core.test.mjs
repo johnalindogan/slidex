@@ -921,6 +921,8 @@ test('a cast ignores local video events and tags the command source', () => {
   assert.match(html, /stopImmediatePropagation/);
   assert.match(html, /function sspCastHook\(name, source\)/);
   assert.match(html, /goTo\(nextMI\(\), 'timer'\)/);
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.match(sched, /if \(!playing \|\| isV\(cur\)\) return/);
   assert.match(html, /ev === "finished"/);
   assert.match(html, /else if \(ev === "finished" && sspCastPlaying\(\)\)/);
   assert.match(html, /goTo\(nextMI\(\), 'remote'\)/);
