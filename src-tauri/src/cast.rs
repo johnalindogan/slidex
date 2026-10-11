@@ -106,7 +106,8 @@ pub fn cast_notice(scenario: CastNotice, category: NetCategory) -> String {
 }
 
 fn media_load_notice() -> String {
-    cast_notice(CastNotice::MediaLoadTimeout, home_lan_category())
+    // The session thread reads the cached category. It does not wait on PowerShell.
+    cast_notice(CastNotice::MediaLoadTimeout, lan_category_now())
 }
 
 /// A cast that never starts on a Public network is the firewall, not a missing TV.
@@ -118,11 +119,69 @@ fn with_public_network(existing: String) -> String {
     }
 }
 
-fn home_lan_category() -> NetCategory {
+/// How long a network-profile query may run before the child is killed.
+const LAN_CATEGORY_WAIT: Duration = Duration::from_millis(2500);
+
+#[cfg(windows)]
+struct LanCache {
+    value: NetCategory,
+    done: bool,
+}
+
+#[cfg(windows)]
+fn lan_cache() -> &'static (Mutex<LanCache>, std::sync::Condvar, AtomicBool) {
+    use std::sync::{Condvar, OnceLock};
+    static CACHE: OnceLock<(Mutex<LanCache>, Condvar, AtomicBool)> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        (
+            Mutex::new(LanCache {
+                value: NetCategory::Unknown,
+                done: false,
+            }),
+            Condvar::new(),
+            AtomicBool::new(false),
+        )
+    })
+}
+
+/// Start the profile query if it is not already running. Returns immediately.
+#[cfg(windows)]
+fn start_lan_category_query() {
+    {
+        let (lock, cv, started) = lan_cache();
+        if started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let spawned = thread::Builder::new()
+            .name("cast-lan-category".into())
+            .spawn(move || {
+                let alias = snapshot_ifaces().bind.map(|b| b.name);
+                let value = windows_lan_category(alias.as_deref());
+                if let Ok(mut slot) = lock.lock() {
+                    slot.value = value;
+                    slot.done = true;
+                }
+                cv.notify_all();
+            });
+        if spawned.is_err() {
+            if let Ok(mut slot) = lan_cache().0.lock() {
+                slot.done = true;
+            }
+            lan_cache().1.notify_all();
+        }
+    }
+}
+
+/// Cached category. Never waits. This is what the Cast session thread uses.
+fn lan_category_now() -> NetCategory {
     #[cfg(windows)]
     {
-        let alias = snapshot_ifaces().bind.map(|b| b.name);
-        return windows_lan_category(alias.as_deref());
+        start_lan_category_query();
+        return lan_cache()
+            .0
+            .lock()
+            .map(|slot| slot.value)
+            .unwrap_or(NetCategory::Unknown);
     }
     #[cfg(not(windows))]
     {
@@ -130,23 +189,70 @@ fn home_lan_category() -> NetCategory {
     }
 }
 
+fn home_lan_category() -> NetCategory {
+    #[cfg(windows)]
+    {
+        start_lan_category_query();
+        let (lock, cv, _) = lan_cache();
+        let Ok(guard) = lock.lock() else {
+            return NetCategory::Unknown;
+        };
+        let (guard, _) = cv
+            .wait_timeout_while(guard, LAN_CATEGORY_WAIT, |slot| !slot.done)
+            .unwrap_or_else(|err| err.into_inner());
+        return guard.value;
+    }
+    #[cfg(not(windows))]
+    {
+        NetCategory::Unknown
+    }
+}
+
+/// Interface alias only (Wi-Fi, Ethernet). The SSID is a different property and is not read.
+#[cfg(windows)]
+const LAN_PROFILE_SCRIPT: &str =
+    "Get-NetConnectionProfile | ForEach-Object { $_.InterfaceAlias + \"`t\" + [string]$_.NetworkCategory }";
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+fn powershell_profile_command() -> std::process::Command {
+    let program = powershell_exe_under_windows_dir(&windows_dir_from_env());
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", LAN_PROFILE_SCRIPT]);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 #[cfg(windows)]
 fn windows_lan_category(alias: Option<&str>) -> NetCategory {
+    net_category_from_profile_command(alias, powershell_profile_command(), LAN_CATEGORY_WAIT)
+}
+
+/// Run `cmd` and map its profile listing to a category. A hang returns
+/// `Unknown` when `limit` elapses; the child is killed.
+fn net_category_from_profile_command(
+    alias: Option<&str>,
+    cmd: std::process::Command,
+    limit: Duration,
+) -> NetCategory {
     let Some(alias) = alias else {
         return NetCategory::Unknown;
     };
-    // Interface alias only (Wi-Fi, Ethernet). The SSID is a different property and is not read.
-    let script = "Get-NetConnectionProfile | ForEach-Object { $_.InterfaceAlias + \"`t\" + [string]$_.NetworkCategory }";
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output();
-    let Ok(output) = output else {
+    let Some(output) = output_bounded(cmd, limit) else {
         return NetCategory::Unknown;
     };
     if !output.status.success() {
         return NetCategory::Unknown;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    category_from_profile_text(alias, &String::from_utf8_lossy(&output.stdout))
+}
+
+fn category_from_profile_text(alias: &str, text: &str) -> NetCategory {
     for line in text.lines() {
         let Some((name, category)) = line.trim().rsplit_once('\t') else {
             continue;
@@ -156,6 +262,84 @@ fn windows_lan_category(alias: Option<&str>) -> NetCategory {
         }
     }
     NetCategory::Unknown
+}
+
+/// `cmd` runs on another thread. `recv_timeout` is the deadline; on timeout the child is killed.
+fn output_bounded(mut cmd: std::process::Command, limit: Duration) -> Option<std::process::Output> {
+    use std::process::{Output, Stdio};
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let out_thread = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stdout {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let err_thread = thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = stderr {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+        let _ = tx.send((stdout, stderr));
+    });
+    match rx.recv_timeout(limit) {
+        Ok((stdout, stderr)) => {
+            let status = match child.try_wait() {
+                Ok(Some(status)) => status,
+                _ => {
+                    let _ = child.kill();
+                    child.wait().ok()?
+                }
+            };
+            Some(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+fn hanging_process_command() -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new(powershell_exe_under_windows_dir(
+            &windows_dir_from_env(),
+        ));
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        cmd
+    }
 }
 
 fn parse_net_category(raw: &str) -> NetCategory {
@@ -1582,10 +1766,34 @@ const READ_POLL: Duration = Duration::from_millis(15);
 /// `TimedOut` (Windows 10060) and `WouldBlock` both mean the socket has no
 /// bytes ready. rustls treats only `WouldBlock` as idle, and a Windows
 /// `SO_RCVTIMEO` leaves the socket undefined, so the cast socket never uses one.
+/// Raw 110 is `ERROR_OPEN_FAILED` on Windows, not a timeout, and a message that
+/// merely contains the word "timeout" is not idle either.
 fn io_is_idle(err: &std::io::Error) -> bool {
     matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-        || matches!(err.raw_os_error(), Some(10060) | Some(10035) | Some(11) | Some(110))
-        || is_cast_timeout(&err.to_string())
+        || matches!(err.raw_os_error(), Some(10060) | Some(10035) | Some(11))
+}
+
+/// Retry an idle write so a stall after the first bytes of a frame does not
+/// fail `write_all` and drop the rest. Returns once at least one byte is in,
+/// or `WouldBlock` at `deadline`.
+fn write_some_retry_idle(write: &mut dyn Write, buf: &[u8], deadline: Instant) -> std::io::Result<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        match write.write(buf) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => return Ok(n),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) if io_is_idle(&err) => {
+                if Instant::now() >= deadline {
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                thread::sleep(READ_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 struct IdleSocket {
@@ -1773,7 +1981,8 @@ where
     StreamOwned<C, IdleSocket>: Read + Write,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(buf)
+        let deadline = Instant::now() + self.pace().max(READ_SLICE);
+        write_some_retry_idle(&mut self.inner, buf, deadline)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2093,11 +2302,12 @@ impl CastLink {
             return None;
         }
         if self.media.can_handle(msg) {
-            if let Ok(MediaResponse::Status(status)) = self.media.parse(msg) {
-                return status.entries.first().map(|e| e.player_state);
-            }
-            if let Ok(MediaResponse::LoadFailed(_)) = self.media.parse(msg) {
-                return Some(PlayerState::Idle);
+            match self.media.parse(msg) {
+                Ok(MediaResponse::Status(status)) => {
+                    return status.entries.first().map(|e| e.player_state);
+                }
+                Ok(MediaResponse::LoadFailed(_)) => return Some(PlayerState::Idle),
+                _ => {}
             }
         }
         None
@@ -2427,6 +2637,8 @@ impl Default for CastState {
 
 impl CastState {
     pub fn connect(&self, host: &str, port: Option<u16>, name: Option<String>) -> Result<CastConnectInfo, String> {
+        // The profile query runs on its own thread. Do not wait for it here.
+        let _ = lan_category_now();
         let (ip, port) = parse_cast_host(host, port)?;
         let snap = snapshot_ifaces();
         let bind = choose_bind_for_device(&snap.preferred, ip)
@@ -2624,6 +2836,8 @@ fn run_session(
     status: Arc<Mutex<CastLiveStatus>>,
     remote_event: Arc<Mutex<Option<String>>>,
 ) {
+    // Start the profile query without waiting. A later load timeout only reads the cache.
+    let _ = lan_category_now();
     let mut http = match MediaHttp::start_lan(bind_ip) {
         Ok(h) => h,
         Err(e) => {
@@ -4178,12 +4392,77 @@ mod tests {
         assert!(io_is_idle(&timed_out));
         assert!(io_is_idle(&std::io::Error::new(ErrorKind::WouldBlock, "would block")));
         assert!(io_is_idle(&std::io::Error::from_raw_os_error(10060)));
+        assert!(!io_is_idle(&std::io::Error::new(ErrorKind::Other, "timeout")));
+        assert!(!io_is_idle(&std::io::Error::new(
+            ErrorKind::Other,
+            "os error 110"
+        )));
+        assert_eq!(LAN_CATEGORY_WAIT, Duration::from_millis(2500));
         assert_eq!(unix_to_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_utc(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(
             media_url_host("http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/1").as_deref(),
             Some("192.168.1.52:47200")
         );
+    }
+
+    #[test]
+    fn hung_profile_query_returns_unknown_within_the_deadline() {
+        let limit = Duration::from_millis(800);
+        let started = Instant::now();
+        let category =
+            net_category_from_profile_command(Some("Wi-Fi"), hanging_process_command(), limit);
+        let elapsed = started.elapsed();
+        assert_eq!(category, NetCategory::Unknown);
+        assert!(
+            elapsed < limit + Duration::from_secs(4),
+            "hung profile query took {elapsed:?}"
+        );
+        assert!(
+            elapsed + Duration::from_millis(250) >= limit,
+            "returned in {elapsed:?} without waiting out the deadline"
+        );
+    }
+
+    #[test]
+    fn write_stall_mid_frame_keeps_the_bytes_and_finishes() {
+        struct Stall {
+            buf: Vec<u8>,
+            stall_after: usize,
+            blocks_left: usize,
+        }
+        impl Write for Stall {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if self.buf.len() >= self.stall_after && self.blocks_left > 0 {
+                    self.blocks_left -= 1;
+                    return Err(ErrorKind::WouldBlock.into());
+                }
+                let n = data.len().min(5);
+                self.buf.extend_from_slice(&data[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let body = b"cast-frame-body";
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(body);
+        let mut sink = Stall {
+            buf: Vec::new(),
+            stall_after: 4,
+            blocks_left: 3,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let mut rest = frame.as_slice();
+        while !rest.is_empty() {
+            let n = write_some_retry_idle(&mut sink, rest, deadline).expect("mid-frame stall");
+            rest = &rest[n..];
+        }
+        assert_eq!(sink.buf, frame, "bytes accepted before the stall must stay");
+        assert_eq!(sink.blocks_left, 0, "the write must stall after the length prefix");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
