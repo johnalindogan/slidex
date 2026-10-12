@@ -1148,6 +1148,8 @@ test('the Cast panel can copy the Cast log path', () => {
   const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
   assert.match(perms, /allow-cast-log-path/);
   assert.match(perms, /cast_log_path/);
+  assert.match(perms, /cast_log_dur_fallback/);
+  assert.match(caps, /allow-cast-log-dur-fallback/);
 });
 
 test('a cast skip message names TV limits and a level the TV may not play', () => {

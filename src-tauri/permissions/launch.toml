@@ -149,6 +149,11 @@ description = "Allow copying the path of the size-capped Cast log"
 commands.allow = ["cast_log_path"]
 
 [[permission]]
+identifier = "allow-cast-log-dur-fallback"
+description = "Allow logging a saved image duration that is not a listed choice"
+commands.allow = ["cast_log_dur_fallback"]
+
+[[permission]]
 identifier = "allow-slidex-save-done"
 description = "Allow the page to ack a save before the window exits"
 commands.allow = ["slidex_save_done"]
