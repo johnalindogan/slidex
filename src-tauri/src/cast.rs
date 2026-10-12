@@ -4325,7 +4325,7 @@ impl SessionFlags {
             return false;
         }
         self.advanced_session = Some(session);
-        cast_log("advance", "source=remote");
+        cast_log("advance", "source=tv_finished");
         true
     }
 
@@ -8940,7 +8940,7 @@ mod tests {
             .lines()
             .find(|l| l.contains(" advance "))
             .expect(&written);
-        assert!(advance.contains("source=remote"), "{advance}");
+        assert!(advance.contains("source=tv_finished"), "{advance}");
         assert!(!advance.contains('/') && !advance.contains('\\'), "{advance}");
         let remote_loads: Vec<_> = written
             .lines()
