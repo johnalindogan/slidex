@@ -32,7 +32,7 @@ jobs:
       - name: Cast unit tests
         env:
           SLIDEX_REQUIRE_FFMPEG: "1"
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib cast::
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib "cast::"
       - name: Run the installer firewall commands
         run: node scripts/cast-firewall-commands.mjs --apply
 
