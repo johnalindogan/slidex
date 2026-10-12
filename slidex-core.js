@@ -438,7 +438,7 @@
     if (n >= 0 && typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.core
         && typeof window.__TAURI__.core.invoke === 'function') {
       try {
-        window.__TAURI__.core.invoke('cast_log_dur_fallback', { from_ms: n, to_ms: best });
+        window.__TAURI__.core.invoke('cast_log_dur_fallback', { fromMs: n, toMs: best }).catch(() => {});
       } catch (e) {}
     }
     return best;

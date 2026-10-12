@@ -491,7 +491,8 @@ test('a saved duration off the list falls back to the closest choice', () => {
     __TAURI__: {
       core: {
         invoke: function (cmd, args) {
-          lines.push(cmd + ' from=' + args.from_ms + ' to=' + args.to_ms);
+          lines.push(cmd + ' from=' + args.fromMs + ' to=' + args.toMs);
+          return Promise.resolve();
         }
       }
     }
@@ -515,6 +516,33 @@ test('a saved duration off the list falls back to the closest choice', () => {
     assert.equal(C.castPhotoHoldMs(null, 999), 3000);
   } finally {
     console.log = orig;
+    delete context.window;
+  }
+});
+
+test('dur_fallback invoke uses camelCase argument names', async () => {
+  const calls = [];
+  context.window = {
+    __TAURI__: {
+      core: {
+        invoke: function (cmd, args) {
+          calls.push({ cmd: cmd, args: args });
+          return Promise.reject(new Error('rejected'));
+        }
+      }
+    }
+  };
+  try {
+    assert.equal(C.savedImageDuration('999'), 3000);
+    await Promise.resolve();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].cmd, 'cast_log_dur_fallback');
+    assert.deepEqual(Object.keys(calls[0].args).sort(), ['fromMs', 'toMs']);
+    assert.equal(calls[0].args.fromMs, 999);
+    assert.equal(calls[0].args.toMs, 3000);
+    assert.equal(calls[0].args.from_ms, undefined);
+    assert.equal(calls[0].args.to_ms, undefined);
+  } finally {
     delete context.window;
   }
 });
