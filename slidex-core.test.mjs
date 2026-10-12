@@ -1222,14 +1222,49 @@ test('the cast banner follows status immediately and shows Paused', () => {
   assert.match(html, /SlideXCore\.castBannerText/);
 });
 
-test('the missing firewall rules message is shown before the panel opens', () => {
+test('the missing firewall rules message is shown before the panel opens', async () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const sentence = 'No Private inbound rule for slideshowpro.exe. Cast needs TCP 47200-47215 and UDP 5353 on private networks. Re-run the installer and accept the Windows prompt.';
   const markup = html.slice(html.indexOf('id="castFirewall"'), html.indexOf('id="castFirewall"') + 400);
   assert.match(markup, new RegExp(sentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   const refresh = html.slice(html.indexOf('function refreshFirewall'), html.indexOf('function watchNetwork'));
-  assert.doesNotMatch(refresh, /textContent = ""/);
+  const catchBody = refresh.slice(refresh.indexOf('.catch'));
+  assert.doesNotMatch(catchBody, /textContent/);
   assert.match(refresh, /\.catch\(function \(\) \{\s*\}\)/);
+  assert.match(refresh, /status=match/);
+  assert.match(refresh, /status=present/);
+  const sandbox = {
+    Promise,
+    firewallEl: { textContent: sentence },
+    call() {
+      return Promise.resolve({
+        state: 'added',
+        detail: 'Private firewall rules are installed for slideshowpro.exe: TCP 47200-47215 and UDP 5353.'
+      });
+    }
+  };
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  assert.equal(
+    sandbox.firewallEl.textContent,
+    'Private firewall rules are installed for slideshowpro.exe: TCP 47200-47215 and UDP 5353.'
+  );
+  sandbox.firewallEl.textContent = sentence;
+  sandbox.call = () => Promise.resolve({ state: 'present', detail: '' });
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  assert.equal(sandbox.firewallEl.textContent, '');
+  sandbox.firewallEl.textContent = sentence;
+  sandbox.call = () => Promise.resolve({ state: 'match', detail: 'status=match' });
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  assert.equal(sandbox.firewallEl.textContent, '');
+  sandbox.firewallEl.textContent = sentence;
+  sandbox.call = () => Promise.reject(new Error('query failed'));
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(sandbox.firewallEl.textContent, sentence);
 });
 
 test('the TV unreachable banner comes only from cast_status', () => {

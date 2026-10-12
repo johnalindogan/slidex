@@ -5538,7 +5538,7 @@ fn query_firewall_text() -> String {
 
 pub fn parse_firewall_script_output(text: &str) -> CastFirewallStatus {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("status=match") {
+    if lower.contains("status=match") || lower.contains("status=present") {
         CastFirewallStatus {
             state: "added".into(),
             detail: format!(
@@ -7268,6 +7268,12 @@ mod tests {
         assert!(!joined.contains("-Command"));
         assert!(joined.contains("-ExecutionPolicy Bypass -File"));
         assert_eq!(parse_firewall_script_output("status=match").state, "added");
+        assert_eq!(parse_firewall_script_output("status=present").state, "added");
+        assert!(
+            !parse_firewall_script_output("status=present")
+                .detail
+                .contains("No Private inbound rule")
+        );
         assert_eq!(
             parse_firewall_script_output("status=partial").state,
             "partial"

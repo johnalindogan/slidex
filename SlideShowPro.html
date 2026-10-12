@@ -7441,7 +7441,19 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function refreshFirewall() {
     if (!firewallEl) return;
     call("cast_firewall_status").then(function (fw) {
-      var text = fw && (fw.detail || fw.state);
+      var state = String((fw && fw.state) || "").toLowerCase();
+      var detail = String((fw && fw.detail) || "");
+      var blob = state + "\n" + detail.toLowerCase();
+      var rulesPresent = state === "added" || state === "match" || state === "present"
+        || blob.indexOf("status=match") !== -1 || blob.indexOf("status=present") !== -1;
+      if (rulesPresent) {
+        var lowered = detail.toLowerCase();
+        var tokenOnly = !detail || detail.indexOf("No Private inbound rule") !== -1
+          || lowered === "match" || lowered === "present" || lowered.indexOf("status=") === 0;
+        firewallEl.textContent = tokenOnly ? "" : detail;
+        return;
+      }
+      var text = detail || state;
       if (text) firewallEl.textContent = text;
     }).catch(function () {});
   }
