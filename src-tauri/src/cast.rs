@@ -201,11 +201,54 @@ fn with_public_network(existing: String) -> String {
 
 /// How long a network-profile query may run before the child is killed.
 const LAN_CATEGORY_WAIT: Duration = Duration::from_millis(2500);
+/// A stored category older than this is read again. Tests pass their own window.
+const LAN_CATEGORY_STALE: Duration = Duration::from_secs(30);
+
+struct ProfileCategory {
+    value: NetCategory,
+    timed_out: bool,
+}
+
+/// Start another profile read only when none is running.
+/// A timeout or a stale value is picked up on the next call, after the
+/// previous read has finished, so a timeout cannot spawn a tight loop.
+fn lan_category_needs_query(
+    in_flight: bool,
+    has_value: bool,
+    timed_out: bool,
+    age: Duration,
+    stale: Duration,
+) -> bool {
+    if in_flight {
+        return false;
+    }
+    if !has_value {
+        return true;
+    }
+    timed_out || age >= stale
+}
+
+/// A refresh that times out leaves the category the panel already showed.
+fn lan_category_after_refresh(
+    previous: NetCategory,
+    had_value: bool,
+    queried: NetCategory,
+    timed_out: bool,
+) -> NetCategory {
+    if timed_out && had_value {
+        previous
+    } else {
+        queried
+    }
+}
 
 #[cfg(windows)]
 struct LanCache {
     value: NetCategory,
+    has_value: bool,
+    timed_out: bool,
     done: bool,
+    updated: Instant,
 }
 
 #[cfg(windows)]
@@ -216,7 +259,10 @@ fn lan_cache() -> &'static (Mutex<LanCache>, std::sync::Condvar, AtomicBool) {
         (
             Mutex::new(LanCache {
                 value: NetCategory::Unknown,
+                has_value: false,
+                timed_out: false,
                 done: false,
+                updated: Instant::now(),
             }),
             Condvar::new(),
             AtomicBool::new(false),
@@ -227,28 +273,57 @@ fn lan_cache() -> &'static (Mutex<LanCache>, std::sync::Condvar, AtomicBool) {
 /// Start the profile query if it is not already running. Returns immediately.
 #[cfg(windows)]
 fn start_lan_category_query() {
+    let (lock, cv, started) = lan_cache();
+    let should = match lock.lock() {
+        Ok(slot) => lan_category_needs_query(
+            started.load(Ordering::SeqCst),
+            slot.has_value,
+            slot.timed_out,
+            slot.updated.elapsed(),
+            LAN_CATEGORY_STALE,
+        ),
+        Err(_) => false,
+    };
+    if !should {
+        return;
+    }
+    if started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
-        let (lock, cv, started) = lan_cache();
-        if started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let spawned = thread::Builder::new()
-            .name("cast-lan-category".into())
-            .spawn(move || {
-                let alias = snapshot_ifaces().bind.map(|b| b.name);
-                let value = windows_lan_category(alias.as_deref());
-                if let Ok(mut slot) = lock.lock() {
-                    slot.value = value;
-                    slot.done = true;
+        return;
+    }
+    if let Ok(mut slot) = lock.lock() {
+        slot.done = false;
+    }
+    let spawned = thread::Builder::new()
+        .name("cast-lan-category".into())
+        .spawn(move || {
+            let alias = snapshot_ifaces().bind.map(|b| b.name);
+            let queried = windows_lan_category(alias.as_deref());
+            if let Ok(mut slot) = lock.lock() {
+                let had = slot.has_value;
+                let previous = slot.value;
+                slot.value =
+                    lan_category_after_refresh(previous, had, queried.value, queried.timed_out);
+                if queried.timed_out {
+                    slot.timed_out = true;
+                } else {
+                    slot.has_value = true;
+                    slot.timed_out = false;
+                    slot.updated = Instant::now();
                 }
-                cv.notify_all();
-            });
-        if spawned.is_err() {
-            if let Ok(mut slot) = lan_cache().0.lock() {
                 slot.done = true;
             }
-            lan_cache().1.notify_all();
+            started.store(false, Ordering::SeqCst);
+            cv.notify_all();
+        });
+    if spawned.is_err() {
+        started.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = lock.lock() {
+            slot.done = true;
         }
+        cv.notify_all();
     }
 }
 
@@ -314,27 +389,40 @@ fn powershell_profile_command() -> std::process::Command {
 }
 
 #[cfg(windows)]
-fn windows_lan_category(alias: Option<&str>) -> NetCategory {
+fn windows_lan_category(alias: Option<&str>) -> ProfileCategory {
     net_category_from_profile_command(alias, powershell_profile_command(), LAN_CATEGORY_WAIT)
 }
 
 /// Run `cmd` and map its profile listing to a category. A hang returns
-/// `Unknown` when `limit` elapses; the child is killed.
+/// `Unknown` when `limit` elapses; the child is killed. `timed_out` is set
+/// only for that hang, so the next call can read the profile again.
 fn net_category_from_profile_command(
     alias: Option<&str>,
     cmd: std::process::Command,
     limit: Duration,
-) -> NetCategory {
+) -> ProfileCategory {
     let Some(alias) = alias else {
-        return NetCategory::Unknown;
+        return ProfileCategory {
+            value: NetCategory::Unknown,
+            timed_out: false,
+        };
     };
     let Some(output) = output_bounded(cmd, limit) else {
-        return NetCategory::Unknown;
+        return ProfileCategory {
+            value: NetCategory::Unknown,
+            timed_out: true,
+        };
     };
     if !output.status.success() {
-        return NetCategory::Unknown;
+        return ProfileCategory {
+            value: NetCategory::Unknown,
+            timed_out: false,
+        };
     }
-    category_from_profile_text(alias, &String::from_utf8_lossy(&output.stdout))
+    ProfileCategory {
+        value: category_from_profile_text(alias, &String::from_utf8_lossy(&output.stdout)),
+        timed_out: false,
+    }
 }
 
 fn category_from_profile_text(alias: &str, text: &str) -> NetCategory {
@@ -7686,6 +7774,7 @@ mod tests {
             "os error 110"
         )));
         assert_eq!(LAN_CATEGORY_WAIT, Duration::from_millis(2500));
+        assert_eq!(LAN_CATEGORY_STALE, Duration::from_secs(30));
         assert_eq!(unix_to_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_utc(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(
@@ -7702,7 +7791,8 @@ mod tests {
         let category =
             net_category_from_profile_command(Some("Wi-Fi"), hanging_process_command(), limit);
         let elapsed = started.elapsed();
-        assert_eq!(category, NetCategory::Unknown);
+        assert_eq!(category.value, NetCategory::Unknown);
+        assert!(category.timed_out);
         assert!(
             elapsed < limit + Duration::from_secs(4),
             "hung profile query took {elapsed:?}"
@@ -7710,6 +7800,58 @@ mod tests {
         assert!(
             elapsed + Duration::from_millis(250) >= limit,
             "returned in {elapsed:?} without waiting out the deadline"
+        );
+    }
+
+    #[test]
+    fn lan_category_requeries_after_a_timeout_or_a_stale_value_without_stacking() {
+        let stale = Duration::from_secs(30);
+        assert!(lan_category_needs_query(
+            false,
+            false,
+            false,
+            Duration::ZERO,
+            stale
+        ));
+        assert!(!lan_category_needs_query(
+            true,
+            true,
+            true,
+            Duration::from_secs(60),
+            stale
+        ));
+        assert!(lan_category_needs_query(
+            false,
+            true,
+            true,
+            Duration::from_secs(1),
+            stale
+        ));
+        assert!(!lan_category_needs_query(
+            false,
+            true,
+            false,
+            Duration::from_secs(29),
+            stale
+        ));
+        assert!(lan_category_needs_query(
+            false,
+            true,
+            false,
+            stale,
+            stale
+        ));
+        assert_eq!(
+            lan_category_after_refresh(NetCategory::Private, true, NetCategory::Unknown, true),
+            NetCategory::Private
+        );
+        assert_eq!(
+            lan_category_after_refresh(NetCategory::Unknown, false, NetCategory::Unknown, true),
+            NetCategory::Unknown
+        );
+        assert_eq!(
+            lan_category_after_refresh(NetCategory::Private, true, NetCategory::Public, false),
+            NetCategory::Public
         );
     }
 
