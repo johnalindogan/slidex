@@ -4545,6 +4545,17 @@ fn idle_wants_next(
     flags.note_finished(Some(session), reason)
 }
 
+/// `loaded` means the successor LOAD was sent, which already cleared
+/// `flags.error`. The skip sentence stays only when that LOAD did not happen.
+fn apply_skip_note(flags: &mut SessionFlags, loaded: bool, skipped: Option<String>) {
+    if loaded {
+        return;
+    }
+    if let Some(msg) = skipped {
+        flags.error = Some(msg);
+    }
+}
+
 fn apply_successor(
     link: &CastLink,
     flags: &mut SessionFlags,
@@ -5169,9 +5180,9 @@ fn run_session(
                             match apply_successor(&link, &mut flags, next) {
                                 Ok(did) => {
                                     advanced = did;
-                                    if let Some(msg) = skipped_video {
-                                        flags.error = Some(msg);
-                                    }
+                                    // A LOAD that went out cleared the note. Keep
+                                    // it only when nothing was cast.
+                                    apply_skip_note(&mut flags, did, skipped_video);
                                 }
                                 Err(err) if err.contains("TV unreachable") => {
                                     flags.connected = false;
@@ -9361,6 +9372,47 @@ mod tests {
         );
         assert!(written.contains("item=1 type=photo"), "{written}");
         assert!(written.contains("item=2 type=video"), "{written}");
+    }
+
+    #[test]
+    fn a_successful_load_clears_the_skip_note() {
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let (_remote, mut flags) = session_after_load("video");
+        flags.item_index = 1;
+        flags.media_session = Some(7);
+        flags.error = Some("90 fps isn't supported by the TV".into());
+        let skip = Some("90 fps isn't supported by the TV".to_string());
+        let did = apply_successor(
+            &link,
+            &mut flags,
+            Ok(Successor {
+                url: "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3"
+                    .into(),
+                content_type: "image/jpeg".into(),
+                item: 3,
+                media_type: "photo",
+            }),
+        )
+        .unwrap();
+        assert!(did);
+        apply_skip_note(&mut flags, did, skip.clone());
+        assert!(
+            flags.error.is_none(),
+            "a sent LOAD must clear the skip note: {:?}",
+            flags.error
+        );
+
+        flags.error = Some("90 fps isn't supported by the TV".into());
+        let did = apply_successor(&link, &mut flags, Err("nothing castable")).unwrap();
+        assert!(!did);
+        apply_skip_note(&mut flags, did, skip);
+        assert_eq!(
+            flags.error.as_deref(),
+            Some("90 fps isn't supported by the TV")
+        );
     }
 
     #[test]
