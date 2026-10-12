@@ -750,12 +750,19 @@ Function CastFirewallInstall
 cast_fw_need_add:
  IfSilent +1 cast_fw_elevate
  ${StrLoc} $0 $R5 "status=nomatch" ">"
- StrCmp $0 "" cast_fw_install_end
+ StrCmp $0 "" cast_fw_check_failed
  FileOpen $2 "$R8" w
  FileWrite $2 "status=skipped_silent$\r$\n"
  FileClose $2
  !insertmacro CAST_FW_COMMIT
  DetailPrint "Cast firewall: silent install left the rules unchanged. No Windows prompt."
+ Goto cast_fw_install_end
+cast_fw_check_failed:
+ FileOpen $2 "$R8" w
+ FileWrite $2 "status=check_failed$\r$\n"
+ FileClose $2
+ !insertmacro CAST_FW_COMMIT
+ DetailPrint "Cast firewall: the pre-check did not report match or nomatch. No Windows prompt."
  Goto cast_fw_install_end
 cast_fw_elevate:
  ; cmd /c strips only the first and last quote. Inner quotes are plain ", never \".

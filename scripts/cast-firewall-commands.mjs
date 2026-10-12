@@ -616,17 +616,14 @@ function readStatus(file) {
   return fs.readFileSync(file, 'utf8');
 }
 
-// Same replace the installer does: the new bytes are complete before the live name changes.
+// Same replace the installer does: if the live file exists, delete it, then
+// rename cast-firewall.new onto cast-firewall.txt.
 function commitFirewallStatus(dir) {
   const live = path.join(dir, 'cast-firewall.txt');
   const temp = path.join(dir, 'cast-firewall.new');
   if (!fs.existsSync(temp)) fail(`missing ${temp}`);
-  const body = fs.readFileSync(temp);
-  const staged = path.join(dir, 'cast-firewall.replacing');
-  fs.writeFileSync(staged, body);
   if (fs.existsSync(live)) fs.rmSync(live);
-  fs.renameSync(staged, live);
-  fs.rmSync(temp, { force: true });
+  fs.renameSync(temp, live);
   return readStatus(live);
 }
 
@@ -649,14 +646,20 @@ function assertSilentSkipsElevation(installBody) {
   const silentSlice = installBody.slice(silentAt, elevateAt);
   if (/ExecShell|runas/i.test(silentSlice)) fail('silent branch contains an elevation attempt');
   if (!silentSlice.includes('status=nomatch')) fail('silent skip does not check status=nomatch');
+  if (!silentSlice.includes('status=check_failed')) {
+    fail('silent pre-check with neither match nor nomatch does not write status=check_failed');
+  }
   if (!silentSlice.includes('Goto cast_fw_install_end')) {
     fail('/S with no rules can fall through to ExecShell runas');
   }
   const nsi = fs.readFileSync(nsiPath, 'utf8');
   const macroAt = nsi.indexOf('!macro CAST_FW_COMMIT');
-  const renameAt = nsi.indexOf('Rename /REBOOTOK "$R8" "$1"');
-  if (macroAt < 0 || renameAt < macroAt || !installBody.includes('!insertmacro CAST_FW_COMMIT')) {
-    fail('cast-firewall.txt is not replaced with Rename /REBOOTOK after the temp file is written');
+  const macroEnd = nsi.indexOf('!macroend', macroAt);
+  const macroBody = nsi.slice(macroAt, macroEnd < 0 ? nsi.length : macroEnd);
+  const deleteAt = macroBody.indexOf('Delete "$1"');
+  const renameAt = macroBody.indexOf('Rename /REBOOTOK "$R8" "$1"');
+  if (macroAt < 0 || deleteAt < 0 || renameAt < 0 || !(deleteAt < renameAt) || !installBody.includes('!insertmacro CAST_FW_COMMIT')) {
+    fail('CAST_FW_COMMIT must Delete "$1" before Rename /REBOOTOK "$R8" "$1"');
   }
   const head = installBody.slice(0, installBody.indexOf('nsExec::ExecToStack'));
   if (head.includes('Delete "$1"') || head.includes('Delete "$INSTDIR\\cast-firewall.txt"')) {
@@ -727,6 +730,23 @@ if (!loaded.skipsElevation) {
   fail('CastFirewallInstall does not return before ExecShell when the pre-check reports status=match');
 }
 assertSilentSkipsElevation(functionBody(fs.readFileSync(nsiPath, 'utf8'), 'Function CastFirewallInstall'));
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slidex-fw-'));
+  try {
+    const live = path.join(dir, 'cast-firewall.txt');
+    const temp = path.join(dir, 'cast-firewall.new');
+    fs.writeFileSync(live, 'status=present\r\n');
+    fs.writeFileSync(temp, 'status=check_failed\r\n');
+    const body = commitFirewallStatus(dir);
+    if (!body.includes('status=check_failed')) fail(`commit kept the old status:\n${body}`);
+    if (fs.existsSync(temp)) fail('commit left cast-firewall.new in place');
+    if (fs.existsSync(path.join(dir, 'cast-firewall.replacing'))) {
+      fail('commit still stages cast-firewall.replacing');
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 if (!fs.readFileSync(nsiPath, 'utf8').includes('Delete "$INSTDIR\\cast-fw-check.ps1"')) {
   fail('uninstaller does not delete cast-fw-check.ps1');
 }
