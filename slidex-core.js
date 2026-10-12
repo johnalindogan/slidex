@@ -367,6 +367,49 @@
       || /may not play on this TV/i.test(s);
   }
 
+  function itemUnsupportedForCast(item, opts) {
+    if (!item) return true;
+    opts = opts || {};
+    var name = String(item.name || '');
+    var notes = opts.skippedNotes || [];
+    var i;
+    if (name) {
+      for (i = 0; i < notes.length; i++) {
+        if (String(notes[i]).indexOf(name) !== -1) return true;
+      }
+    }
+    var path = item.path || '';
+    if (!path) return false;
+    var bad = opts.badPaths;
+    if (bad && bad[path]) return true;
+    var skipped = opts.skippedPaths;
+    if (!skipped) return false;
+    if (Array.isArray(skipped)) {
+      for (i = 0; i < skipped.length; i++) {
+        if (skipped[i] === path) return true;
+      }
+      return false;
+    }
+    return !!skipped[path];
+  }
+
+  /* Index of the next castable slide, or null when every other slide is unsupported. */
+  function nextIndexSkippingUnsupported(cur, items, opts) {
+    items = items || [];
+    var n = items.length;
+    if (!n) return null;
+    opts = opts || {};
+    var step = opts.reverse ? -1 : 1;
+    var i = cur | 0;
+    var k;
+    for (k = 0; k < n; k++) {
+      i = (i + step + n) % n;
+      if (i === (cur | 0)) return null;
+      if (!itemUnsupportedForCast(items[i], opts)) return i;
+    }
+    return null;
+  }
+
   function savedImageDuration(stored) {
     var n = parseInt(stored, 10);
     if (!isFinite(n)) return DEFAULT_IMAGE_DURATION_MS;
@@ -1298,6 +1341,7 @@
     DEFAULT_IMAGE_DURATION_MS: DEFAULT_IMAGE_DURATION_MS,
     IMAGE_DURATION_CHOICES_MS: IMAGE_DURATION_CHOICES_MS,
     isCastSkipMessage: isCastSkipMessage,
+    nextIndexSkippingUnsupported: nextIndexSkippingUnsupported,
     savedImageDuration: savedImageDuration,
     resolveImageDuration: resolveImageDuration,
     castPhotoHoldMs: castPhotoHoldMs,

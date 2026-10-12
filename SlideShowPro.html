@@ -5746,6 +5746,19 @@ function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
   const ms = getEDur(cur);
   tmr = setTimeout(() => {
+    if (window.__sspCastActive && window.SlideXCore && typeof window.SlideXCore.nextIndexSkippingUnsupported === "function") {
+      var skipTo = window.SlideXCore.nextIndexSkippingUnsupported(cur, getMediaItems(), {
+        reverse: typeof reversePlay !== "undefined" && !!reversePlay,
+        skippedNotes: window.__sspCastSkipped || [],
+        badPaths: window.__sspCastBadPaths || null
+      });
+      if (skipTo == null) return;
+      if (skipTo !== nextMI()) {
+        goTo(skipTo, 'timer');
+        schedNext();
+        return;
+      }
+    }
     goTo(nextMI(), 'timer');
     schedNext();
   }, ms);
@@ -7480,6 +7493,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (!castActive) return Promise.resolve();
     return call("cast_set_playlist", { paths: sspCastPaths() }).then(function (upd) {
       skippedNotes = (upd && upd.skipped) || [];
+      window.__sspCastSkipped = skippedNotes;
       if (skippedNotes.length) noteSkip(skippedNotes[0]);
     });
   }

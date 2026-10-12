@@ -509,6 +509,65 @@ test('a saved duration off the list falls back to the closest choice', () => {
   }
 });
 
+test('the cast timer skips unsupported files without another photo wait', () => {
+  const items = [
+    { name: 'one.jpg', path: '/p/one.jpg' },
+    { name: 'bad.mp4', path: '/p/bad.mp4' },
+    { name: 'skip.webp', path: '/p/skip.webp' },
+    { name: 'three.jpg', path: '/p/three.jpg' },
+  ];
+  const opts = {
+    skippedNotes: ['skip.webp: Unsupported media. Cast plays JPEG, PNG, and MP4 (H.264 + AAC). Skipped.'],
+    badPaths: { '/p/bad.mp4': true },
+  };
+  assert.equal(C.nextIndexSkippingUnsupported(0, items, opts), 3);
+  assert.equal(C.nextIndexSkippingUnsupported(3, items, opts), 0);
+  assert.equal(C.nextIndexSkippingUnsupported(0, items, { reverse: true, badPaths: { '/p/three.jpg': true } }), 2);
+  assert.equal(C.nextIndexSkippingUnsupported(0, [{ name: 'only.jpg', path: '/p/only.jpg' }], { badPaths: {} }), null);
+  assert.equal(C.nextIndexSkippingUnsupported(0, items, {
+    badPaths: { '/p/bad.mp4': true, '/p/skip.webp': true, '/p/three.jpg': true },
+  }), null);
+
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.match(sched, /goTo\(nextMI\(\), 'timer'\)/);
+  assert.match(sched, /if \(!playing \|\| isV\(cur\)\) return/);
+  assert.match(sched, /typeof window\.SlideXCore\.nextIndexSkippingUnsupported === "function"/);
+
+  const timers = [];
+  let seq = 1;
+  const visits = [];
+  const sandbox = {
+    console,
+    SlideXCore: C,
+    cur: 0,
+    playing: true,
+    tmr: null,
+    reversePlay: false,
+    items,
+    getMediaItems() { return sandbox.items; },
+    isV() { return false; },
+    nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
+    getEDur() { return 10000; },
+    setTimeout(fn, ms) { const id = seq++; timers.push({ id, fn, ms }); return id; },
+    clearTimeout() {},
+    goTo(i, source) { visits.push({ i, source }); sandbox.cur = i; },
+    window: {
+      SlideXCore: C,
+      __sspCastActive: true,
+      __sspCastSkipped: opts.skippedNotes,
+      __sspCastBadPaths: opts.badPaths,
+    },
+  };
+  vm.runInNewContext(sched, sandbox);
+  sandbox.schedNext();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 10000);
+  timers[0].fn();
+  assert.deepEqual(visits, [{ i: 3, source: 'timer' }]);
+  assert.equal(timers.length, 2, 'the landing photo arms one timer, not one per skipped file');
+});
+
 test('a 20s cast photo uses that duration, and a change waits for the next photo', () => {
   assert.equal(C.savedImageDuration('20000'), 20000);
   assert.equal(C.castPhotoHoldMs(null, 20000), 20000);
