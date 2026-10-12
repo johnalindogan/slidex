@@ -1165,6 +1165,51 @@ test('a cast skip message names TV limits and a level the TV may not play', () =
   assert.match(html, /__sspCastBadPaths/);
 });
 
+test('a cast skip during loadCurrent moves straight to the next slide', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('function currentSkipped'), html.indexOf('function syncTransport'));
+  const moves = [];
+  const timers = [];
+  const core = {
+    isCastSkipMessage: C.isCastSkipMessage,
+    DEFAULT_IMAGE_DURATION_MS: C.DEFAULT_IMAGE_DURATION_MS
+  };
+  const sandbox = {
+    Promise,
+    String,
+    Number,
+    Math,
+    Object,
+    window: { __sspCastActive: true, SlideXCore: core },
+    SlideXCore: core,
+    castActive: true,
+    skipBurst: 0,
+    skippedNotes: [],
+    cur: 0,
+    setTimeout(fn, ms) { timers.push(ms); return 0; },
+    setStatus() {},
+    showToast() {},
+    esc(s) { return String(s); },
+    sspCastCurrentPath() { return 'C:/slides/bad.mp4'; },
+    sspCastCurrentName() { return 'bad.mp4'; },
+    sspCastPaths() { return ['C:/slides/a.jpg', 'C:/slides/bad.mp4', 'C:/slides/c.jpg']; },
+    sspCastPlaying() { return true; },
+    nextMI() { return 1; },
+    goTo(index, source) { moves.push([index, source]); },
+    call(cmd) {
+      assert.equal(cmd, 'cast_load');
+      return Promise.reject(new Error("90 fps isn't supported by the TV"));
+    }
+  };
+  const done = vm.runInNewContext(src + '\nloadCurrent("user");', sandbox);
+  await done;
+  assert.deepEqual(moves, [[1, 'user']]);
+  assert.deepEqual(timers, []);
+  assert.equal(sandbox.window.__sspCastBadPaths['C:/slides/bad.mp4'], true);
+  assert.equal(sandbox.skipBurst, 1);
+  assert.equal(sandbox.cur, 0);
+});
+
 test('a cast ignores local video events and tags the command source', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   assert.match(html, /window\.__sspCastActive/);
