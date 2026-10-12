@@ -1285,6 +1285,8 @@ struct TrackProbe {
     sample_count: u64,
     /// Σ(sample_count × sample_delta) across every `stts` entry.
     sample_ticks: u128,
+    /// `moof` or `mvex` is present, so timing may live in the fragments.
+    fragmented: bool,
     codec: Option<VisualCodec>,
     /// Tenths from avcC, or the HEVC general_level_idc converted to tenths.
     /// `Some(0)` means the box was present and the level byte was 0.
@@ -1303,6 +1305,7 @@ impl TrackProbe {
             duration: 0,
             sample_count: 0,
             sample_ticks: 0,
+            fragmented: false,
             codec: None,
             level: None,
             bit_depth: None,
@@ -1340,6 +1343,11 @@ fn decide_cast_video(path: &Path) -> CastVideoDecision {
         Err(_) => return unverifiable_video(path),
     };
     if probe.codec.is_none() {
+        return unverifiable_video(path);
+    }
+    // `trex` / `tfhd` are not read. A fragment with no `mdhd` timescale or no
+    // `stts` samples cannot be checked, so it is not sent to the TV.
+    if probe.fragmented && (probe.timescale == 0 || probe.sample_count == 0) {
         return unverifiable_video(path);
     }
     let mut derived = None;
@@ -1622,11 +1630,16 @@ fn walk_probe(
                 let mut inner = TrackProbe::new();
                 walk_probe(f, bx.payload, bx.end, depth + 1, &mut inner)?;
                 if inner.codec.is_some() {
+                    let fragmented = probe.fragmented || inner.fragmented;
                     *probe = inner;
+                    probe.fragmented = fragmented;
                 }
             }
             b"moov" | b"mdia" | b"minf" | b"stbl" => {
                 walk_probe(f, bx.payload, bx.end, depth + 1, probe)?;
+            }
+            b"mvex" | b"moof" => {
+                probe.fragmented = true;
             }
             b"tkhd" => parse_tkhd(f, bx.payload, bx.end, probe)?,
             b"mdhd" => parse_mdhd(f, bx.payload, bx.end, probe)?,
@@ -5976,6 +5989,7 @@ mod tests {
             hevc_idc,
             bitrate,
             pad,
+            false,
         )
     }
 
@@ -5989,6 +6003,7 @@ mod tests {
         hevc_idc: Option<u8>,
         bitrate: Option<u32>,
         pad: usize,
+        fragment: bool,
     ) -> Vec<u8> {
         let mut tkhd_rest = vec![0u8; 72];
         tkhd_rest.extend_from_slice(&(width << 16).to_be_bytes());
@@ -6046,10 +6061,17 @@ mod tests {
                 &mp4_box(b"minf", &mp4_box(b"stbl", &mp4_box(b"stsd", &audio_stsd))),
             ),
         );
-        let moov = mp4_box(b"moov", &[video, audio].concat());
+        let mut moov_payload = [video, audio].concat();
+        if fragment {
+            moov_payload.extend_from_slice(&mp4_box(b"mvex", &[]));
+        }
+        let moov = mp4_box(b"moov", &moov_payload);
         let mut file = mp4_box(b"ftyp", b"isom");
         file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; pad]));
         file.extend_from_slice(&moov);
+        if fragment {
+            file.extend_from_slice(&mp4_box(b"moof", &[]));
+        }
         file
     }
 
@@ -6131,6 +6153,7 @@ mod tests {
                 None,
                 Some(8_000_000),
                 8,
+                false,
             ),
         );
         let uneven = decide_cast_video(&uneven);
@@ -6149,6 +6172,7 @@ mod tests {
                 None,
                 Some(8_000_000),
                 8,
+                false,
             ),
         );
         let tail = decide_cast_video(&tail);
@@ -6424,6 +6448,53 @@ mod tests {
             &h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000)),
         );
         assert!(decide_cast_video(&mov).skip.is_none(), "a readable MOV still loads");
+    }
+
+    #[test]
+    fn fragmented_mp4_with_empty_timing_is_unverifiable() {
+        let log = LogDir::new();
+        let empty = scratch(
+            "frag.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                0,
+                &[],
+                Some(40),
+                None,
+                Some(8_000_000),
+                8,
+                true,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&empty).skip.as_deref(),
+            Some("can't verify this video for the TV (MP4)")
+        );
+        let written = log.text();
+        assert!(
+            written.contains("skip reason=unverifiable container=MP4"),
+            "{written}"
+        );
+        // mvex/moof with a real stts is still measured from those samples.
+        let timed = scratch(
+            "frag-timed.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                30,
+                &[(1, 1)],
+                Some(40),
+                None,
+                Some(8_000_000),
+                8,
+                true,
+            ),
+        );
+        let timed = decide_cast_video(&timed);
+        assert!(timed.skip.is_none(), "{:?}", timed.skip);
     }
 
     #[test]
