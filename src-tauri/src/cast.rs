@@ -1281,7 +1281,10 @@ struct TrackProbe {
     height: u32,
     timescale: u32,
     duration: u64,
-    min_delta: u32,
+    /// Sample count summed across every `stts` entry.
+    sample_count: u64,
+    /// Σ(sample_count × sample_delta) across every `stts` entry.
+    sample_ticks: u128,
     codec: Option<VisualCodec>,
     /// Tenths from avcC, or the HEVC general_level_idc converted to tenths.
     /// `Some(0)` means the box was present and the level byte was 0.
@@ -1298,7 +1301,8 @@ impl TrackProbe {
             height: 0,
             timescale: 0,
             duration: 0,
-            min_delta: 0,
+            sample_count: 0,
+            sample_ticks: 0,
             codec: None,
             level: None,
             bit_depth: None,
@@ -1337,9 +1341,13 @@ fn decide_cast_video(path: &Path) -> CastVideoDecision {
     let mut derived = None;
     let mut level = probe.level.filter(|tenths| *tenths != 0);
     if level.is_none() {
-        if let Some(tenths) =
-            derive_h264_level(probe.width, probe.height, probe.timescale, probe.min_delta)
-        {
+        if let Some(tenths) = derive_h264_level(
+            probe.width,
+            probe.height,
+            probe.timescale,
+            probe.sample_count,
+            probe.sample_ticks,
+        ) {
             derived = Some(format_level(tenths));
             level = Some(tenths);
         }
@@ -1353,8 +1361,12 @@ fn decide_cast_video(path: &Path) -> CastVideoDecision {
             parts.push(format!("{}-bit", 8u32.saturating_add(minus8 as u32)));
         }
     }
-    if probe.timescale > 0 && probe.min_delta > 0 && fps_over_60(probe.timescale, probe.min_delta) {
-        parts.push(format_fps(probe.timescale, probe.min_delta));
+    if fps_over_60(probe.timescale, probe.sample_count, probe.sample_ticks) {
+        parts.push(format_fps(
+            probe.timescale,
+            probe.sample_count,
+            probe.sample_ticks,
+        ));
     }
     let have_size = probe.width > 0 && probe.height > 0;
     if have_size && !fits_box(probe.width, probe.height, UHD_W, UHD_H) {
@@ -1438,21 +1450,26 @@ fn fits_box(w: u32, h: u32, box_w: u32, box_h: u32) -> bool {
     (w <= box_w && h <= box_h) || (w <= box_h && h <= box_w)
 }
 
-fn fps_over_60(timescale: u32, delta: u32) -> bool {
-    delta > 0 && (timescale as u64) > 60u64.saturating_mul(delta as u64)
+/// Average frame rate is `samples × timescale / Σ(sample_count × delta)`.
+/// Strictly over 60 fails. Exactly 60 passes.
+fn fps_over_60(timescale: u32, samples: u64, ticks: u128) -> bool {
+    if timescale == 0 || samples == 0 || ticks == 0 {
+        return false;
+    }
+    let numer = (samples as u128).saturating_mul(timescale as u128);
+    numer > ticks.saturating_mul(60)
 }
 
-fn format_fps(timescale: u32, delta: u32) -> String {
-    if delta == 0 {
+fn format_fps(timescale: u32, samples: u64, ticks: u128) -> String {
+    if timescale == 0 || samples == 0 || ticks == 0 {
         return "0 fps".to_string();
     }
-    if timescale % delta == 0 {
-        return format!("{} fps", timescale / delta);
+    let numer = (samples as u128).saturating_mul(timescale as u128);
+    if numer % ticks == 0 {
+        let fps = numer / ticks;
+        return format!("{fps} fps");
     }
-    let tenths = (timescale as u64)
-        .saturating_mul(10)
-        .saturating_add((delta as u64) / 2)
-        / delta as u64;
+    let tenths = numer.saturating_mul(10).saturating_add(ticks / 2) / ticks;
     format!("{}.{} fps", tenths / 10, tenths % 10)
 }
 
@@ -1483,20 +1500,26 @@ fn bitrate_from_file(len: u64, timescale: u32, duration: u64) -> Option<u64> {
 }
 
 /// Lowest Table A-1 level whose MaxFS and MaxMBPS both hold.
-/// `fs * timescale <= MaxMBPS * sample_delta` avoids a floating frame rate.
-fn derive_h264_level(width: u32, height: u32, timescale: u32, delta: u32) -> Option<u8> {
-    if width == 0 || height == 0 || timescale == 0 || delta == 0 {
+/// Average frame rate is `samples × timescale / ticks`, so
+/// `fs × samples × timescale <= MaxMBPS × ticks`.
+fn derive_h264_level(
+    width: u32,
+    height: u32,
+    timescale: u32,
+    samples: u64,
+    ticks: u128,
+) -> Option<u8> {
+    if width == 0 || height == 0 || timescale == 0 || samples == 0 || ticks == 0 {
         return None;
     }
     let mb_w = (width as u64).saturating_add(15) / 16;
     let mb_h = (height as u64).saturating_add(15) / 16;
     let fs = mb_w.saturating_mul(mb_h);
-    let ts = timescale as u64;
-    let sample_delta = delta as u64;
+    let left = (fs as u128)
+        .saturating_mul(samples as u128)
+        .saturating_mul(timescale as u128);
     for &(level, max_fs, max_mbps) in H264_LEVEL_TABLE {
-        if fs <= max_fs as u64
-            && fs.saturating_mul(ts) <= (max_mbps as u64).saturating_mul(sample_delta)
-        {
+        if fs <= max_fs as u64 && left <= (max_mbps as u128).saturating_mul(ticks) {
             return Some(level);
         }
     }
@@ -1638,20 +1661,19 @@ fn parse_stts(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> s
     }
     f.seek(SeekFrom::Start(payload + 4))?;
     let count = read_u32(f)?.min(4096);
-    let mut min_delta = u32::MAX;
+    let mut samples: u64 = 0;
+    let mut ticks: u128 = 0;
     for _ in 0..count {
         if f.stream_position()? + 8 > end {
             break;
         }
-        let _samples = read_u32(f)?;
-        let delta = read_u32(f)?;
-        if delta > 0 && delta < min_delta {
-            min_delta = delta;
-        }
+        let n = read_u32(f)? as u64;
+        let delta = read_u32(f)? as u128;
+        samples = samples.saturating_add(n);
+        ticks = ticks.saturating_add((n as u128).saturating_mul(delta));
     }
-    if min_delta != u32::MAX {
-        probe.min_delta = min_delta;
-    }
+    probe.sample_count = probe.sample_count.saturating_add(samples);
+    probe.sample_ticks = probe.sample_ticks.saturating_add(ticks);
     Ok(())
 }
 
@@ -5911,6 +5933,30 @@ mod tests {
         bitrate: Option<u32>,
         pad: usize,
     ) -> Vec<u8> {
+        limited_mp4_entries(
+            fourcc,
+            width,
+            height,
+            timescale,
+            &[(1, sample_delta)],
+            level,
+            hevc_idc,
+            bitrate,
+            pad,
+        )
+    }
+
+    fn limited_mp4_entries(
+        fourcc: &[u8; 4],
+        width: u32,
+        height: u32,
+        timescale: u32,
+        stts_entries: &[(u32, u32)],
+        level: Option<u8>,
+        hevc_idc: Option<u8>,
+        bitrate: Option<u32>,
+        pad: usize,
+    ) -> Vec<u8> {
         let mut tkhd_rest = vec![0u8; 72];
         tkhd_rest.extend_from_slice(&(width << 16).to_be_bytes());
         tkhd_rest.extend_from_slice(&(height << 16).to_be_bytes());
@@ -5920,9 +5966,11 @@ mod tests {
         mdhd_rest.extend_from_slice(&timescale.to_be_bytes());
         let mdhd = full_box(b"mdhd", 0, &mdhd_rest);
         let mut stts_rest = Vec::new();
-        stts_rest.extend_from_slice(&1u32.to_be_bytes());
-        stts_rest.extend_from_slice(&1u32.to_be_bytes());
-        stts_rest.extend_from_slice(&sample_delta.to_be_bytes());
+        stts_rest.extend_from_slice(&(stts_entries.len() as u32).to_be_bytes());
+        for &(count, delta) in stts_entries {
+            stts_rest.extend_from_slice(&count.to_be_bytes());
+            stts_rest.extend_from_slice(&delta.to_be_bytes());
+        }
         let stts = full_box(b"stts", 0, &stts_rest);
         let mut visual = vec![0u8; 78];
         if let Some(idc) = hevc_idc {
@@ -6035,6 +6083,46 @@ mod tests {
     }
 
     #[test]
+    fn average_frame_rate_uses_every_stts_entry() {
+        // 100×1490 + 100×1510 = 300_000 ticks. 200×90000 / 300_000 = 60 exactly.
+        // The 1490 gap alone is about 60.4 fps and must not decide the clip.
+        let uneven = scratch(
+            "uneven60.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                90_000,
+                &[(100, 1490), (100, 1510)],
+                Some(51),
+                None,
+                Some(8_000_000),
+                8,
+            ),
+        );
+        let uneven = decide_cast_video(&uneven);
+        assert!(uneven.skip.is_none(), "{:?}", uneven.skip);
+
+        // One short last sample stays near 30 fps on average.
+        let tail = scratch(
+            "short-tail.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                90_000,
+                &[(100, 3000), (1, 1)],
+                Some(40),
+                None,
+                Some(8_000_000),
+                8,
+            ),
+        );
+        let tail = decide_cast_video(&tail);
+        assert!(tail.skip.is_none(), "{:?}", tail.skip);
+    }
+
+    #[test]
     fn level_5_2_passes_and_a_higher_level_is_skipped() {
         // John's Google TV plays 2160×2160 at 60 fps, which is level 5.2.
         let square = scratch(
@@ -6123,11 +6211,11 @@ mod tests {
     #[test]
     fn missing_or_zero_level_is_derived_from_macroblocks() {
         // 1920×1080 @ 30 → mb 120×68 = 8160, MBPS 244800 → level 4.0, and it plays.
-        assert_eq!(derive_h264_level(1920, 1080, 30, 1), Some(40));
+        assert_eq!(derive_h264_level(1920, 1080, 30, 1, 1), Some(40));
         // 2160×2160 @ 60 → mb 135×135 = 18225, MBPS 1_093_500 → level 5.2.
-        assert_eq!(derive_h264_level(2160, 2160, 60, 1), Some(52));
+        assert_eq!(derive_h264_level(2160, 2160, 60, 1, 1), Some(52));
         // A frame rate at or under 60 that still needs 5.1 passes once derived.
-        assert_eq!(derive_h264_level(2000, 1536, 60, 1), Some(51));
+        assert_eq!(derive_h264_level(2000, 1536, 60, 1, 1), Some(51));
 
         let zero = scratch(
             "level0.mp4",
