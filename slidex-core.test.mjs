@@ -1053,6 +1053,20 @@ test('the Cast panel can copy the Cast log path', () => {
   assert.match(perms, /cast_log_path/);
 });
 
+test('a cast skip message names TV limits and a level the TV may not play', () => {
+  assert.equal(C.isCastSkipMessage("90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"), true);
+  assert.equal(C.isCastSkipMessage("10-bit isn't supported by the TV"), true);
+  assert.equal(C.isCastSkipMessage('H.264 level 5.2 may not play on this TV'), true);
+  assert.equal(C.isCastSkipMessage('HEVC level 5.2 may not play on this TV'), true);
+  assert.equal(C.isCastSkipMessage('Unsupported media. Cast plays JPEG, PNG, and MP4 (H.264 + AAC). Skipped.'), true);
+  assert.equal(C.isCastSkipMessage('TV unreachable. It may be off or the Wi-Fi dropped.'), false);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  assert.match(load, /castSkipMessage\(msg\)/);
+  assert.match(load, /rememberCastBad\(path\)/);
+  assert.match(html, /__sspCastBadPaths/);
+});
+
 test('a cast ignores local video events and tags the command source', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   assert.match(html, /window\.__sspCastActive/);

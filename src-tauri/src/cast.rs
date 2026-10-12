@@ -3,7 +3,7 @@
 //! → Default Media Receiver. Not chrome.cast, not desktop mirror, no cloud relay.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -975,7 +975,9 @@ fn ext_of(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// JPEG, PNG, or MP4 (H.264 + AAC). Anything else is refused before it is tokenized.
+/// JPEG, PNG, or MP4 (H.264 or HEVC + AAC). Anything else is refused before it
+/// is tokenized. TV limits (level, frame size, frame rate, bit depth, bitrate)
+/// are applied when the file is cast, not here.
 pub fn classify_playlist_file(path: &Path) -> Result<(&'static str, String), String> {
     let canon = path
         .canonicalize()
@@ -998,7 +1000,7 @@ pub fn classify_playlist_file(path: &Path) -> Result<(&'static str, String), Str
             if ext == "m4v" {
                 return Err(format!("{label}: {UNSUPPORTED_MEDIA}"));
             }
-            if !mp4_is_h264_aac(&canon).unwrap_or(false) {
+            if !mp4_is_tv_video(&canon).unwrap_or(false) {
                 return Err(format!("{label}: {UNSUPPORTED_MEDIA}"));
             }
             Ok(("video/mp4", "video".into()))
@@ -1038,12 +1040,22 @@ fn read_u64(f: &mut File) -> std::io::Result<u64> {
 
 /// Walk MP4 boxes without reading `mdat`. True only when an `avc1`/`avc3` sample and an `mp4a` sample both exist.
 pub fn mp4_is_h264_aac(path: &Path) -> std::io::Result<bool> {
+    mp4_has_codecs(path, false)
+}
+
+/// H.264 (`avc1`/`avc3`) or HEVC (`hvc1`/`hev1`) plus AAC. `hev1` is registered
+/// so cast time can name that tag; the TV limit check still skips it.
+fn mp4_is_tv_video(path: &Path) -> std::io::Result<bool> {
+    mp4_has_codecs(path, true)
+}
+
+fn mp4_has_codecs(path: &Path, hevc: bool) -> std::io::Result<bool> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
-    let mut saw_avc = false;
+    let mut saw_visual = false;
     let mut saw_aac = false;
-    walk_boxes(&mut f, 0, len, 0, &mut saw_avc, &mut saw_aac)?;
-    Ok(saw_avc && saw_aac)
+    walk_boxes(&mut f, 0, len, 0, &mut saw_visual, &mut saw_aac, hevc)?;
+    Ok(saw_visual && saw_aac)
 }
 
 fn walk_boxes(
@@ -1051,10 +1063,11 @@ fn walk_boxes(
     start: u64,
     end: u64,
     depth: u8,
-    saw_avc: &mut bool,
+    saw_visual: &mut bool,
     saw_aac: &mut bool,
+    hevc: bool,
 ) -> std::io::Result<()> {
-    if depth > 8 || *saw_avc && *saw_aac {
+    if depth > 8 || *saw_visual && *saw_aac {
         return Ok(());
     }
     f.seek(SeekFrom::Start(start))?;
@@ -1079,13 +1092,13 @@ fn walk_boxes(
             return Ok(());
         }
         if &typ == b"stsd" {
-            parse_stsd(f, box_end, saw_avc, saw_aac)?;
+            parse_stsd(f, box_end, saw_visual, saw_aac, hevc)?;
         } else if matches!(&typ, b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl") {
             let child = f.stream_position()?;
-            walk_boxes(f, child, box_end, depth + 1, saw_avc, saw_aac)?;
+            walk_boxes(f, child, box_end, depth + 1, saw_visual, saw_aac, hevc)?;
         }
         f.seek(SeekFrom::Start(box_end))?;
-        if *saw_avc && *saw_aac {
+        if *saw_visual && *saw_aac {
             return Ok(());
         }
     }
@@ -1095,8 +1108,9 @@ fn walk_boxes(
 fn parse_stsd(
     f: &mut File,
     box_end: u64,
-    saw_avc: &mut bool,
+    saw_visual: &mut bool,
     saw_aac: &mut bool,
+    hevc: bool,
 ) -> std::io::Result<()> {
     if f.stream_position()? + 8 > box_end {
         return Ok(());
@@ -1112,7 +1126,8 @@ fn parse_stsd(
         let mut four = [0u8; 4];
         f.read_exact(&mut four)?;
         match &four {
-            b"avc1" | b"avc3" => *saw_avc = true,
+            b"avc1" | b"avc3" => *saw_visual = true,
+            b"hvc1" | b"hev1" if hevc => *saw_visual = true,
             b"mp4a" => *saw_aac = true,
             _ => {}
         }
@@ -1127,6 +1142,664 @@ fn parse_stsd(
         f.seek(SeekFrom::Start(entry_end))?;
     }
     Ok(())
+}
+
+/// Highest H.264/HEVC level SlideX will cast, in tenths (51 = level 5.1).
+const CAST_MAX_VIDEO_LEVEL: u8 = 51;
+
+/// H.264 Table A-1, in tenths: level, MaxFS, MaxMBPS. Used for a missing level
+/// on both H.264 and HEVC (16×16 macroblocks, rounded up).
+const H264_LEVEL_TABLE: &[(u8, u32, u32)] = &[
+    (10, 99, 1_485),
+    (11, 396, 3_000),
+    (12, 396, 6_000),
+    (13, 396, 11_880),
+    (20, 396, 11_880),
+    (21, 792, 19_800),
+    (22, 1_620, 20_250),
+    (30, 1_620, 40_500),
+    (31, 3_600, 108_000),
+    (32, 5_120, 216_000),
+    (40, 8_192, 245_760),
+    (41, 8_192, 245_760),
+    (42, 8_704, 522_240),
+    (50, 22_080, 589_824),
+    (51, 36_864, 983_040),
+    (52, 36_864, 2_073_600),
+    (60, 139_264, 4_177_920),
+    (61, 139_264, 8_355_840),
+    (62, 139_264, 16_711_680),
+];
+
+const UHD_W: u32 = 3840;
+const UHD_H: u32 = 2160;
+const FHD_W: u32 = 1920;
+const FHD_H: u32 = 1080;
+const BITRATE_FHD: u64 = 20_000_000;
+const BITRATE_UHD: u64 = 40_000_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisualCodec {
+    Avc,
+    Hvc1,
+    Hev1,
+}
+
+struct TrackProbe {
+    width: u32,
+    height: u32,
+    timescale: u32,
+    duration: u64,
+    min_delta: u32,
+    codec: Option<VisualCodec>,
+    /// Tenths from avcC, or the HEVC general_level_idc converted to tenths.
+    /// `Some(0)` means the box was present and the level byte was 0.
+    level: Option<u8>,
+    /// `bit_depth_luma_minus8`. Missing when the file does not say.
+    bit_depth: Option<u8>,
+    bitrate: Option<u64>,
+}
+
+impl TrackProbe {
+    fn new() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            timescale: 0,
+            duration: 0,
+            min_delta: 0,
+            codec: None,
+            level: None,
+            bit_depth: None,
+            bitrate: None,
+        }
+    }
+}
+
+struct CastVideoDecision {
+    /// Sentence shown to the user. `None` means the file may be cast.
+    skip: Option<String>,
+    /// Set only when avcC/hvcC had no level (missing box or 0). Format `5.1`.
+    derived: Option<String>,
+}
+
+struct Mp4Box {
+    typ: [u8; 4],
+    payload: u64,
+    end: u64,
+}
+
+/// SlideX does not ship ffmpeg. Limits come from the MP4 boxes (`avcC` /
+/// `hvcC`, `tkhd`, `mdhd`, `stts`, `btrt`). A value the file does not carry
+/// is not treated as a failure, so a stub sample entry still loads.
+fn decide_cast_video(path: &Path) -> CastVideoDecision {
+    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let probe = match read_mp4_video(path) {
+        Ok(probe) => probe,
+        Err(_) => {
+            return CastVideoDecision {
+                skip: None,
+                derived: None,
+            };
+        }
+    };
+    let mut derived = None;
+    let mut level = probe.level.filter(|tenths| *tenths != 0);
+    if level.is_none() {
+        if let Some(tenths) =
+            derive_h264_level(probe.width, probe.height, probe.timescale, probe.min_delta)
+        {
+            derived = Some(format_level(tenths));
+            level = Some(tenths);
+        }
+    }
+    let mut parts = Vec::new();
+    if probe.codec == Some(VisualCodec::Hev1) {
+        parts.push("HEVC (hev1)".to_string());
+    }
+    if let Some(minus8) = probe.bit_depth {
+        if minus8 != 0 {
+            parts.push(format!("{}-bit", 8u32.saturating_add(minus8 as u32)));
+        }
+    }
+    if probe.timescale > 0 && probe.min_delta > 0 && fps_over_60(probe.timescale, probe.min_delta) {
+        parts.push(format_fps(probe.timescale, probe.min_delta));
+    }
+    let have_size = probe.width > 0 && probe.height > 0;
+    if have_size && !fits_box(probe.width, probe.height, UHD_W, UHD_H) {
+        parts.push(format!("{}x{}", probe.width, probe.height));
+    }
+    let bitrate = probe
+        .bitrate
+        .or_else(|| bitrate_from_file(file_len, probe.timescale, probe.duration));
+    if let (Some(rate), true) = (bitrate, have_size) {
+        let above_fhd = !fits_box(probe.width, probe.height, FHD_W, FHD_H);
+        let cap = if above_fhd { BITRATE_UHD } else { BITRATE_FHD };
+        if rate > cap {
+            parts.push(format_mbit(rate, cap));
+        }
+    }
+    let level_sentence = level.and_then(|tenths| {
+        if tenths > CAST_MAX_VIDEO_LEVEL {
+            let name = match probe.codec {
+                Some(VisualCodec::Hvc1) | Some(VisualCodec::Hev1) => "HEVC",
+                _ => "H.264",
+            };
+            Some(format!(
+                "{name} level {} may not play on this TV",
+                format_level(tenths)
+            ))
+        } else {
+            None
+        }
+    });
+    CastVideoDecision {
+        skip: skip_sentence(&parts, level_sentence),
+        derived,
+    }
+}
+
+fn join_skip_notes(notes: &[String]) -> Option<String> {
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(". "))
+    }
+}
+
+fn skip_sentence(parts: &[String], level_sentence: Option<String>) -> Option<String> {
+    if parts.is_empty() && level_sentence.is_none() {
+        return None;
+    }
+    let mut out = String::new();
+    if !parts.is_empty() {
+        let verb = if parts.len() == 1 { "isn't" } else { "aren't" };
+        out = format!("{} {verb} supported by the TV", join_limits(parts));
+    }
+    if let Some(level) = level_sentence {
+        if out.is_empty() {
+            out = level;
+        } else {
+            out.push_str(". ");
+            out.push_str(&level);
+        }
+    }
+    Some(out)
+}
+
+fn join_limits(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, rest) = parts.split_last().unwrap();
+            format!("{} and {last}", rest.join(", "))
+        }
+    }
+}
+
+fn format_level(tenths: u8) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+fn fits_box(w: u32, h: u32, box_w: u32, box_h: u32) -> bool {
+    (w <= box_w && h <= box_h) || (w <= box_h && h <= box_w)
+}
+
+fn fps_over_60(timescale: u32, delta: u32) -> bool {
+    delta > 0 && (timescale as u64) > 60u64.saturating_mul(delta as u64)
+}
+
+fn format_fps(timescale: u32, delta: u32) -> String {
+    if delta == 0 {
+        return "0 fps".to_string();
+    }
+    if timescale % delta == 0 {
+        return format!("{} fps", timescale / delta);
+    }
+    let tenths = (timescale as u64)
+        .saturating_mul(10)
+        .saturating_add((delta as u64) / 2)
+        / delta as u64;
+    format!("{}.{} fps", tenths / 10, tenths % 10)
+}
+
+/// Nearest Mbit/s. One decimal when the integer would hide a value over `cap`.
+fn format_mbit(bitrate: u64, cap: u64) -> String {
+    let nearest = bitrate.saturating_add(500_000) / 1_000_000;
+    let cap_mbit = cap / 1_000_000;
+    if bitrate > cap && nearest <= cap_mbit {
+        let tenths = bitrate.saturating_add(50_000) / 100_000;
+        return format!("{}.{} Mbit/s", tenths / 10, tenths % 10);
+    }
+    format!("{nearest} Mbit/s")
+}
+
+fn bitrate_from_file(len: u64, timescale: u32, duration: u64) -> Option<u64> {
+    if timescale == 0 || duration == 0 || len == 0 {
+        return None;
+    }
+    let bits = (len as u128)
+        .saturating_mul(8)
+        .saturating_mul(timescale as u128);
+    let rate = bits / duration as u128;
+    if rate == 0 {
+        None
+    } else {
+        Some(rate.min(u64::MAX as u128) as u64)
+    }
+}
+
+/// Lowest Table A-1 level whose MaxFS and MaxMBPS both hold.
+/// `fs * timescale <= MaxMBPS * sample_delta` avoids a floating frame rate.
+fn derive_h264_level(width: u32, height: u32, timescale: u32, delta: u32) -> Option<u8> {
+    if width == 0 || height == 0 || timescale == 0 || delta == 0 {
+        return None;
+    }
+    let mb_w = (width as u64).saturating_add(15) / 16;
+    let mb_h = (height as u64).saturating_add(15) / 16;
+    let fs = mb_w.saturating_mul(mb_h);
+    let ts = timescale as u64;
+    let sample_delta = delta as u64;
+    for &(level, max_fs, max_mbps) in H264_LEVEL_TABLE {
+        if fs <= max_fs as u64
+            && fs.saturating_mul(ts) <= (max_mbps as u64).saturating_mul(sample_delta)
+        {
+            return Some(level);
+        }
+    }
+    Some(62)
+}
+
+fn hevc_level_tenths(idc: u8) -> u8 {
+    let major = idc / 30;
+    let minor = (idc % 30) / 3;
+    major.saturating_mul(10).saturating_add(minor)
+}
+
+fn read_mp4_video(path: &Path) -> std::io::Result<TrackProbe> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut probe = TrackProbe::new();
+    walk_probe(&mut f, 0, len, 0, &mut probe)?;
+    Ok(probe)
+}
+
+fn read_box_header(f: &mut File, end: u64) -> std::io::Result<Option<Mp4Box>> {
+    if f.stream_position()? + 8 > end {
+        return Ok(None);
+    }
+    let pos = f.stream_position()?;
+    let size32 = read_u32(f)? as u64;
+    let mut typ = [0u8; 4];
+    f.read_exact(&mut typ)?;
+    let (size, header) = if size32 == 1 {
+        if f.stream_position()? + 8 > end {
+            return Ok(None);
+        }
+        (read_u64(f)?, 16u64)
+    } else if size32 == 0 {
+        (end.saturating_sub(pos), 8u64)
+    } else {
+        (size32, 8u64)
+    };
+    if size < header {
+        return Ok(None);
+    }
+    let box_end = pos.saturating_add(size);
+    if box_end > end || box_end <= pos {
+        return Ok(None);
+    }
+    Ok(Some(Mp4Box {
+        typ,
+        payload: pos + header,
+        end: box_end,
+    }))
+}
+
+fn walk_probe(
+    f: &mut File,
+    start: u64,
+    end: u64,
+    depth: u8,
+    probe: &mut TrackProbe,
+) -> std::io::Result<()> {
+    if depth > 8 {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(start))?;
+    while f.stream_position()? + 8 <= end {
+        let Some(bx) = read_box_header(f, end)? else {
+            break;
+        };
+        match &bx.typ {
+            b"trak" => {
+                let mut inner = TrackProbe::new();
+                walk_probe(f, bx.payload, bx.end, depth + 1, &mut inner)?;
+                if inner.codec.is_some() {
+                    *probe = inner;
+                }
+            }
+            b"moov" | b"mdia" | b"minf" | b"stbl" => {
+                walk_probe(f, bx.payload, bx.end, depth + 1, probe)?;
+            }
+            b"tkhd" => parse_tkhd(f, bx.payload, bx.end, probe)?,
+            b"mdhd" => parse_mdhd(f, bx.payload, bx.end, probe)?,
+            b"stts" => parse_stts(f, bx.payload, bx.end, probe)?,
+            b"stsd" => parse_visual_stsd(f, bx.payload, bx.end, probe)?,
+            _ => {}
+        }
+        f.seek(SeekFrom::Start(bx.end))?;
+    }
+    Ok(())
+}
+
+fn parse_tkhd(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    if payload + 1 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload))?;
+    let mut ver = [0u8; 1];
+    f.read_exact(&mut ver)?;
+    let width_at = payload + if ver[0] == 0 { 76 } else { 88 };
+    if width_at + 8 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(width_at))?;
+    let width = read_u32(f)? >> 16;
+    let height = read_u32(f)? >> 16;
+    if width > 0 && height > 0 {
+        probe.width = width;
+        probe.height = height;
+    }
+    Ok(())
+}
+
+fn parse_mdhd(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    if payload + 1 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload))?;
+    let mut ver = [0u8; 1];
+    f.read_exact(&mut ver)?;
+    if ver[0] == 0 {
+        if payload + 20 > end {
+            return Ok(());
+        }
+        f.seek(SeekFrom::Start(payload + 12))?;
+        probe.timescale = read_u32(f)?;
+        probe.duration = read_u32(f)? as u64;
+    } else {
+        if payload + 32 > end {
+            return Ok(());
+        }
+        f.seek(SeekFrom::Start(payload + 20))?;
+        probe.timescale = read_u32(f)?;
+        probe.duration = read_u64(f)?;
+    }
+    Ok(())
+}
+
+fn parse_stts(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    if payload + 8 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload + 4))?;
+    let count = read_u32(f)?.min(4096);
+    let mut min_delta = u32::MAX;
+    for _ in 0..count {
+        if f.stream_position()? + 8 > end {
+            break;
+        }
+        let _samples = read_u32(f)?;
+        let delta = read_u32(f)?;
+        if delta > 0 && delta < min_delta {
+            min_delta = delta;
+        }
+    }
+    if min_delta != u32::MAX {
+        probe.min_delta = min_delta;
+    }
+    Ok(())
+}
+
+fn parse_visual_stsd(
+    f: &mut File,
+    payload: u64,
+    end: u64,
+    probe: &mut TrackProbe,
+) -> std::io::Result<()> {
+    if payload + 8 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload))?;
+    let _ver_flags = read_u32(f)?;
+    let count = read_u32(f)?.min(32);
+    for _ in 0..count {
+        if f.stream_position()? + 8 > end {
+            break;
+        }
+        let entry_pos = f.stream_position()?;
+        let entry_size = read_u32(f)? as u64;
+        let mut four = [0u8; 4];
+        f.read_exact(&mut four)?;
+        let entry_end = if entry_size >= 8 {
+            entry_pos.saturating_add(entry_size)
+        } else {
+            break;
+        };
+        if entry_end > end {
+            break;
+        }
+        let codec = match &four {
+            b"avc1" | b"avc3" => Some(VisualCodec::Avc),
+            b"hvc1" => Some(VisualCodec::Hvc1),
+            b"hev1" => Some(VisualCodec::Hev1),
+            _ => None,
+        };
+        if let Some(codec) = codec {
+            probe.codec = Some(codec);
+            // VisualSampleEntry fields are 78 bytes after the 8-byte box header.
+            let child = entry_pos.saturating_add(86);
+            if child < entry_end {
+                walk_sample_children(f, child, entry_end, probe)?;
+            }
+        }
+        f.seek(SeekFrom::Start(entry_end))?;
+    }
+    Ok(())
+}
+
+fn walk_sample_children(
+    f: &mut File,
+    start: u64,
+    end: u64,
+    probe: &mut TrackProbe,
+) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(start))?;
+    while f.stream_position()? + 8 <= end {
+        let Some(bx) = read_box_header(f, end)? else {
+            break;
+        };
+        match &bx.typ {
+            b"avcC" => parse_avcc(f, bx.payload, bx.end, probe)?,
+            b"hvcC" => parse_hvcc(f, bx.payload, bx.end, probe)?,
+            b"btrt" => parse_btrt(f, bx.payload, bx.end, probe)?,
+            _ => {}
+        }
+        f.seek(SeekFrom::Start(bx.end))?;
+    }
+    Ok(())
+}
+
+fn read_span(f: &mut File, payload: u64, end: u64, cap: usize) -> std::io::Result<Vec<u8>> {
+    let n = ((end.saturating_sub(payload)) as usize).min(cap);
+    let mut buf = vec![0u8; n];
+    if n > 0 {
+        f.seek(SeekFrom::Start(payload))?;
+        f.read_exact(&mut buf)?;
+    }
+    Ok(buf)
+}
+
+fn parse_avcc(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    let buf = read_span(f, payload, end, 512)?;
+    if buf.len() < 4 {
+        return Ok(());
+    }
+    let profile = buf[1];
+    probe.level = Some(buf[3]);
+    if matches!(profile, 66 | 77 | 88) {
+        probe.bit_depth = Some(0);
+        return Ok(());
+    }
+    if let Some(depth) = avcc_sps_bit_depth(&buf) {
+        probe.bit_depth = Some(depth);
+    }
+    Ok(())
+}
+
+fn avcc_sps_bit_depth(buf: &[u8]) -> Option<u8> {
+    if buf.len() < 6 {
+        return None;
+    }
+    let num_sps = (buf[5] & 0x1f) as usize;
+    if num_sps == 0 {
+        return None;
+    }
+    let mut off = 6usize;
+    if off + 2 > buf.len() {
+        return None;
+    }
+    let sps_len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
+    off += 2;
+    if sps_len < 2 || off + sps_len > buf.len() {
+        return None;
+    }
+    sps_bit_depth(&buf[off..off + sps_len])
+}
+
+fn parse_hvcc(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    let buf = read_span(f, payload, end, 64)?;
+    // general_level_idc is byte 12. A shorter box has no level.
+    if buf.len() < 13 {
+        return Ok(());
+    }
+    probe.level = Some(hevc_level_tenths(buf[12]));
+    if buf.len() > 17 {
+        probe.bit_depth = Some(buf[17] & 0x07);
+    }
+    Ok(())
+}
+
+fn parse_btrt(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    let buf = read_span(f, payload, end, 12)?;
+    if buf.len() < 12 {
+        return Ok(());
+    }
+    let max_rate = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let avg_rate = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if avg_rate != 0 {
+        probe.bitrate = Some(avg_rate as u64);
+    } else if max_rate != 0 {
+        probe.bitrate = Some(max_rate as u64);
+    }
+    Ok(())
+}
+
+fn ebsp_to_rbsp(ebsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ebsp.len());
+    let mut i = 0;
+    while i < ebsp.len() {
+        if i + 2 < ebsp.len() && ebsp[i] == 0 && ebsp[i + 1] == 0 && ebsp[i + 2] == 3 {
+            out.push(0);
+            out.push(0);
+            i += 3;
+        } else {
+            out.push(ebsp[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<u8> {
+        let i = self.bit / 8;
+        if i >= self.data.len() {
+            return None;
+        }
+        let shift = 7 - (self.bit % 8);
+        self.bit += 1;
+        Some((self.data[i] >> shift) & 1)
+    }
+
+    fn read_bits(&mut self, n: u32) -> Option<u32> {
+        if n > 31 {
+            return None;
+        }
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.read_bit()? as u32;
+        }
+        Some(v)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut zeros = 0u32;
+        loop {
+            if self.read_bit()? == 1 {
+                break;
+            }
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        if zeros == 0 {
+            return Some(0);
+        }
+        let rest = self.read_bits(zeros)?;
+        Some(((1u32 << zeros) - 1).saturating_add(rest))
+    }
+}
+
+fn sps_bit_depth(nal: &[u8]) -> Option<u8> {
+    if nal.is_empty() {
+        return None;
+    }
+    let rbsp = ebsp_to_rbsp(nal);
+    if rbsp.len() < 4 {
+        return None;
+    }
+    let mut bits = BitReader::new(&rbsp[1..]);
+    let profile = bits.read_bits(8)? as u8;
+    let _constraint = bits.read_bits(8)?;
+    let _level = bits.read_bits(8)?;
+    let _sps_id = bits.read_ue()?;
+    const HIGH: &[u8] = &[100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+    if !HIGH.contains(&profile) {
+        return Some(0);
+    }
+    let chroma = bits.read_ue()?;
+    if chroma == 3 {
+        let _separate = bits.read_bits(1)?;
+    }
+    let luma = bits.read_ue()?;
+    if luma > 6 {
+        return None;
+    }
+    Some(luma as u8)
 }
 
 #[derive(Clone, Debug)]
@@ -1424,6 +2097,92 @@ impl MediaHttp {
             item: next.0,
             media_type: media_type_label(&entry.kind),
         })
+    }
+
+    /// The next item a FINISHED video should LOAD. Videos that break a TV
+    /// limit are logged and passed over with no wait. The walk stops when it
+    /// returns to `item_index`.
+    fn next_castable(&self, item_index: u32) -> (Result<Successor, &'static str>, Option<String>) {
+        let (token, steps) = {
+            let book = match self.book.lock() {
+                Ok(book) => book,
+                Err(_) => return (Err("playlist lock"), None),
+            };
+            if book.order.is_empty() {
+                return (Err("empty playlist"), None);
+            }
+            if item_index == 0 {
+                return (Err("current item unknown"), None);
+            }
+            let mut ranked: Vec<(u32, String)> = Vec::new();
+            for path in &book.order {
+                let Some(key) = book.by_path.get(path) else {
+                    return (Err("current item unknown"), None);
+                };
+                let Some(entry) = book.files.get(key) else {
+                    return (Err("current item unknown"), None);
+                };
+                ranked.push((entry.page_index, key.clone()));
+            }
+            ranked.sort_by_key(|(page, _)| *page);
+            let mut steps = Vec::with_capacity(ranked.len());
+            for (page, key) in ranked {
+                let Some(entry) = book.files.get(&key) else {
+                    return (Err("current item unknown"), None);
+                };
+                steps.push((
+                    page,
+                    key,
+                    entry.path.clone(),
+                    entry.content_type.clone(),
+                    entry.kind.clone(),
+                ));
+            }
+            (book.token.clone(), steps)
+        };
+        let start = steps
+            .iter()
+            .position(|(page, ..)| *page > item_index)
+            .unwrap_or(0);
+        let mut seen = HashSet::new();
+        seen.insert(item_index);
+        let mut skipped = Vec::new();
+        let n = steps.len();
+        for step in 0..n {
+            let (page, key, path, content_type, kind) = &steps[(start + step) % n];
+            if !seen.insert(*page) {
+                break;
+            }
+            if kind == "video" {
+                let decision = decide_cast_video(path);
+                if let Some(level) = decision.derived.as_deref() {
+                    cast_log(
+                        "level_derived",
+                        &format!("item={} level_derived={level}", item_log_token(*page)),
+                    );
+                }
+                if let Some(reasons) = decision.skip {
+                    cast_log(
+                        "video_skipped",
+                        &format!("item={} reasons={reasons}", item_log_token(*page)),
+                    );
+                    skipped.push(reasons);
+                    continue;
+                }
+            }
+            let url = format!("http://{}:{}/m/{}/{}", self.bind_ip, self.port, token, key);
+            let note = join_skip_notes(&skipped);
+            return (
+                Ok(Successor {
+                    url,
+                    content_type: content_type.clone(),
+                    item: *page,
+                    media_type: media_type_label(kind),
+                }),
+                note,
+            );
+        }
+        (Err("nothing castable"), join_skip_notes(&skipped))
     }
 
     fn shutdown(&mut self) {
@@ -3592,43 +4351,41 @@ impl SessionFlags {
     }
 }
 
-/// IDLE for the current media session.
-/// A video FINISHED loads `next` while the slideshow is playing, or logs why
-/// that LOAD was not sent. A photo FINISHED is logged and ignored: the
-/// slideshow timer is the only photo advance. ERROR is a failed fetch: tell
-/// the user and do not skip to the next slide.
-/// `Ok(true)` means the next LOAD was sent. The caller publishes `item_index`
-/// before raising the finished event, so the page moves to that item.
-fn on_media_idle(
-    link: &CastLink,
+/// Side effects of an IDLE status, up to the point where the next LOAD is
+/// chosen. `true` means the caller should load a successor.
+fn idle_wants_next(
     flags: &mut SessionFlags,
     session: Option<i32>,
     reason: Option<IdleReason>,
-    next: Result<Successor, &'static str>,
-) -> Result<bool, String> {
+) -> bool {
     let Some(session) = session else {
-        return Ok(false);
+        return false;
     };
     let Some(current) = flags.media_session else {
-        return Ok(false);
+        return false;
     };
     if session != current {
-        return Ok(false);
+        return false;
     }
     if reason == Some(IdleReason::Error) {
         flags.note_load_failed(session);
-        return Ok(false);
+        return false;
     }
     if flags.media_kind == "still" && reason == Some(IdleReason::Finished) {
         flags.note_photo_finished_ignored(session);
-        return Ok(false);
+        return false;
     }
     if reason == Some(IdleReason::Finished) && !flags.slideshow_playing {
-        return Ok(false);
+        return false;
     }
-    if !flags.note_finished(Some(session), reason) {
-        return Ok(false);
-    }
+    flags.note_finished(Some(session), reason)
+}
+
+fn apply_successor(
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    next: Result<Successor, &'static str>,
+) -> Result<bool, String> {
     let next = match next {
         Ok(next) => next,
         Err(why) => {
@@ -3680,6 +4437,26 @@ fn on_media_idle(
             Err(err)
         }
     }
+}
+
+/// IDLE for the current media session.
+/// A video FINISHED loads `next` while the slideshow is playing, or logs why
+/// that LOAD was not sent. A photo FINISHED is logged and ignored: the
+/// slideshow timer is the only photo advance. ERROR is a failed fetch: tell
+/// the user and do not skip to the next slide.
+/// `Ok(true)` means the next LOAD was sent. The caller publishes `item_index`
+/// before raising the finished event, so the page moves to that item.
+fn on_media_idle(
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    session: Option<i32>,
+    reason: Option<IdleReason>,
+    next: Result<Successor, &'static str>,
+) -> Result<bool, String> {
+    if !idle_wants_next(flags, session, reason) {
+        return Ok(false);
+    }
+    apply_successor(link, flags, next)
 }
 
 enum CastCmd {
@@ -4187,31 +4964,27 @@ fn run_session(
                     flags.note_state(state, false);
                     let mut advanced = false;
                     if state == PlayerState::Idle {
-                        let next = match http.successor(flags.item_index) {
-                            Ok(next) => Ok(next),
-                            Err(err) if err == "empty playlist" => Err("empty playlist"),
-                            Err(err) if err == "current item unknown" => Err("current item unknown"),
-                            Err(_) => Err("playlist lock"),
-                        };
-                        match on_media_idle(
-                            &link,
-                            &mut flags,
-                            update.media_session,
-                            update.idle_reason,
-                            next,
-                        ) {
-                            Ok(did) => advanced = did,
-                            Err(err) if err.contains("TV unreachable") => {
-                                flags.connected = false;
-                                flags.error = Some(link_down_message());
-                                publish(&status, |s| {
-                                    s.connected = false;
-                                    s.error = Some(link_down_message());
-                                });
-                                fail_pending(&cmd_rx, &err, &link);
-                                break;
+                        if idle_wants_next(&mut flags, update.media_session, update.idle_reason) {
+                            let (next, skipped_video) = http.next_castable(flags.item_index);
+                            match apply_successor(&link, &mut flags, next) {
+                                Ok(did) => {
+                                    advanced = did;
+                                    if let Some(msg) = skipped_video {
+                                        flags.error = Some(msg);
+                                    }
+                                }
+                                Err(err) if err.contains("TV unreachable") => {
+                                    flags.connected = false;
+                                    flags.error = Some(link_down_message());
+                                    publish(&status, |s| {
+                                        s.connected = false;
+                                        s.error = Some(link_down_message());
+                                    });
+                                    fail_pending(&cmd_rx, &err, &link);
+                                    break;
+                                }
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
                     }
                     let name = flags.player_state.clone();
@@ -4306,6 +5079,22 @@ fn handle_cmd(
                 let (url, ctype) = http.media_url(&path)?;
                 let kind = http.kind_of(&path)?;
                 let item = http.index_of(&path).unwrap_or(0);
+                if kind == "video" {
+                    let decision = decide_cast_video(&path);
+                    if let Some(level) = decision.derived.as_deref() {
+                        cast_log(
+                            "level_derived",
+                            &format!("item={} level_derived={level}", item_log_token(item)),
+                        );
+                    }
+                    if let Some(reasons) = decision.skip {
+                        cast_log(
+                            "video_skipped",
+                            &format!("item={} reasons={reasons}", item_log_token(item)),
+                        );
+                        return Err(reasons);
+                    }
+                }
                 let play = if kind == "still" { true } else { autoplay };
                 link.photo_timer_ms.set(if origin == CastOrigin::Timer {
                     duration_ms
@@ -4943,18 +5732,481 @@ mod tests {
         let png = scratch("b.png", &png_bytes());
         let mp4 = scratch("c.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
         let hevc = scratch("d.mp4", &mp4_with(&[b"hvc1", b"mp4a"]));
+        let hev1 = scratch("d2.mp4", &mp4_with(&[b"hev1", b"mp4a"]));
         let no_aac = scratch("e.mp4", &mp4_with(&[b"avc1"]));
         let webp = scratch("f.webp", b"RIFF");
         let mov = scratch("g.mov", &mp4_with(&[b"avc1", b"mp4a"]));
         assert!(classify_playlist_file(&jpg).is_ok());
         assert!(classify_playlist_file(&png).is_ok());
         assert!(classify_playlist_file(&mp4).is_ok());
-        assert!(classify_playlist_file(&hevc).is_err());
+        assert!(classify_playlist_file(&hevc).is_ok());
+        assert!(classify_playlist_file(&hev1).is_ok());
         assert!(classify_playlist_file(&no_aac).is_err());
         assert!(classify_playlist_file(&webp).is_err());
         assert!(classify_playlist_file(&mov).is_err());
         assert!(mp4_is_h264_aac(&mp4).unwrap());
         assert!(!mp4_is_h264_aac(&hevc).unwrap());
+        assert!(!mp4_is_h264_aac(&hev1).unwrap());
+    }
+
+    fn mp4_box(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(typ);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn full_box(typ: &[u8; 4], version: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![version, 0, 0, 0];
+        body.extend_from_slice(payload);
+        mp4_box(typ, &body)
+    }
+
+    /// A video the TV-limit probe can measure. `level` `None` omits avcC/hvcC.
+    /// `Some(0)` writes a level byte of 0. Bitrate `None` omits `btrt`.
+    fn limited_mp4(
+        fourcc: &[u8; 4],
+        width: u32,
+        height: u32,
+        timescale: u32,
+        sample_delta: u32,
+        level: Option<u8>,
+        hevc_idc: Option<u8>,
+        bitrate: Option<u32>,
+        pad: usize,
+    ) -> Vec<u8> {
+        let mut tkhd_rest = vec![0u8; 72];
+        tkhd_rest.extend_from_slice(&(width << 16).to_be_bytes());
+        tkhd_rest.extend_from_slice(&(height << 16).to_be_bytes());
+        let tkhd = full_box(b"tkhd", 0, &tkhd_rest);
+        let mut mdhd_rest = vec![0u8; 8];
+        mdhd_rest.extend_from_slice(&timescale.to_be_bytes());
+        mdhd_rest.extend_from_slice(&timescale.to_be_bytes());
+        let mdhd = full_box(b"mdhd", 0, &mdhd_rest);
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&1u32.to_be_bytes());
+        stts_rest.extend_from_slice(&1u32.to_be_bytes());
+        stts_rest.extend_from_slice(&sample_delta.to_be_bytes());
+        let stts = full_box(b"stts", 0, &stts_rest);
+        let mut visual = vec![0u8; 78];
+        if let Some(idc) = hevc_idc {
+            let mut hvcc = vec![0u8; 18];
+            hvcc[0] = 1;
+            hvcc[12] = idc;
+            hvcc[17] = 0xf8;
+            visual.extend_from_slice(&mp4_box(b"hvcC", &hvcc));
+        } else if let Some(level_byte) = level {
+            // Baseline profile, 8-bit, no SPS. Level is byte 3 (tenths).
+            let avcc = [0x01u8, 0x42, 0x00, level_byte, 0xff, 0xe0];
+            visual.extend_from_slice(&mp4_box(b"avcC", &avcc));
+        }
+        if let Some(avg) = bitrate {
+            let mut btrt = vec![0u8; 4];
+            btrt.extend_from_slice(&avg.to_be_bytes());
+            btrt.extend_from_slice(&avg.to_be_bytes());
+            visual.extend_from_slice(&mp4_box(b"btrt", &btrt));
+        }
+        let entry = mp4_box(fourcc, &visual);
+        let mut stsd_payload = vec![0, 0, 0, 0];
+        stsd_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsd_payload.extend_from_slice(&entry);
+        let stsd = mp4_box(b"stsd", &stsd_payload);
+        let stbl = mp4_box(b"stbl", &[stsd, stts].concat());
+        let minf = mp4_box(b"minf", &stbl);
+        let mdia = mp4_box(b"mdia", &[mdhd, minf].concat());
+        let video = mp4_box(b"trak", &[tkhd, mdia].concat());
+        let mut audio_entry = Vec::new();
+        audio_entry.extend_from_slice(&16u32.to_be_bytes());
+        audio_entry.extend_from_slice(b"mp4a");
+        audio_entry.extend_from_slice(&[0u8; 8]);
+        let mut audio_stsd = vec![0, 0, 0, 0];
+        audio_stsd.extend_from_slice(&1u32.to_be_bytes());
+        audio_stsd.extend_from_slice(&audio_entry);
+        let audio = mp4_box(
+            b"trak",
+            &mp4_box(
+                b"mdia",
+                &mp4_box(b"minf", &mp4_box(b"stbl", &mp4_box(b"stsd", &audio_stsd))),
+            ),
+        );
+        let moov = mp4_box(b"moov", &[video, audio].concat());
+        let mut file = mp4_box(b"ftyp", b"isom");
+        file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; pad]));
+        file.extend_from_slice(&moov);
+        file
+    }
+
+    fn h264_clip(
+        width: u32,
+        height: u32,
+        timescale: u32,
+        sample_delta: u32,
+        level: Option<u8>,
+        bitrate: Option<u32>,
+    ) -> Vec<u8> {
+        limited_mp4(
+            b"avc1",
+            width,
+            height,
+            timescale,
+            sample_delta,
+            level,
+            None,
+            bitrate,
+            8,
+        )
+    }
+
+    #[test]
+    fn level_5_1_passes_and_a_declared_level_is_trusted() {
+        assert_eq!(CAST_MAX_VIDEO_LEVEL, 51);
+        let exact = scratch(
+            "level51.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(51), Some(8_000_000)),
+        );
+        let decision = decide_cast_video(&exact);
+        assert!(decision.skip.is_none(), "{:?}", decision.skip);
+        assert!(decision.derived.is_none(), "{:?}", decision.derived);
+        // 2160×2160 @ 60 needs 5.2, but a declared 5.1 is not recomputed.
+        let trusted = scratch(
+            "declared51.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(51), Some(8_000_000)),
+        );
+        let trusted = decide_cast_video(&trusted);
+        assert!(trusted.skip.is_none(), "{:?}", trusted.skip);
+        assert!(trusted.derived.is_none());
+        let hevc = scratch(
+            "hevc51.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(153),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert!(decide_cast_video(&hevc).skip.is_none());
+        // 60000/1001 is under 60 fps and must not be skipped for frame rate.
+        let film = scratch(
+            "film.mp4",
+            &h264_clip(1920, 1080, 60_000, 1001, Some(51), Some(8_000_000)),
+        );
+        assert!(decide_cast_video(&film).skip.is_none());
+    }
+
+    #[test]
+    fn level_5_2_is_skipped_with_the_tv_sentence() {
+        let path = scratch(
+            "level52.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
+        );
+        let decision = decide_cast_video(&path);
+        assert_eq!(
+            decision.skip.as_deref(),
+            Some("H.264 level 5.2 may not play on this TV")
+        );
+        assert!(decision.derived.is_none());
+        let hevc = scratch(
+            "hevc52.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(156),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&hevc).skip.as_deref(),
+            Some("HEVC level 5.2 may not play on this TV")
+        );
+        let both = scratch(
+            "fps-and-level.mp4",
+            &h264_clip(1920, 1080, 90, 1, Some(52), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&both).skip.as_deref(),
+            Some("90 fps isn't supported by the TV. H.264 level 5.2 may not play on this TV")
+        );
+    }
+
+    #[test]
+    fn missing_or_zero_level_is_derived_from_macroblocks() {
+        // 1920×1080 @ 30 → mb 120×68 = 8160, MBPS 244800 → level 4.0, and it plays.
+        assert_eq!(derive_h264_level(1920, 1080, 30, 1), Some(40));
+        // 2160×2160 @ 60 → mb 135×135 = 18225, MBPS 1_093_500 → level 5.2.
+        assert_eq!(derive_h264_level(2160, 2160, 60, 1), Some(52));
+        // A frame rate at or under 60 that still needs 5.1 passes once derived.
+        assert_eq!(derive_h264_level(2000, 1536, 60, 1), Some(51));
+
+        let zero = scratch(
+            "level0.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(0), Some(8_000_000)),
+        );
+        let zero = decide_cast_video(&zero);
+        assert_eq!(zero.derived.as_deref(), Some("4.0"));
+        assert!(zero.skip.is_none(), "{:?}", zero.skip);
+
+        let absent = scratch(
+            "nolevel.mp4",
+            &h264_clip(1920, 1080, 30, 1, None, Some(8_000_000)),
+        );
+        let absent = decide_cast_video(&absent);
+        assert_eq!(absent.derived.as_deref(), Some("4.0"));
+        assert!(absent.skip.is_none(), "{:?}", absent.skip);
+
+        let square = scratch(
+            "square.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(0), Some(8_000_000)),
+        );
+        let square = decide_cast_video(&square);
+        assert_eq!(square.derived.as_deref(), Some("5.2"));
+        assert_eq!(
+            square.skip.as_deref(),
+            Some("H.264 level 5.2 may not play on this TV")
+        );
+
+        let passes = scratch(
+            "derived51.mp4",
+            &h264_clip(2000, 1536, 60, 1, Some(0), Some(8_000_000)),
+        );
+        let passes = decide_cast_video(&passes);
+        assert_eq!(passes.derived.as_deref(), Some("5.1"));
+        assert!(passes.skip.is_none(), "{:?}", passes.skip);
+
+        let hevc_zero = scratch(
+            "hevc0.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(0),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        let hevc_zero = decide_cast_video(&hevc_zero);
+        assert_eq!(hevc_zero.derived.as_deref(), Some("4.0"));
+        assert!(hevc_zero.skip.is_none(), "{:?}", hevc_zero.skip);
+    }
+
+    #[test]
+    fn unsupported_limits_are_named_in_one_sentence() {
+        let path = scratch(
+            "too-big.mp4",
+            &h264_clip(2560, 2560, 90, 1, Some(51), Some(245_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&path).skip.as_deref(),
+            Some("90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV")
+        );
+        let square = scratch(
+            "square-ok.mp4",
+            &h264_clip(2160, 2160, 30, 1, Some(51), Some(8_000_000)),
+        );
+        assert!(decide_cast_video(&square).skip.is_none());
+        let hid = scratch(
+            "hid.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(51), Some(20_400_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&hid).skip.as_deref(),
+            Some("20.4 Mbit/s isn't supported by the TV")
+        );
+        let sized = scratch(
+            "sized.mp4",
+            &limited_mp4(b"avc1", 1920, 1080, 30, 1, Some(51), None, None, 3_000_000),
+        );
+        let len = std::fs::metadata(&sized).unwrap().len();
+        let rate = bitrate_from_file(len, 30, 30).unwrap();
+        assert!(rate > 20_000_000, "{rate}");
+        assert_eq!(
+            decide_cast_video(&sized).skip.as_deref(),
+            Some(format!(
+                "{} isn't supported by the TV",
+                format_mbit(rate, 20_000_000)
+            ))
+            .as_deref()
+        );
+        let hev = scratch(
+            "hev1.mp4",
+            &limited_mp4(
+                b"hev1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(153),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&hev).skip.as_deref(),
+            Some("HEVC (hev1) isn't supported by the TV")
+        );
+        // A stub sample entry has no size, rate, or level, so it still loads.
+        let stub = scratch("stub.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
+        let stub = decide_cast_video(&stub);
+        assert!(stub.skip.is_none(), "{:?}", stub.skip);
+        assert!(stub.derived.is_none());
+    }
+
+    #[test]
+    fn auto_advance_skips_an_unsupported_video_and_logs_it() {
+        let log = LogDir::new();
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let bad = scratch(
+            "skip-me.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
+        );
+        let next = scratch("three.jpg", &jpeg_bytes());
+        let derived = scratch(
+            "derived.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(0), Some(8_000_000)),
+        );
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[photo, bad, next.clone(), derived])
+            .unwrap();
+        let started = Instant::now();
+        let (succ, skipped) = http.next_castable(1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a skipped video must not wait out the load deadline: {:?}",
+            started.elapsed()
+        );
+        let succ = succ.expect("the photo after the bad video");
+        assert_eq!(succ.item, 3);
+        assert_eq!(succ.media_type, "photo");
+        assert_eq!(
+            skipped.as_deref(),
+            Some("H.264 level 5.2 may not play on this TV")
+        );
+        let written = log.text();
+        assert!(written.contains("video_skipped"), "{written}");
+        assert!(written.contains("item=2"), "{written}");
+        assert!(
+            written.contains("reasons=H.264 level 5.2 may not play on this TV"),
+            "{written}"
+        );
+        let (play, none) = http.next_castable(3);
+        let play = play.expect("derived 4.0 video");
+        assert_eq!(play.item, 4);
+        assert_eq!(play.media_type, "video");
+        assert!(none.is_none());
+        let written = log.text();
+        assert!(written.contains("level_derived=4.0"), "{written}");
+    }
+
+    fn drive_load(
+        name: &str,
+        bytes: &[u8],
+    ) -> (LogDir, FakeTv, Result<(), String>, CastLiveStatus) {
+        let log = LogDir::new();
+        let path = scratch(name, bytes);
+        let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(std::slice::from_ref(&path)).unwrap();
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let status = Mutex::new(CastLiveStatus {
+            connected: true,
+            player_state: "idle".into(),
+            remote_event: None,
+            error: None,
+            media_kind: String::new(),
+            http_port: http.port,
+            bind_ip: http.bind_ip.to_string(),
+            item_index: 0,
+        });
+        let (_remote, mut flags) = session_after_load("still");
+        flags.media_kind.clear();
+        flags.media_session = None;
+        flags.player_state = "idle".into();
+        flags.item_index = 0;
+        let mut running = true;
+        let (tx, rx) = mpsc::channel();
+        let kept = handle_cmd(
+            CastCmd::Load {
+                path,
+                autoplay: true,
+                origin: CastOrigin::User,
+                duration_ms: None,
+                reply: tx,
+            },
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+        );
+        assert!(kept);
+        let result = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let live = status.lock().unwrap().clone();
+        // Keep the link up until the reply is in hand. Drop order is the
+        // return tuple, then these locals.
+        let _ = link;
+        let _ = http;
+        (log, fake, result, live)
+    }
+
+    #[test]
+    fn level_5_2_load_sends_no_load_and_logs_video_skipped() {
+        let (log, fake, result, live) = drive_load(
+            "no-load.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
+        );
+        let err = result.expect_err("a level 5.2 file is not loaded");
+        assert_eq!(err, "H.264 level 5.2 may not play on this TV");
+        assert!(live.connected);
+        assert_eq!(live.error.as_deref(), Some(err.as_str()));
+        let text = fake.trace_text();
+        assert!(
+            !text.lines().any(|line| line.starts_with("load ")),
+            "no LOAD is sent: {text}"
+        );
+        let written = log.text();
+        assert!(written.contains("video_skipped"), "{written}");
+        assert!(
+            written.contains("item=1 reasons=H.264 level 5.2 may not play on this TV"),
+            "{written}"
+        );
+        assert!(!written.contains("level_derived="), "{written}");
+    }
+
+    #[test]
+    fn derived_level_4_0_still_loads_and_logs_level_derived() {
+        let (log, fake, result, live) = drive_load(
+            "derived-load.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(0), Some(8_000_000)),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert_eq!(live.media_kind, "video");
+        let text = fake.trace_text();
+        assert!(
+            text.lines().any(|line| line.starts_with("load ")),
+            "a derived 4.0 file is loaded: {text}"
+        );
+        let written = log.text();
+        assert!(written.contains("level_derived=4.0"), "{written}");
+        assert!(written.contains("item=1"), "{written}");
+        assert!(!written.contains("video_skipped"), "{written}");
     }
 
     #[test]

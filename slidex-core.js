@@ -359,6 +359,14 @@
   var DEFAULT_IMAGE_DURATION_MS = 10000;
   var IMAGE_DURATION_CHOICES_MS = [3000, 4000, 6000, 8000, 10000, 12000, 20000];
 
+  function isCastSkipMessage(msg) {
+    var s = String(msg || '');
+    return /unsupported|skipped/i.test(s)
+      || /aren't supported by the TV/i.test(s)
+      || /isn't supported by the TV/i.test(s)
+      || /may not play on this TV/i.test(s);
+  }
+
   function savedImageDuration(stored) {
     var n = parseInt(stored, 10);
     for (var i = 0; i < IMAGE_DURATION_CHOICES_MS.length; i++) {
@@ -1278,6 +1286,7 @@
     playlistNamesMatch: playlistNamesMatch,
     DEFAULT_IMAGE_DURATION_MS: DEFAULT_IMAGE_DURATION_MS,
     IMAGE_DURATION_CHOICES_MS: IMAGE_DURATION_CHOICES_MS,
+    isCastSkipMessage: isCastSkipMessage,
     savedImageDuration: savedImageDuration,
     resolveImageDuration: resolveImageDuration,
     castPhotoHoldMs: castPhotoHoldMs,

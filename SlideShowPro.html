@@ -7460,7 +7460,19 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     }
     return "";
   }
+  function castSkipMessage(msg) {
+    if (window.SlideXCore && typeof SlideXCore.isCastSkipMessage === "function") {
+      return SlideXCore.isCastSkipMessage(msg);
+    }
+    return /unsupported|skipped/i.test(String(msg || ""));
+  }
+  function rememberCastBad(path) {
+    if (!path) return;
+    window.__sspCastBadPaths = window.__sspCastBadPaths || Object.create(null);
+    window.__sspCastBadPaths[path] = true;
+  }
   function noteSkip(msg) {
+    window.__sspCastToasted = msg;
     if (typeof showToast === "function") showToast(esc(msg), 4500);
     setStatus(msg);
   }
@@ -7501,7 +7513,8 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       setStatus("Casting " + (sspCastCurrentName() || "the current slide") + ".");
     }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
-      if (/unsupported|skipped/i.test(msg)) {
+      if (castSkipMessage(msg)) {
+        rememberCastBad(path);
         noteSkip(msg);
         skipBurst++;
         if (skipBurst >= Math.max(1, sspCastPaths().length)) {
@@ -7527,6 +7540,10 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (!castActive) return;
     call("cast_status").then(function (st) {
       if (!st || !castActive) return;
+      var skipMsg = field(st, "error");
+      if (skipMsg && castSkipMessage(skipMsg) && skipMsg !== window.__sspCastToasted) {
+        noteSkip(skipMsg);
+      }
       var ev = field(st, "remote_event");
       if (ev === "load_failed") {
         setStatus(field(st, "error") || "The TV could not load this slide.");
