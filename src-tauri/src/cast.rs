@@ -4243,6 +4243,11 @@ fn cast_log_path_in(local_app_data: &Path) -> PathBuf {
         .join("cast.log")
 }
 
+/// Page duration fallback. The detail is only `from=<digits> to=<digits>`.
+pub fn log_dur_fallback(from_ms: u64, to_ms: u64) {
+    cast_log("dur_fallback", &format!("from={from_ms} to={to_ms}"));
+}
+
 fn cast_log(step: &str, detail: &str) {
     let _guard = CAST_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let safe = sanitize_cast_log_detail(detail);
@@ -9372,6 +9377,21 @@ mod tests {
         );
         assert!(written.contains("item=1 type=photo"), "{written}");
         assert!(written.contains("item=2 type=video"), "{written}");
+    }
+
+    #[test]
+    fn dur_fallback_is_written_to_the_cast_log() {
+        let log = LogDir::new();
+        log_dur_fallback(999, 3000);
+        log_dur_fallback(3500, 3000);
+        log_dur_fallback(25000, 20000);
+        let written = log.text();
+        assert!(written.contains("dur_fallback from=999 to=3000"), "{written}");
+        assert!(written.contains("dur_fallback from=3500 to=3000"), "{written}");
+        assert!(
+            written.contains("dur_fallback from=25000 to=20000"),
+            "{written}"
+        );
     }
 
     #[test]

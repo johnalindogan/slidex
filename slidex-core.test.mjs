@@ -487,16 +487,25 @@ test('a saved duration off the list falls back to the closest choice', () => {
   console.log = function () {
     lines.push(Array.prototype.join.call(arguments, ' '));
   };
+  context.window = {
+    __TAURI__: {
+      core: {
+        invoke: function (cmd, args) {
+          lines.push(cmd + ' from=' + args.from_ms + ' to=' + args.to_ms);
+        }
+      }
+    }
+  };
   try {
     lines.length = 0;
     assert.equal(C.savedImageDuration('999'), 3000);
-    assert.deepEqual(lines, ['dur_fallback from=999']);
+    assert.deepEqual(lines, ['cast_log_dur_fallback from=999 to=3000']);
     lines.length = 0;
     assert.equal(C.savedImageDuration('3500'), 3000);
-    assert.deepEqual(lines, ['dur_fallback from=3500']);
+    assert.deepEqual(lines, ['cast_log_dur_fallback from=3500 to=3000']);
     lines.length = 0;
     assert.equal(C.savedImageDuration('25000'), 20000);
-    assert.deepEqual(lines, ['dur_fallback from=25000']);
+    assert.deepEqual(lines, ['cast_log_dur_fallback from=25000 to=20000']);
     lines.length = 0;
     assert.equal(C.savedImageDuration('20000'), 20000);
     assert.equal(C.savedImageDuration(null), 10000);
@@ -506,6 +515,7 @@ test('a saved duration off the list falls back to the closest choice', () => {
     assert.equal(C.castPhotoHoldMs(null, 999), 3000);
   } finally {
     console.log = orig;
+    delete context.window;
   }
 });
 
