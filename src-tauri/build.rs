@@ -160,7 +160,8 @@ fn sha256_file(path: &std::path::Path) -> String {
     use std::io::Read;
     let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    // Heap buffer. A 1 MiB stack array overflows the Windows build-script stack.
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file
             .read(&mut buf)
