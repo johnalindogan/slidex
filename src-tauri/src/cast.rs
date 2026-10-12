@@ -3531,7 +3531,7 @@ impl CastLink {
                                 kind: "INVALID_PLAYER_STATE",
                             });
                         }
-                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id) => {
+                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id, true) => {
                             return Ok(Waited::LoadRejected { kind: "ERROR" });
                         }
                         _ => {
@@ -3567,7 +3567,7 @@ impl CastLink {
                             let _ = err;
                             return Err("The TV refused the media command (LOAD_FAILED).".into());
                         }
-                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id) => {
+                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id, false) => {
                             return Err("The TV refused the media command (ERROR).".into());
                         }
                         _ => {
@@ -3632,9 +3632,12 @@ impl CastLink {
                 cast_log(&step, &format!("{ids} error={err}"));
                 Err(err)
             }
-            Err(err) if (typ == "PLAY" || typ == "PAUSE") && media_cmd_unanswered(&err) => {
+            Err(err)
+                if matches!(typ, "PLAY" | "PAUSE" | "SEEK") && media_cmd_unanswered(&err) =>
+            {
                 // The TV often never replies to PLAY or PAUSE for a still, and a
-                // missed reply must not become "TV unreachable".
+                // missed SEEK must not become an error. A missed reply must not
+                // become "TV unreachable".
                 cast_log(&step, &format!("{ids} warning=unanswered"));
                 Ok(if typ == "PAUSE" {
                     PlayerState::Paused
@@ -3895,11 +3898,12 @@ fn media_error_reply(msg: &CastMessage, id: u32) -> Option<&'static str> {
     }
 }
 
-/// A parsed ERROR carries no request id in rust_cast. Accept it when the
-/// payload does not name a different request. requestId 0 stays ignored.
-fn parsed_error_matches(msg: &CastMessage, id: u32) -> bool {
+/// A parsed ERROR carries no request id in rust_cast. That satisfies a LOAD
+/// wait only. PLAY, PAUSE, and SEEK ignore it and keep waiting. An explicit
+/// requestId must match, and requestId 0 stays ignored.
+fn parsed_error_matches(msg: &CastMessage, id: u32, allow_missing_request: bool) -> bool {
     match media_reply_type(msg) {
-        Some((None, typ)) if typ == "ERROR" => true,
+        Some((None, typ)) if typ == "ERROR" => allow_missing_request,
         Some((Some(rid), _)) => rid == id && id != 0,
         _ => false,
     }
@@ -7063,6 +7067,12 @@ mod tests {
         still: bool,
         /// PLAY is left unanswered. PAUSE still gets a status.
         silence_play: bool,
+        /// SEEK is left unanswered.
+        silence_seek: bool,
+        /// LOAD is answered only with ERROR and no requestId.
+        load_bare_error: bool,
+        /// A media command is first sent ERROR with no requestId, then its real reply.
+        media_bare_error: bool,
         /// PLAY is answered with this type instead of MEDIA_STATUS.
         /// `ERROR` is a raw reply with no detailedErrorCode.
         play_reply: Option<&'static str>,
@@ -7079,6 +7089,9 @@ mod tests {
                 idle_delay: Duration::ZERO,
                 still: false,
                 silence_play: false,
+                silence_seek: false,
+                load_bare_error: false,
+                media_bare_error: false,
                 play_reply: None,
             }
         }
@@ -7402,6 +7415,18 @@ mod tests {
                         "autoplay=false"
                     },
                 );
+                if script.load_bare_error {
+                    // detailedErrorCode is what rust_cast needs to parse ERROR.
+                    // The parsed error still has no requestId.
+                    note_trace(traces, "bare-error");
+                    fake_send(
+                        mm,
+                        NS_MEDIA,
+                        "transport-1",
+                        r#"{"type":"ERROR","detailedErrorCode":104}"#,
+                    );
+                    continue;
+                }
                 if script.load_failed {
                     let body = serde_json::json!({
                         "requestId": id,
@@ -7492,6 +7517,19 @@ mod tests {
                 if script.silence_play && typ == "PLAY" {
                     note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
                     continue;
+                }
+                if script.silence_seek && typ == "SEEK" {
+                    note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
+                    continue;
+                }
+                if script.media_bare_error {
+                    note_trace(traces, "bare-error");
+                    fake_send(
+                        mm,
+                        NS_MEDIA,
+                        "transport-1",
+                        r#"{"type":"ERROR","detailedErrorCode":104}"#,
+                    );
                 }
                 if typ == "PLAY" {
                     if let Some(kind) = script.play_reply {
@@ -8273,6 +8311,95 @@ mod tests {
         let written = cast.log.text();
         assert!(written.contains("warning=unanswered"), "{written}");
         assert!(!written.contains("TV unreachable"), "{written}");
+    }
+
+    #[test]
+    fn error_without_request_id_satisfies_only_the_load_wait() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            load_bare_error: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/clip";
+        let started = Instant::now();
+        let err = link
+            .load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .expect_err("bare ERROR ends the LOAD wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "LOAD treated a requestId-less ERROR as silence: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err, MEDIA_FETCH_MESSAGE);
+        let written = log.text();
+        assert!(written.contains("reply=ERROR"), "{written}");
+        assert!(fake.trace_text().contains("bare-error"), "{}", fake.trace_text());
+
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            media_bare_error: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .unwrap();
+        let started = Instant::now();
+        let state = link.pause(7, CastOrigin::User).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "PAUSE must ignore ERROR with no requestId, waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(state, PlayerState::Paused);
+        let written = log.text();
+        let pause = written
+            .lines()
+            .find(|l| l.contains(" pause "))
+            .unwrap_or_else(|| panic!("{written}"));
+        assert!(pause.contains("reply=PAUSED"), "{pause}");
+        assert!(!pause.contains("error="), "{pause}");
+        assert!(fake.trace_text().contains("bare-error"), "{}", fake.trace_text());
+    }
+
+    #[test]
+    fn unanswered_seek_warns_instead_of_erroring() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            silence_seek: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/clip";
+        link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .unwrap();
+        let started = Instant::now();
+        let state = link.seek(7, 1.5, CastOrigin::User).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(6),
+            "unanswered SEEK should wait out the media deadline, got {elapsed:?}"
+        );
+        assert_eq!(state, PlayerState::Playing);
+        let written = log.text();
+        let seek = written
+            .lines()
+            .find(|l| l.contains(" seek "))
+            .unwrap_or_else(|| panic!("{written}"));
+        assert!(seek.contains("warning=unanswered"), "{seek}");
+        assert!(!seek.contains("error="), "{seek}");
+        assert!(!written.contains("TV unreachable"), "{written}");
+        assert!(
+            fake.trace_text().contains("SEEK transport-1"),
+            "{}",
+            fake.trace_text()
+        );
     }
 
     #[test]
