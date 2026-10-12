@@ -107,7 +107,14 @@ fn log_disconnect_once(flag: &AtomicBool, detail: &str) {
 
 pub const LAUNCH_TIMEOUT_MESSAGE: &str =
     "The TV didn't answer the launch request. Make sure it's on and try again.";
-const LOAD_REFUSED_MESSAGE: &str = "The TV refused to play this slide.";
+/// The control channel is up, but the TV did not fetch the slide or did not answer a media command.
+pub const MEDIA_FETCH_MESSAGE: &str =
+    "The TV couldn't load the media from this PC. Check that the PC and TV are on the same network and that SlideX's Cast firewall rules are allowed.";
+
+/// PLAY, PAUSE, and SEEK. The UI's reply wait is longer, so a live TV is not
+/// reported unreachable while this wait is still running.
+const MEDIA_CMD_DEADLINE: Duration = Duration::from_secs(4);
+const MEDIA_CMD_REPLY_WAIT: Duration = Duration::from_secs(5);
 
 pub const NO_TV_ERROR: &str = "No TV found on this network. Check that the PC and TV are on the same Wi-Fi, the firewall, or the router's client isolation.";
 
@@ -155,8 +162,9 @@ pub fn cast_notice(scenario: CastNotice, category: NetCategory) -> String {
 }
 
 fn media_load_notice() -> String {
-    // The session thread reads the cached category. It does not wait on PowerShell.
-    cast_notice(CastNotice::MediaLoadTimeout, lan_category_now())
+    // A LOAD that times out still has a live control channel. That is a media
+    // fetch failure, not "TV unreachable", and it does not wait on PowerShell.
+    cast_panel_message(CastPanelCause::MediaCommandTimeout)
 }
 
 /// A cast that never starts on a Public network is the firewall, not a missing TV.
@@ -1279,12 +1287,15 @@ impl MediaHttp {
     }
 
     fn from_listener(listener: TcpListener, ip: Ipv4Addr, idle: Duration) -> Result<Self, String> {
-        let port = listener
+        let bound = listener
             .local_addr()
-            .map_err(|e| format!("http local_addr: {e}"))?
-            .port();
-        let bound = listener.local_addr().map_err(|e| e.to_string())?.ip();
-        if bound.is_unspecified() {
+            .map_err(|e| format!("http local_addr: {e}"))?;
+        let port = bound.port();
+        let bound_ip = match bound.ip() {
+            IpAddr::V4(v4) => v4,
+            _ => return Err("Refusing to listen on a non-IPv4 address.".into()),
+        };
+        if bound_ip.is_unspecified() {
             return Err("Refusing to listen on 0.0.0.0.".into());
         }
         listener
@@ -1298,8 +1309,17 @@ impl MediaHttp {
         let stop_t = Arc::clone(&stop);
         let workers_t = Arc::clone(&workers);
         let inflight_t = Arc::clone(&inflight);
-        let join =
-            thread::spawn(move || http_loop(listener, book_t, stop_t, workers_t, inflight_t, idle));
+        // The accept thread and its workers must see the test log directory.
+        // CAST_LOG_OVERRIDE is thread-local, so copy it onto those threads.
+        let log_dir = cast_log_override_dir();
+        let join = thread::spawn(move || {
+            apply_cast_log_dir(log_dir);
+            http_loop(listener, book_t, stop_t, workers_t, inflight_t, idle);
+        });
+        cast_log(
+            "media_listen",
+            &format!("addr={bound_ip}:{port} pid={}", std::process::id()),
+        );
         eprintln!("[cast] media server listening on one LAN address, port {port}");
         Ok(Self {
             port,
@@ -1435,6 +1455,7 @@ fn http_loop(
                     // Dropping a socket that still holds the request makes Linux send RST
                     // and the client never sees the 503.
                     let _ = discard_unread(&mut sock);
+                    log_media_req(&sock, "unknown", "redacted", 503, 0);
                     let _ = write_empty(&mut sock, 503);
                     let _ = sock.shutdown(Shutdown::Write);
                     continue;
@@ -1442,9 +1463,11 @@ fn http_loop(
                 let book_c = Arc::clone(&book);
                 let stop_c = Arc::clone(&stop);
                 let inflight_c = Arc::clone(&inflight);
+                let log_dir = cast_log_override_dir();
                 let spawned = thread::Builder::new()
                     .name("cast-http".into())
                     .spawn(move || {
+                        apply_cast_log_dir(log_dir);
                         struct Slot(Arc<AtomicUsize>);
                         impl Drop for Slot {
                             fn drop(&mut self) {
@@ -1492,6 +1515,73 @@ fn claim_conn_slot(inflight: &AtomicUsize) -> bool {
     }
 }
 
+struct MediaReqLog {
+    from: String,
+    method: String,
+    path: String,
+    status: u16,
+    bytes: u64,
+}
+
+impl MediaReqLog {
+    fn begin(sock: &TcpStream, method: &str) -> Self {
+        Self {
+            from: peer_ipv4(sock),
+            method: http_method_token(method),
+            path: "redacted".into(),
+            status: 0,
+            bytes: 0,
+        }
+    }
+}
+
+impl Drop for MediaReqLog {
+    fn drop(&mut self) {
+        log_media_req_fields(&self.from, &self.method, &self.path, self.status, self.bytes);
+    }
+}
+
+fn peer_ipv4(sock: &TcpStream) -> String {
+    match sock.peer_addr() {
+        Ok(addr) => match addr.ip() {
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(_) => "unknown".into(),
+        },
+        Err(_) => "unknown".into(),
+    }
+}
+
+fn http_method_token(method: &str) -> String {
+    if !method.is_empty()
+        && method.len() <= 16
+        && method.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        method.to_string()
+    } else {
+        "unknown".into()
+    }
+}
+
+/// Page index only. A missing or unknown index is the word `redacted`, never a file path.
+fn media_req_path_label(page_index: u32) -> String {
+    if page_index == 0 {
+        "redacted".into()
+    } else {
+        page_index.to_string()
+    }
+}
+
+fn log_media_req(sock: &TcpStream, method: &str, path: &str, status: u16, bytes: u64) {
+    log_media_req_fields(&peer_ipv4(sock), &http_method_token(method), path, status, bytes);
+}
+
+fn log_media_req_fields(from: &str, method: &str, path: &str, status: u16, bytes: u64) {
+    cast_log(
+        "media_req",
+        &format!("from={from} method={method} path={path} status={status} bytes={bytes}"),
+    );
+}
+
 fn serve_client(
     sock: &mut TcpStream,
     book: &Mutex<AllowBook>,
@@ -1506,7 +1596,9 @@ fn serve_client(
     let mut parts = request.split_whitespace();
     let method = parts.next().unwrap_or("");
     let url = parts.next().unwrap_or("/").to_string();
+    let mut rec = MediaReqLog::begin(sock, method);
     if method != "GET" && method != "HEAD" {
+        rec.status = 405;
         return write_empty(sock, 405);
     }
     let mut range = None;
@@ -1521,34 +1613,57 @@ fn serve_client(
     let entry = {
         let guard = match book.lock() {
             Ok(g) => g,
-            Err(_) => return write_empty(sock, 404),
+            Err(_) => {
+                rec.status = 404;
+                return write_empty(sock, 404);
+            }
         };
         match resolve_media_url(&url, &guard) {
             Ok(e) => e.clone(),
-            Err(_) => return write_empty(sock, 404),
+            Err(_) => {
+                rec.status = 404;
+                return write_empty(sock, 404);
+            }
         }
     };
+    rec.path = media_req_path_label(entry.page_index);
     let prepared = match transform_media(&entry) {
         Ok(body) => body,
-        Err(_) => return write_empty(sock, 404),
+        Err(_) => {
+            rec.status = 404;
+            return write_empty(sock, 404);
+        }
     };
     let len = prepared.len;
     let ctype = prepared.content_type;
     let file = prepared.file;
     let head = method == "HEAD";
-    if let Some(spec) = range {
+    let result = if let Some(spec) = range {
         match parse_range(&spec, len) {
-            Some((start, end)) => write_file(
-                sock, file, &ctype, start, end, len, head, stop, book, &token, &key, &mut pace,
-            ),
-            None => write_empty(sock, 416),
+            Some((start, end)) => {
+                let take = end - start + 1;
+                rec.status = if start == 0 && take == len { 200 } else { 206 };
+                let wrote = write_file(
+                    sock, file, &ctype, start, end, len, head, stop, book, &token, &key, &mut pace,
+                );
+                if wrote.is_ok() && !head {
+                    rec.bytes = take;
+                }
+                wrote
+            }
+            None => {
+                rec.status = 416;
+                write_empty(sock, 416)
+            }
         }
     } else if len == 0 {
+        rec.status = 200;
         write_file(
             sock, file, &ctype, 0, 0, 0, head, stop, book, &token, &key, &mut pace,
         )
     } else {
-        write_file(
+        rec.status = 200;
+        let wrote = write_file(
             sock,
             file,
             &ctype,
@@ -1561,8 +1676,13 @@ fn serve_client(
             &token,
             &key,
             &mut pace,
-        )
-    }
+        );
+        if wrote.is_ok() && !head {
+            rec.bytes = len;
+        }
+        wrote
+    };
+    result
 }
 
 struct IoPace {
@@ -2344,34 +2464,21 @@ impl CastLink {
             return Err(err);
         }
         match self.wait_load(request_id) {
-            Ok(sid) => {
+            Ok(reply) => {
+                let sid = reply.session_id;
                 cast_log(
                     "load",
-                    &load_log_detail(
-                        &host,
-                        request_id,
-                        source,
-                        item,
-                        media_type,
-                        &format!("reply={sid}"),
-                    ),
+                    &load_log_detail(&host, request_id, source, item, media_type, &reply.log_tail()),
                 );
                 Ok(sid)
             }
-            Err(err) if err == CAST_CANCELLED => Err(err),
-            Err(err) => {
+            Err(fail) if fail.user == CAST_CANCELLED => Err(fail.user),
+            Err(fail) => {
                 cast_log(
                     "load",
-                    &load_log_detail(
-                        &host,
-                        request_id,
-                        source,
-                        item,
-                        media_type,
-                        &format!("error={err}"),
-                    ),
+                    &load_log_detail(&host, request_id, source, item, media_type, &fail.log_tail),
                 );
-                Err(err)
+                Err(fail.user)
             }
         }
     }
@@ -2385,23 +2492,37 @@ impl CastLink {
         )
         .and_then(|hit| match hit {
             Waited::Launched(app) => Ok(app),
-            Waited::Loaded(_) | Waited::Media(_) => Err(LAUNCH_TIMEOUT_MESSAGE.to_string()),
+            Waited::Loaded(_) | Waited::LoadRejected { .. } | Waited::Media(_) => {
+                Err(LAUNCH_TIMEOUT_MESSAGE.to_string())
+            }
         })
     }
 
-    fn wait_load(&self, request_id: u32) -> Result<i32, String> {
-        // The timeout sentence asks Windows for the network category. Do that
-        // only after the wait gives up — a LOAD_FAILED must not sit behind
-        // PowerShell, and the read loop has to be running while the TV answers.
-        self.wait_matching(
+    fn wait_load(&self, request_id: u32) -> Result<LoadReply, LoadWaitError> {
+        // A LOAD_FAILED returns as soon as the TV says so. The timeout sentence
+        // is only built after the wait gives up.
+        match self.wait_matching(
             LOAD_DEADLINE,
             WaitMsg::LoadNotice,
             WaitExpect::Load(request_id),
-        )
-        .and_then(|hit| match hit {
-            Waited::Loaded(sid) => Ok(sid),
-            Waited::Launched(_) | Waited::Media(_) => Err(media_load_notice()),
-        })
+        ) {
+            Ok(Waited::Loaded(reply)) => Ok(reply),
+            Ok(Waited::LoadRejected { kind }) => Err(LoadWaitError {
+                user: load_reject_user(kind),
+                log_tail: format!("reply={kind} playerState=none idleReason=none"),
+            }),
+            Ok(Waited::Launched(_) | Waited::Media(_)) => {
+                let user = media_load_notice();
+                Err(LoadWaitError {
+                    log_tail: format!("error={user}"),
+                    user,
+                })
+            }
+            Err(err) => Err(LoadWaitError {
+                log_tail: format!("error={err}"),
+                user: err,
+            }),
+        }
     }
 
     fn wait_matching(
@@ -2479,26 +2600,36 @@ impl CastLink {
                     }
                     match self.media.parse(&msg) {
                         Ok(MediaResponse::Status(status)) if status.request_id == id => {
-                            let sid = status
-                                .entries
-                                .first()
-                                .map(|e| e.media_session_id)
-                                .ok_or_else(media_load_notice)?;
-                            return Ok(Waited::Loaded(sid));
+                            let Some(entry) = status.entries.first() else {
+                                return Ok(Waited::LoadRejected { kind: "MEDIA_STATUS" });
+                            };
+                            return Ok(Waited::Loaded(LoadReply {
+                                session_id: entry.media_session_id,
+                                player_state: entry.player_state.to_string(),
+                                idle_reason: idle_reason_token(entry.idle_reason).to_string(),
+                            }));
                         }
                         Ok(MediaResponse::LoadFailed(err)) if err.request_id == id => {
-                            return Err(LOAD_REFUSED_MESSAGE.to_string());
+                            let _ = err;
+                            return Ok(Waited::LoadRejected { kind: "LOAD_FAILED" });
                         }
                         Ok(MediaResponse::LoadCancelled(err)) if err.request_id == id => {
-                            return Err("The TV cancelled this slide.".to_string());
+                            let _ = err;
+                            return Ok(Waited::LoadRejected {
+                                kind: "LOAD_CANCELLED",
+                            });
                         }
                         Ok(MediaResponse::InvalidRequest(err)) if err.request_id == id => {
                             let _ = err;
-                            return Err(LOAD_REFUSED_MESSAGE.to_string());
+                            return Ok(Waited::LoadRejected {
+                                kind: "INVALID_REQUEST",
+                            });
                         }
                         Ok(MediaResponse::InvalidPlayerState(err)) if err.request_id == id => {
                             let _ = err;
-                            return Err(LOAD_REFUSED_MESSAGE.to_string());
+                            return Ok(Waited::LoadRejected {
+                                kind: "INVALID_PLAYER_STATE",
+                            });
                         }
                         _ => continue,
                     }
@@ -2567,7 +2698,7 @@ impl CastLink {
         }
         match self.wait_matching(
             deadline,
-            WaitMsg::Text("The TV didn't answer the media command."),
+            WaitMsg::Text(MEDIA_FETCH_MESSAGE),
             WaitExpect::Media(request_id),
         ) {
             Ok(Waited::Media(state)) => {
@@ -2575,7 +2706,7 @@ impl CastLink {
                 Ok(state)
             }
             Ok(_) => {
-                let err = "The TV didn't answer the media command.".to_string();
+                let err = cast_panel_message(CastPanelCause::MediaCommandTimeout);
                 cast_log(&step, &format!("{ids} error={err}"));
                 Err(err)
             }
@@ -2587,15 +2718,15 @@ impl CastLink {
     }
 
     fn pause(&self, sid: i32, origin: CastOrigin) -> Result<PlayerState, String> {
-        self.media_cmd("PAUSE", sid, None, Duration::from_secs(4), origin)
+        self.media_cmd("PAUSE", sid, None, MEDIA_CMD_DEADLINE, origin)
     }
 
     fn play(&self, sid: i32, origin: CastOrigin) -> Result<PlayerState, String> {
-        self.media_cmd("PLAY", sid, None, Duration::from_secs(4), origin)
+        self.media_cmd("PLAY", sid, None, MEDIA_CMD_DEADLINE, origin)
     }
 
     fn seek(&self, sid: i32, seconds: f32, origin: CastOrigin) -> Result<PlayerState, String> {
-        self.media_cmd("SEEK", sid, Some(seconds), Duration::from_secs(4), origin)
+        self.media_cmd("SEEK", sid, Some(seconds), MEDIA_CMD_DEADLINE, origin)
     }
 
     fn stop(&self, sid: i32, origin: CastOrigin) -> Result<PlayerState, String> {
@@ -2776,9 +2907,49 @@ fn drive_tls(conn: &mut ClientConnection, tcp: &mut TcpStream) -> Result<(), Str
 }
 
 #[derive(Debug)]
+struct LoadReply {
+    session_id: i32,
+    player_state: String,
+    idle_reason: String,
+}
+
+impl LoadReply {
+    fn log_tail(&self) -> String {
+        format!(
+            "reply=MEDIA_STATUS playerState={} idleReason={} mediaSessionId={}",
+            self.player_state, self.idle_reason, self.session_id
+        )
+    }
+}
+
+struct LoadWaitError {
+    user: String,
+    log_tail: String,
+}
+
+fn load_reject_user(kind: &str) -> String {
+    if kind == "LOAD_CANCELLED" {
+        "The TV cancelled this slide.".to_string()
+    } else {
+        cast_panel_message(CastPanelCause::LoadError)
+    }
+}
+
+fn idle_reason_token(reason: Option<IdleReason>) -> &'static str {
+    match reason {
+        Some(IdleReason::Cancelled) => "CANCELLED",
+        Some(IdleReason::Interrupted) => "INTERRUPTED",
+        Some(IdleReason::Finished) => "FINISHED",
+        Some(IdleReason::Error) => "ERROR",
+        None => "none",
+    }
+}
+
+#[derive(Debug)]
 enum Waited {
     Launched(Application),
-    Loaded(i32),
+    Loaded(LoadReply),
+    LoadRejected { kind: &'static str },
     Media(PlayerState),
 }
 
@@ -2889,6 +3060,16 @@ fn map_launch_failure(err: &str) -> String {
 
 thread_local! {
     static CAST_LOG_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+fn cast_log_override_dir() -> Option<PathBuf> {
+    CAST_LOG_OVERRIDE.with(|slot| slot.borrow().clone())
+}
+
+fn apply_cast_log_dir(dir: Option<PathBuf>) {
+    if let Some(dir) = dir {
+        CAST_LOG_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(dir));
+    }
 }
 
 static CAST_LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -3014,6 +3195,25 @@ fn link_down_message() -> String {
     "TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.".into()
 }
 
+/// Why the panel text changed. Connect failures stay "TV unreachable".
+/// A live control channel that cannot fetch media, or that does not answer a
+/// media command, uses [`MEDIA_FETCH_MESSAGE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastPanelCause {
+    ConnectFailed,
+    MediaCommandTimeout,
+    LoadError,
+}
+
+pub fn cast_panel_message(cause: CastPanelCause) -> String {
+    match cause {
+        CastPanelCause::ConnectFailed => link_down_message(),
+        CastPanelCause::MediaCommandTimeout | CastPanelCause::LoadError => {
+            MEDIA_FETCH_MESSAGE.to_string()
+        }
+    }
+}
+
 fn player_name(state: PlayerState) -> &'static str {
     match state {
         PlayerState::Playing => "playing",
@@ -3105,10 +3305,7 @@ impl SessionFlags {
         self.failed_session = Some(session);
         let item = item_log_token(self.item_index);
         cast_log("load_failed", &format!("item={item} reason=ERROR"));
-        let msg = format!(
-            "The TV could not load item {item}. It may be blocked from reaching this PC."
-        );
-        self.error = Some(msg);
+        self.error = Some(cast_panel_message(CastPanelCause::LoadError));
         if let Ok(mut ev) = self.remote_event.lock() {
             *ev = Some("load_failed".to_string());
         }
@@ -3445,8 +3642,8 @@ impl CastState {
             })
             .map_err(|_| "Cast is not connected.".to_string())?;
             reply_rx
-                .recv_timeout(Duration::from_secs(2))
-                .map_err(|_| link_down_message())?
+                .recv_timeout(MEDIA_CMD_REPLY_WAIT)
+                .map_err(|_| cast_panel_message(CastPanelCause::MediaCommandTimeout))?
         })
     }
 
@@ -3459,8 +3656,8 @@ impl CastState {
             })
             .map_err(|_| "Cast is not connected.".to_string())?;
             reply_rx
-                .recv_timeout(Duration::from_secs(2))
-                .map_err(|_| link_down_message())?
+                .recv_timeout(MEDIA_CMD_REPLY_WAIT)
+                .map_err(|_| cast_panel_message(CastPanelCause::MediaCommandTimeout))?
         })
     }
 
@@ -4635,6 +4832,96 @@ mod tests {
         assert_eq!(parse_net_category(""), NetCategory::Unknown);
     }
 
+    #[test]
+    fn panel_message_keeps_unreachable_for_connect_failures_only() {
+        let fetch = cast_panel_message(CastPanelCause::MediaCommandTimeout);
+        let load = cast_panel_message(CastPanelCause::LoadError);
+        let down = cast_panel_message(CastPanelCause::ConnectFailed);
+        assert_eq!(fetch, MEDIA_FETCH_MESSAGE);
+        assert_eq!(load, MEDIA_FETCH_MESSAGE);
+        assert_eq!(down, link_down_message());
+        assert_ne!(fetch, down);
+        assert!(down.contains("TV unreachable"));
+        for msg in [fetch.as_str(), load.as_str()] {
+            let lower = msg.to_ascii_lowercase();
+            assert!(!lower.contains("unreachable"), "{msg}");
+            assert!(!msg.contains("restart SlideX"), "{msg}");
+            assert!(!lower.contains("not connected"), "{msg}");
+            assert!(!lower.contains("unsupported"), "{msg}");
+            assert!(!msg.contains("skipped"), "{msg}");
+        }
+        assert_eq!(load_reject_user("LOAD_FAILED"), MEDIA_FETCH_MESSAGE);
+        assert_eq!(load_reject_user("INVALID_REQUEST"), MEDIA_FETCH_MESSAGE);
+        assert_eq!(
+            load_reject_user("INVALID_PLAYER_STATE"),
+            MEDIA_FETCH_MESSAGE
+        );
+        assert_eq!(
+            load_reject_user("LOAD_CANCELLED"),
+            "The TV cancelled this slide."
+        );
+        assert_eq!(media_load_notice(), MEDIA_FETCH_MESSAGE);
+        assert!(link_down_message().contains("TV unreachable"));
+    }
+
+    #[test]
+    fn media_server_logs_the_bind_and_one_redacted_request_line() {
+        let log = LogDir::new();
+        let jpg = scratch("secret-vacation-photo.jpg", &jpeg_bytes());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        assert_eq!(http.bind_ip, Ipv4Addr::LOCALHOST);
+        assert_ne!(http.bind_ip, Ipv4Addr::UNSPECIFIED);
+        assert!(MediaHttp::start_lan(Ipv4Addr::UNSPECIFIED).is_err());
+        http.set_playlist(std::slice::from_ref(&jpg)).unwrap();
+        let (url, _) = http.media_url(&jpg).unwrap();
+        let host = media_url_host(&url).unwrap();
+        assert_eq!(host, format!("127.0.0.1:{}", http.port));
+        assert!(url.starts_with(&format!("http://{}:{}/", http.bind_ip, http.port)));
+        assert!(!url.contains("0.0.0.0"));
+        let (status, body) = http_get(http.bind_ip, http.port, &url_path(&url));
+        assert_eq!(status, 200);
+        assert_eq!(body, jpeg_bytes());
+        let (missing, _) = http_get(
+            http.bind_ip,
+            http.port,
+            "/m/not-a-token/secret-vacation-photo.jpg",
+        );
+        assert_eq!(missing, 404);
+        let written = log.text();
+        let listen = written
+            .lines()
+            .find(|l| l.contains(" media_listen "))
+            .unwrap_or_else(|| panic!("missing media_listen in {written}"));
+        assert!(
+            listen.contains(&format!("addr=127.0.0.1:{}", http.port)),
+            "{listen}"
+        );
+        assert!(
+            listen.contains(&format!("pid={}", std::process::id())),
+            "{listen}"
+        );
+        assert!(!listen.contains('/') && !listen.contains('\\'), "{listen}");
+        let reqs: Vec<_> = written
+            .lines()
+            .filter(|l| l.contains(" media_req "))
+            .collect();
+        assert_eq!(reqs.len(), 2, "{written}");
+        let ok = reqs.iter().find(|l| l.contains("status=200")).unwrap();
+        assert!(ok.contains("from=127.0.0.1"), "{ok}");
+        assert!(ok.contains("method=GET"), "{ok}");
+        assert!(ok.contains("path=1"), "{ok}");
+        assert!(ok.contains(&format!("bytes={}", body.len())), "{ok}");
+        assert!(!ok.contains("secret"), "{ok}");
+        assert!(!ok.contains("vacation"), "{ok}");
+        assert!(!ok.contains('/') && !ok.contains('\\'), "{ok}");
+        let denied = reqs.iter().find(|l| l.contains("status=404")).unwrap();
+        assert!(denied.contains("path=redacted"), "{denied}");
+        assert!(denied.contains("bytes=0"), "{denied}");
+        assert!(!denied.contains("secret"), "{denied}");
+        assert!(!denied.contains("jpg"), "{denied}");
+        assert!(!written.contains("secret-vacation"), "{written}");
+    }
+
     fn big_jpeg(len: usize) -> Vec<u8> {
         let mut v = vec![0xff, 0xd8, 0xff];
         v.resize(len, 0x11);
@@ -5716,7 +6003,10 @@ mod tests {
         );
         assert!(after_ping.contains(" pong "), "{after_ping}");
         assert!(after_ping.contains("requestId="), "{after_ping}");
-        assert!(after_ping.contains("reply=7"), "{after_ping}");
+        assert!(after_ping.contains("reply=MEDIA_STATUS"), "{after_ping}");
+        assert!(after_ping.contains("playerState=PLAYING"), "{after_ping}");
+        assert!(after_ping.contains("idleReason=none"), "{after_ping}");
+        assert!(after_ping.contains("mediaSessionId=7"), "{after_ping}");
         match link.pump().unwrap() {
             Some(update) => assert!(update.player.is_none()),
             None => panic!("a PONG from the TV must count as the TV speaking"),
@@ -5789,6 +6079,7 @@ mod tests {
 
     #[test]
     fn load_failed_is_not_reported_as_a_timeout() {
+        let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
             load_failed: true,
             ..FakeScript::default()
@@ -5812,16 +6103,22 @@ mod tests {
             "LOAD_FAILED took {:?}",
             started.elapsed()
         );
-        assert_eq!(err, LOAD_REFUSED_MESSAGE);
+        assert_eq!(err, MEDIA_FETCH_MESSAGE);
         assert_ne!(err, UNSUPPORTED_MEDIA);
         assert!(!err.contains("15 seconds"));
         assert!(!err.to_ascii_lowercase().contains("timed out"));
+        assert!(!err.to_ascii_lowercase().contains("unreachable"));
         assert!(!err.contains("didn't answer"));
         assert!(
             fake.trace_text().contains("load-failed"),
             "{}",
             fake.trace_text()
         );
+        let written = log.text();
+        assert!(written.contains("reply=LOAD_FAILED"), "{written}");
+        assert!(written.contains("playerState=none"), "{written}");
+        assert!(written.contains("idleReason=none"), "{written}");
+        assert!(!written.contains('/') && !written.contains('\\'), "{written}");
     }
 
     fn session_after_load(kind: &str) -> (Arc<Mutex<Option<String>>>, SessionFlags) {
@@ -6381,7 +6678,7 @@ mod tests {
         }
         assert!(saw_error, "a failed fetch must be shown to the user");
         let shown = flags.error.clone().unwrap_or_default();
-        assert!(shown.contains("item 1"), "{shown}");
+        assert_eq!(shown, MEDIA_FETCH_MESSAGE);
         assert!(!shown.contains('/') && !shown.contains('\\'), "{shown}");
         assert_eq!(
             remote.lock().unwrap().as_deref(),
