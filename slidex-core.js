@@ -357,7 +357,7 @@
   }
 
   var DEFAULT_IMAGE_DURATION_MS = 10000;
-  var IMAGE_DURATION_CHOICES_MS = [3000, 4000, 6000, 8000, 10000, 12000];
+  var IMAGE_DURATION_CHOICES_MS = [3000, 4000, 6000, 8000, 10000, 12000, 20000];
 
   function savedImageDuration(stored) {
     var n = parseInt(stored, 10);
@@ -367,11 +367,19 @@
     return DEFAULT_IMAGE_DURATION_MS;
   }
 
-  /* Per-item playlist duration wins, including values outside the menu (20s). */
+  /* Per-item playlist duration wins, including values outside the old default menu (20s). */
   function resolveImageDuration(custom, fallback) {
     var n = parseInt(custom, 10);
     if (n > 0) return n;
     return savedImageDuration(fallback);
+  }
+
+  /* Hold time for the photo on screen. A 20s session or per-item duration
+     stays 20s. Only a missing or unknown value uses the 10s default. */
+  function castPhotoHoldMs(item, sessionMs) {
+    var custom = item && item.customDur;
+    if (!(parseInt(custom, 10) > 0) && item && item.imageUpdates) custom = item.imageUpdates.customDur;
+    return resolveImageDuration(custom, sessionMs);
   }
 
   function loadingStatusText(index, total) {
@@ -1272,6 +1280,7 @@
     IMAGE_DURATION_CHOICES_MS: IMAGE_DURATION_CHOICES_MS,
     savedImageDuration: savedImageDuration,
     resolveImageDuration: resolveImageDuration,
+    castPhotoHoldMs: castPhotoHoldMs,
     loadingStatusText: loadingStatusText,
     backgroundLoadStep: backgroundLoadStep,
     buildPlaylistDocument: buildPlaylistDocument,

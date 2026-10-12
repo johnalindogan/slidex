@@ -994,6 +994,7 @@ body.ssp-playlist-window #dock-toggle-btn {
         <option value="8000">8s</option>
         <option value="10000" selected>10s</option>
         <option value="12000">12s</option>
+        <option value="20000">20s</option>
       </select>
       <select class="cs" id="tsel" title="Transition effect">
         <option value="fade" selected>Fade</option>
@@ -3161,6 +3162,7 @@ const isV = i => getMediaItems()[i]?.type === 'video';
 const getDur = () => parseInt(g('dsel').value);
 const getItemDur = i => {
   const item = getMediaItems()[i != null ? i : cur];
+  if (window.SlideXCore && SlideXCore.castPhotoHoldMs) return SlideXCore.castPhotoHoldMs(item, getDur());
   if (window.SlideXCore) return SlideXCore.resolveImageDuration(item && item.customDur, getDur());
   return (item && item.customDur) || getDur();
 };
@@ -5735,7 +5737,12 @@ function waitForVideoFrame(video) {
 
 function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
-  tmr = setTimeout(() => { goTo(nextMI(), 'timer'); schedNext(); }, getEDur(cur));
+  const ms = getEDur(cur);
+  tmr = setTimeout(() => {
+    window.__sspCastHoldMs = ms;
+    goTo(nextMI(), 'timer');
+    schedNext();
+  }, ms);
 }
 
 function goTo(i, source) {
@@ -6094,6 +6101,8 @@ g('bne').onclick = () => goTo(cur + 1);
 g('btheme').onclick = e => { if (e.shiftKey) applyThemeToCurrent(true); else if (e.altKey) applyThemeToAll(true); else applyThemeToCurrent(false); };
 g('dsel').onchange = () => {
   try { localStorage.setItem('ssp_default_dur', g('dsel').value); } catch (_) {}
+  // While casting, the photo already on screen keeps its timer. The next one reads this.
+  if (window.__sspCastActive) return;
   clearTimeout(tmr); clearInterval(ptmr); if (!isV(cur)) { startKB(cur); startProg(); if (playing) schedNext(); }
 };
 (function initDefaultImageDuration() {
@@ -7453,7 +7462,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       if (skippedNotes.length) noteSkip(skippedNotes[0]);
     });
   }
-  function loadCurrent(source) {
+  function loadCurrent(source, holdMs) {
     var src = source || "user";
     if (!castActive || !window.__sspCastActive) return Promise.resolve();
     var path = sspCastCurrentPath();
@@ -7472,7 +7481,14 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
       return Promise.resolve();
     }
-    return call("cast_load", { path: path, autoplay: !!sspCastPlaying(), source: src }).then(function () {
+    var args = { path: path, autoplay: !!sspCastPlaying(), source: src };
+    if (src === "timer") {
+      var used = holdMs;
+      if (!(used > 0)) used = window.__sspCastHoldMs;
+      if (!(used > 0)) used = (window.SlideXCore && SlideXCore.DEFAULT_IMAGE_DURATION_MS) || 10000;
+      args.durationMs = Math.round(used);
+    }
+    return call("cast_load", args).then(function () {
       skipBurst = 0;
       setStatus("Casting " + (sspCastCurrentName() || "the current slide") + ".");
     }).catch(function (e) {
@@ -7531,9 +7547,10 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     slide: function (source) {
       var gen = window.__sspCastGen || 0;
       var src = source || "user";
+      var hold = window.__sspCastHoldMs;
       enqueue(function () {
         if (gen !== (window.__sspCastGen || 0) || !castActive || !window.__sspCastActive) return Promise.resolve();
-        return loadCurrent(src);
+        return loadCurrent(src, hold);
       });
     },
     transport: function (source) {

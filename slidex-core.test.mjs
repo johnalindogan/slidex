@@ -481,17 +481,102 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
-test('0.1.9 versions match and the welcome screen reads getVersion()', () => {
+test('a 20s cast photo uses that duration, and a change waits for the next photo', () => {
+  assert.equal(C.savedImageDuration('20000'), 20000);
+  assert.equal(C.castPhotoHoldMs(null, 20000), 20000);
+  assert.equal(C.castPhotoHoldMs({ customDur: 20000 }, 10000), 20000);
+  assert.equal(C.castPhotoHoldMs({ imageUpdates: { customDur: 20000 } }, 10000), 20000);
+  assert.equal(C.castPhotoHoldMs(null, 10000), 10000);
+  assert.equal(C.castPhotoHoldMs(null, 999), 10000);
+  assert.equal(C.resolveImageDuration(undefined, 20000), 20000);
+
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /value="20000">20s/);
+  const durFns = html.slice(html.indexOf('const getDur = () =>'), html.indexOf('/* ── Zoom / Pan ── */'));
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  const onchange = html.slice(html.indexOf("g('dsel').onchange"), html.indexOf('(function initDefaultImageDuration'));
+  assert.match(onchange, /__sspCastActive/);
+  assert.ok(onchange.indexOf('return') < onchange.indexOf('clearTimeout(tmr)'));
+  assert.match(sched, /__sspCastHoldMs/);
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  assert.match(load, /src === ['"]timer['"]/);
+  assert.match(load, /durationMs/);
+
+  const timers = [];
+  let seq = 1;
+  const sandbox = {
+    console,
+    SlideXCore: C,
+    cur: 0,
+    playing: true,
+    tmr: null,
+    ptmr: null,
+    spd: 100,
+    dsel: '20000',
+    dselEl: { value: '20000' },
+    items: [{ name: 'one.jpg' }, { name: 'two.jpg' }],
+    getMediaItems() { return sandbox.items; },
+    getSpd() { return sandbox.spd / 100; },
+    isV() { return false; },
+    nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
+    g(id) {
+      if (id === 'dsel') {
+        sandbox.dselEl.value = sandbox.dsel;
+        return sandbox.dselEl;
+      }
+      return {};
+    },
+    localStorage: { setItem(k, v) { this[k] = v; } },
+    startKB() {},
+    startProg() {},
+    clearInterval() {},
+    setTimeout(fn, ms) {
+      const id = seq++;
+      timers.push({ id, fn, ms });
+      return id;
+    },
+    clearTimeout(id) {
+      const i = timers.findIndex(t => t.id === id);
+      if (i >= 0) timers.splice(i, 1);
+    },
+    goTo(i) {
+      sandbox.cur = i;
+    },
+    window: { SlideXCore: C, __sspCastActive: true, __sspCastHoldMs: 0 },
+  };
+  sandbox.window.window = sandbox.window;
+  vm.runInNewContext(`
+    ${durFns}
+    ${sched}
+    ${onchange}
+  `, sandbox);
+  sandbox.schedNext();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 20000);
+  sandbox.dsel = '8000';
+  sandbox.dselEl.onchange();
+  assert.equal(timers.length, 1, 'changing duration while casting must not restart this photo');
+  assert.equal(timers[0].ms, 20000);
+  const fired = timers[0];
+  timers.splice(0, 1);
+  fired.fn();
+  assert.equal(sandbox.cur, 1);
+  assert.equal(sandbox.window.__sspCastHoldMs, 20000);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 8000, 'the next photo uses the duration set during the previous one');
+});
+
+test('0.1.10 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.9');
-  assert.equal(tauri.version, '0.1.9');
+  assert.equal(pkg.version, '0.1.10');
+  assert.equal(tauri.version, '0.1.10');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.9"/m);
-  assert.match(lock, /"version": "0\.1\.9"/);
+  assert.match(cargo, /^version = "0\.1\.10"/m);
+  assert.match(lock, /"version": "0\.1\.10"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
