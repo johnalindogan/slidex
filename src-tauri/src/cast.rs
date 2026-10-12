@@ -64,6 +64,8 @@ pub enum CastOrigin {
     User,
     Timer,
     Remote,
+    /// The session-ready wait gave up. The page cannot send this source.
+    Timeout,
 }
 
 impl CastOrigin {
@@ -81,6 +83,7 @@ impl CastOrigin {
             Self::User => "user",
             Self::Timer => "timer",
             Self::Remote => "remote",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -4516,12 +4519,15 @@ struct LiveSession {
 
 pub struct CastState {
     inner: Mutex<Option<LiveSession>>,
+    /// Connect failures are not stored as a session. status() still reports them.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Default for CastState {
     fn default() -> Self {
         Self {
             inner: Mutex::new(None),
+            last_error: Mutex::new(None),
         }
     }
 }
@@ -4533,6 +4539,39 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
     ) -> Result<CastConnectInfo, String> {
+        self.connect_wait(host, port, name, SESSION_READY_WAIT)
+    }
+
+    fn connect_wait(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        name: Option<String>,
+        ready_wait: Duration,
+    ) -> Result<CastConnectInfo, String> {
+        match self.connect_wait_inner(host, port, name, ready_wait) {
+            Ok(info) => {
+                if let Ok(mut slot) = self.last_error.lock() {
+                    *slot = None;
+                }
+                Ok(info)
+            }
+            Err(err) => {
+                if let Ok(mut slot) = self.last_error.lock() {
+                    *slot = Some(err.clone());
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn connect_wait_inner(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        name: Option<String>,
+        ready_wait: Duration,
+    ) -> Result<CastConnectInfo, String> {
         // The profile query runs on its own thread. Do not wait for it here.
         let _ = lan_category_now();
         let (ip, port) = parse_cast_host(host, port)?;
@@ -4541,7 +4580,7 @@ impl CastState {
             .cloned()
             .ok_or_else(|| NO_HOME_LAN_MESSAGE.to_string())?;
         // Replacing a session that was never opened is not a user Disconnect.
-        self.disconnect_session(false)?;
+        self.disconnect_session()?;
 
         let device_name = name.unwrap_or_else(|| "Chromecast".into());
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -4574,7 +4613,7 @@ impl CastState {
             })
             .map_err(|e| format!("cast thread: {e}"))?;
 
-        let info = match ready_rx.recv_timeout(SESSION_READY_WAIT) {
+        let info = match ready_rx.recv_timeout(ready_wait) {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
                 let _ = worker.join();
@@ -4583,9 +4622,12 @@ impl CastState {
             Err(_) => {
                 cancel.store(true, Ordering::SeqCst);
                 let _ = cmd_tx.send(CastCmd::Disconnect {
-                    origin: CastOrigin::User,
+                    origin: CastOrigin::Timeout,
                     reply: mpsc::channel().0,
                 });
+                // The worker is often still inside TLS or launch and exits
+                // before it reads Disconnect, so the caller records the line.
+                log_disconnect_once(&disconnect_logged, "source=timeout");
                 let _ = worker.join();
                 let reason = with_public_network(link_down_message());
                 log_connect_error(&reason, ip);
@@ -4675,20 +4717,16 @@ impl CastState {
     }
 
     pub fn disconnect(&self) -> Result<(), String> {
-        self.disconnect_session(true)
+        self.disconnect_session()
     }
 
-    /// `log_if_absent` is true for a user Disconnect, including a dead link.
-    /// Cast slideshow passes false so clearing an empty session writes nothing.
-    fn disconnect_session(&self, log_if_absent: bool) -> Result<(), String> {
+    /// Drop the live session. A Disconnect with nothing connected writes no line.
+    fn disconnect_session(&self) -> Result<(), String> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| "cast state lock".to_string())?;
         let Some(mut live) = guard.take() else {
-            if log_if_absent {
-                cast_log("disconnect", "source=user error=not connected");
-            }
             return Ok(());
         };
         // Cancel before the Disconnect command so a queued slideshow LOAD is dropped.
@@ -4734,11 +4772,12 @@ impl CastState {
             }
         };
         let Some(live) = guard.as_ref() else {
+            let error = self.last_error.lock().ok().and_then(|slot| slot.clone());
             return CastLiveStatus {
                 connected: false,
                 player_state: "idle".into(),
                 remote_event: None,
-                error: None,
+                error,
                 media_kind: String::new(),
                 http_port: 0,
                 bind_ip: String::new(),
@@ -8745,15 +8784,90 @@ mod tests {
             !written.contains(" disconnect "),
             "clearing an empty session must not log disconnect: {written}"
         );
+        assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
         state.disconnect().unwrap();
+        let written = log.text();
+        assert!(
+            !written.contains(" disconnect "),
+            "a user Disconnect with nothing connected must not log: {written}"
+        );
+        assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn session_ready_timeout_logs_source_timeout_and_sets_status_error() {
+        assert!(CastOrigin::parse("timeout").is_err());
+        assert_eq!(CastOrigin::Timeout.as_str(), "timeout");
+        let log = LogDir::new();
+        let snap = snapshot_ifaces();
+        let iface = snap
+            .bind
+            .clone()
+            .or_else(|| snap.preferred.first().cloned())
+            .expect("a home-LAN address is required to start a cast");
+        let listener = TcpListener::bind((iface.ip, 0)).expect("bind stalling peer");
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            while !stop_t.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        // Keep the TCP session open and never answer TLS.
+                        sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                        let mut buf = [0u8; 1024];
+                        while !stop_t.load(Ordering::SeqCst) {
+                            match sock.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(err)
+                                    if err.kind() == ErrorKind::WouldBlock
+                                        || err.kind() == ErrorKind::TimedOut => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let state = CastState::default();
+        let started = Instant::now();
+        let err = state
+            .connect_wait(
+                &iface.ip.to_string(),
+                Some(port),
+                None,
+                Duration::from_millis(400),
+            )
+            .expect_err("a peer that accepts and stays silent must time out");
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            elapsed >= Duration::from_millis(350) && elapsed < Duration::from_secs(6),
+            "ready wait should be ~400ms plus the TLS join, got {elapsed:?}"
+        );
+        assert!(err.contains("TV unreachable"), "{err}");
+        assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
         let written = log.text();
         let lines: Vec<_> = written
             .lines()
             .filter(|l| l.contains(" disconnect "))
             .collect();
         assert_eq!(lines.len(), 1, "{written}");
-        assert!(lines[0].contains("source=user"), "{}", lines[0]);
-        assert!(lines[0].contains("error=not connected"), "{}", lines[0]);
+        assert!(lines[0].contains("source=timeout"), "{}", lines[0]);
+        assert!(!lines[0].contains("source=user"), "{}", lines[0]);
+        state.disconnect().unwrap();
+        let after = log.text();
+        let lines: Vec<_> = after
+            .lines()
+            .filter(|l| l.contains(" disconnect "))
+            .collect();
+        assert_eq!(lines.len(), 1, "{after}");
     }
 
     #[test]
