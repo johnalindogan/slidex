@@ -6107,8 +6107,11 @@ g('bne').onclick = () => goTo(cur + 1);
 g('btheme').onclick = e => { if (e.shiftKey) applyThemeToCurrent(true); else if (e.altKey) applyThemeToAll(true); else applyThemeToCurrent(false); };
 g('dsel').onchange = () => {
   try { localStorage.setItem('ssp_default_dur', g('dsel').value); } catch (_) {}
-  // While casting, the photo already on screen keeps its timer. The next one reads this.
-  if (window.__sspCastActive) return;
+  // Casting: leave the photo timer. Ken Burns and the bar take the new duration, even if paused.
+  if (window.__sspCastActive) {
+    if (!isV(cur)) { startKB(cur); startProg(); }
+    return;
+  }
   clearTimeout(tmr); clearInterval(ptmr); if (!isV(cur)) { startKB(cur); startProg(); if (playing) schedNext(); }
 };
 (function initDefaultImageDuration() {

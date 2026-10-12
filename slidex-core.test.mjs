@@ -499,6 +499,10 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   const hook = html.slice(html.indexOf('function sspCastHook('), html.indexOf('function sspCastPlaying'));
   assert.match(onchange, /__sspCastActive/);
   assert.ok(onchange.indexOf('return') < onchange.indexOf('clearTimeout(tmr)'));
+  const castBranch = onchange.slice(onchange.indexOf('__sspCastActive'), onchange.indexOf('clearTimeout(tmr)'));
+  assert.match(castBranch, /startKB\(cur\)/);
+  assert.match(castBranch, /startProg\(\)/);
+  assert.doesNotMatch(castBranch, /schedNext/);
   assert.match(sched, /goTo\(nextMI\(\), 'timer'\)/);
   assert.doesNotMatch(sched, /__sspCastHoldMs/);
   assert.match(hook, /getEDur\(\)/);
@@ -514,6 +518,8 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   const timers = [];
   const loads = [];
   let seq = 1;
+  let kb = 0;
+  let prog = 0;
   const sandbox = {
     console,
     SlideXCore: C,
@@ -542,8 +548,8 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
       return {};
     },
     localStorage: { setItem(k, v) { this[k] = v; } },
-    startKB() {},
-    startProg() {},
+    startKB() { kb += 1; },
+    startProg() { prog += 1; },
     clearInterval() {},
     enqueue(fn) { fn(); },
     loadCurrent(source, holdMs) { loads.push({ source, holdMs }); },
@@ -575,8 +581,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 20000);
   sandbox.dsel = '8000';
   sandbox.dselEl.onchange();
+  assert.equal(kb, 1, 'a duration change while casting restarts Ken Burns');
+  assert.equal(prog, 1, 'a duration change while casting restarts the progress bar');
   assert.equal(timers.length, 1, 'changing duration while casting must not restart this photo');
   assert.equal(timers[0].ms, 20000);
+  sandbox.playing = false;
+  kb = 0;
+  prog = 0;
+  sandbox.dselEl.onchange();
+  assert.equal(kb, 1, 'a paused cast still restarts Ken Burns');
+  assert.equal(prog, 1, 'a paused cast still restarts the progress bar');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 20000, 'a paused cast does not restart the photo timer');
+  sandbox.playing = true;
   const fired = timers[0];
   timers.splice(0, 1);
   fired.fn();
@@ -591,6 +608,16 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.deepEqual(loads[1], { source: 'timer', holdMs: 8000 });
   assert.equal(timers.length, 1);
   assert.equal(timers[0].ms, 8000, 'a photo without its own duration uses the setting changed during the previous one');
+  sandbox.window.__sspCastActive = false;
+  sandbox.cur = 0;
+  sandbox.dsel = '6000';
+  kb = 0;
+  prog = 0;
+  sandbox.dselEl.onchange();
+  assert.equal(kb, 1);
+  assert.equal(prog, 1);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
 test('0.1.10 versions match and the welcome screen reads getVersion()', () => {
