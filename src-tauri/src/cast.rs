@@ -1486,13 +1486,13 @@ fn fits_box(w: u32, h: u32, box_w: u32, box_h: u32) -> bool {
 }
 
 /// Average frame rate is `samples × timescale / Σ(sample_count × delta)`.
-/// Strictly over 60 fails. Exactly 60 passes.
+/// The cap is 60 plus 0.5% (60.3). Exactly 60.3 passes. 61 does not.
 fn fps_over_60(timescale: u32, samples: u64, ticks: u128) -> bool {
     if timescale == 0 || samples == 0 || ticks == 0 {
         return false;
     }
     let numer = (samples as u128).saturating_mul(timescale as u128);
-    numer > ticks.saturating_mul(60)
+    numer.saturating_mul(1000) > ticks.saturating_mul(60_300)
 }
 
 fn format_fps(timescale: u32, samples: u64, ticks: u128) -> String {
@@ -1704,14 +1704,27 @@ fn parse_stts(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> s
     }
     f.seek(SeekFrom::Start(payload + 4))?;
     let count = read_u32(f)?.min(4096);
-    let mut samples: u64 = 0;
-    let mut ticks: u128 = 0;
+    let mut entries: Vec<(u64, u128)> = Vec::new();
     for _ in 0..count {
         if f.stream_position()? + 8 > end {
             break;
         }
         let n = read_u32(f)? as u64;
         let delta = read_u32(f)? as u128;
+        entries.push((n, delta));
+    }
+    // A short final sample (count 1, delta below the previous entry) is the
+    // remainder of the last frame, not the clip's frame rate.
+    if entries.len() >= 2 {
+        let (n, delta) = entries[entries.len() - 1];
+        let prev = entries[entries.len() - 2].1;
+        if n == 1 && delta < prev {
+            entries.pop();
+        }
+    }
+    let mut samples: u64 = 0;
+    let mut ticks: u128 = 0;
+    for (n, delta) in entries {
         samples = samples.saturating_add(n);
         ticks = ticks.saturating_add((n as u128).saturating_mul(delta));
     }
@@ -6193,6 +6206,38 @@ mod tests {
         );
         let tail = decide_cast_video(&tail);
         assert!(tail.skip.is_none(), "{:?}", tail.skip);
+    }
+
+    #[test]
+    fn pass_short_last_sample() {
+        // 300×1500 is exactly 60 fps at timescale 90000. One shorter final
+        // sample (delta 100) would pull the average to about 60.2 if counted.
+        let tail = scratch(
+            "short-last.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                90_000,
+                &[(300, 1500), (1, 100)],
+                Some(51),
+                None,
+                Some(8_000_000),
+                8,
+                false,
+            ),
+        );
+        let tail = decide_cast_video(&tail);
+        assert!(tail.skip.is_none(), "{:?}", tail.skip);
+
+        let fast = scratch(
+            "sixtyone.mp4",
+            &h264_clip(1920, 1080, 61, 1, Some(42), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&fast).skip.as_deref(),
+            Some("61 fps isn't supported by the TV")
+        );
     }
 
     #[test]
