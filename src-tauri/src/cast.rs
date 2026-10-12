@@ -1144,8 +1144,8 @@ fn parse_stsd(
     Ok(())
 }
 
-/// Highest H.264/HEVC level SlideX will cast, in tenths (51 = level 5.1).
-const CAST_MAX_VIDEO_LEVEL: u8 = 51;
+/// Highest H.264/HEVC level SlideX will cast, in tenths (52 = level 5.2).
+const CAST_MAX_VIDEO_LEVEL: u8 = 52;
 
 /// H.264 Table A-1, in tenths: level, MaxFS, MaxMBPS. Used for a missing level
 /// on both H.264 and HEVC (16×16 macroblocks, rounded up).
@@ -5861,7 +5861,7 @@ mod tests {
 
     #[test]
     fn level_5_1_passes_and_a_declared_level_is_trusted() {
-        assert_eq!(CAST_MAX_VIDEO_LEVEL, 51);
+        assert_eq!(CAST_MAX_VIDEO_LEVEL, 52);
         let exact = scratch(
             "level51.mp4",
             &h264_clip(1920, 1080, 30, 1, Some(51), Some(8_000_000)),
@@ -5901,16 +5901,21 @@ mod tests {
     }
 
     #[test]
-    fn level_5_2_is_skipped_with_the_tv_sentence() {
+    fn level_5_2_passes_and_a_higher_level_is_skipped() {
+        // John's Google TV plays 2160×2160 at 60 fps, which is level 5.2.
+        let square = scratch(
+            "square52.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(52), Some(8_000_000)),
+        );
+        let square = decide_cast_video(&square);
+        assert!(square.skip.is_none(), "{:?}", square.skip);
+        assert!(square.derived.is_none());
         let path = scratch(
             "level52.mp4",
             &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
         );
         let decision = decide_cast_video(&path);
-        assert_eq!(
-            decision.skip.as_deref(),
-            Some("H.264 level 5.2 may not play on this TV")
-        );
+        assert!(decision.skip.is_none(), "{:?}", decision.skip);
         assert!(decision.derived.is_none());
         let hevc = scratch(
             "hevc52.mp4",
@@ -5926,17 +5931,58 @@ mod tests {
                 8,
             ),
         );
+        assert!(decide_cast_video(&hevc).skip.is_none());
+
+        let five_three = scratch(
+            "level53.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
+        );
         assert_eq!(
-            decide_cast_video(&hevc).skip.as_deref(),
-            Some("HEVC level 5.2 may not play on this TV")
+            decide_cast_video(&five_three).skip.as_deref(),
+            Some("H.264 level 5.3 may not play on this TV")
+        );
+        let six = scratch(
+            "level60.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(60), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&six).skip.as_deref(),
+            Some("H.264 level 6.0 may not play on this TV")
+        );
+        let six_one = scratch(
+            "level61.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(61), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&six_one).skip.as_deref(),
+            Some("H.264 level 6.1 may not play on this TV")
+        );
+        // general_level_idc 180 is HEVC level 6.0.
+        let hevc6 = scratch(
+            "hevc60.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(180),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&hevc6).skip.as_deref(),
+            Some("HEVC level 6.0 may not play on this TV")
         );
         let both = scratch(
             "fps-and-level.mp4",
-            &h264_clip(1920, 1080, 90, 1, Some(52), Some(8_000_000)),
+            &h264_clip(1920, 1080, 90, 1, Some(60), Some(8_000_000)),
         );
         assert_eq!(
             decide_cast_video(&both).skip.as_deref(),
-            Some("90 fps isn't supported by the TV. H.264 level 5.2 may not play on this TV")
+            Some("90 fps isn't supported by the TV. H.264 level 6.0 may not play on this TV")
         );
     }
 
@@ -5971,9 +6017,10 @@ mod tests {
         );
         let square = decide_cast_video(&square);
         assert_eq!(square.derived.as_deref(), Some("5.2"));
-        assert_eq!(
-            square.skip.as_deref(),
-            Some("H.264 level 5.2 may not play on this TV")
+        assert!(
+            square.skip.is_none(),
+            "a derived 5.2 plays: {:?}",
+            square.skip
         );
 
         let passes = scratch(
@@ -6072,7 +6119,7 @@ mod tests {
         let photo = scratch("one.jpg", &jpeg_bytes());
         let bad = scratch(
             "skip-me.mp4",
-            &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
+            &h264_clip(1920, 1080, 30, 1, Some(60), Some(8_000_000)),
         );
         let next = scratch("three.jpg", &jpeg_bytes());
         let derived = scratch(
@@ -6094,13 +6141,13 @@ mod tests {
         assert_eq!(succ.media_type, "photo");
         assert_eq!(
             skipped.as_deref(),
-            Some("H.264 level 5.2 may not play on this TV")
+            Some("H.264 level 6.0 may not play on this TV")
         );
         let written = log.text();
         assert!(written.contains("video_skipped"), "{written}");
         assert!(written.contains("item=2"), "{written}");
         assert!(
-            written.contains("reasons=H.264 level 5.2 may not play on this TV"),
+            written.contains("reasons=H.264 level 6.0 may not play on this TV"),
             "{written}"
         );
         let (play, none) = http.next_castable(3);
@@ -6166,13 +6213,32 @@ mod tests {
     }
 
     #[test]
-    fn level_5_2_load_sends_no_load_and_logs_video_skipped() {
+    fn level_5_2_load_is_sent() {
+        let (log, fake, result, live) = drive_load(
+            "level52.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(52), Some(8_000_000)),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert_eq!(live.media_kind, "video");
+        let text = fake.trace_text();
+        assert!(
+            text.lines().any(|line| line.starts_with("load ")),
+            "level 5.2 is loaded: {text}"
+        );
+        let written = log.text();
+        assert!(!written.contains("video_skipped"), "{written}");
+        assert!(!written.contains("level_derived="), "{written}");
+    }
+
+    #[test]
+    fn level_above_5_2_load_sends_no_load_and_logs_video_skipped() {
         let (log, fake, result, live) = drive_load(
             "no-load.mp4",
-            &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
+            &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
         );
-        let err = result.expect_err("a level 5.2 file is not loaded");
-        assert_eq!(err, "H.264 level 5.2 may not play on this TV");
+        let err = result.expect_err("a level above 5.2 is not loaded");
+        assert_eq!(err, "H.264 level 5.3 may not play on this TV");
         assert!(live.connected);
         assert_eq!(live.error.as_deref(), Some(err.as_str()));
         let text = fake.trace_text();
@@ -6183,7 +6249,7 @@ mod tests {
         let written = log.text();
         assert!(written.contains("video_skipped"), "{written}");
         assert!(
-            written.contains("item=1 reasons=H.264 level 5.2 may not play on this TV"),
+            written.contains("item=1 reasons=H.264 level 5.3 may not play on this TV"),
             "{written}"
         );
         assert!(!written.contains("level_derived="), "{written}");
