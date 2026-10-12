@@ -7311,7 +7311,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="castClose">Close</button>
   </div>
   <div id="castStatus">Open Cast to look for a TV. Play, pause, next, and previous on this PC follow on the TV.</div>
-  <div id="castFirewall"></div>
+  <div id="castFirewall">No Private inbound rule for slideshowpro.exe. Cast needs TCP 47200-47215 and UDP 5353 on private networks. Re-run the installer and accept the Windows prompt.</div>
 </div>
 <script>
 /* Cast spike UI. #lbcast and #bcast stay disabled until the stacked Cast PR removes disabled. */
@@ -7441,10 +7441,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function refreshFirewall() {
     if (!firewallEl) return;
     call("cast_firewall_status").then(function (fw) {
-      firewallEl.textContent = (fw && (fw.detail || fw.state)) || "";
-    }).catch(function () {
-      firewallEl.textContent = "";
-    });
+      var text = fw && (fw.detail || fw.state);
+      if (text) firewallEl.textContent = text;
+    }).catch(function () {});
   }
   function watchNetwork() {
     if (!sspIsTauri()) return;

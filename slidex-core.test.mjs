@@ -1211,6 +1211,16 @@ test('the cast banner follows status immediately and shows Paused', () => {
   assert.match(html, /SlideXCore\.castBannerText/);
 });
 
+test('the missing firewall rules message is shown before the panel opens', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const sentence = 'No Private inbound rule for slideshowpro.exe. Cast needs TCP 47200-47215 and UDP 5353 on private networks. Re-run the installer and accept the Windows prompt.';
+  const markup = html.slice(html.indexOf('id="castFirewall"'), html.indexOf('id="castFirewall"') + 400);
+  assert.match(markup, new RegExp(sentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const refresh = html.slice(html.indexOf('function refreshFirewall'), html.indexOf('function watchNetwork'));
+  assert.doesNotMatch(refresh, /textContent = ""/);
+  assert.match(refresh, /\.catch\(function \(\) \{\s*\}\)/);
+});
+
 test('the TV unreachable banner comes only from cast_status', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
