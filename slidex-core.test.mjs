@@ -1189,6 +1189,28 @@ test('a cast ignores local video events and tags the command source', () => {
   assert.match(disc, /cast_disconnect/);
 });
 
+test('the cast banner follows status immediately and shows Paused', () => {
+  assert.equal(C.castBannerText({ player_state: 'paused' }, 'clip.mp4'), 'Paused');
+  assert.equal(C.castBannerText({ player_state: 'PAUSED', error: '' }, 'clip.mp4'), 'Paused');
+  assert.equal(C.castBannerText({ player_state: 'playing' }, 'clip.mp4'), 'Casting clip.mp4.');
+  assert.equal(C.castBannerText({ player_state: 'playing' }, ''), 'Casting the current slide.');
+  assert.equal(
+    C.castBannerText({ player_state: 'playing', error: '90 fps isn\'t supported by the TV' }, 'clip.mp4'),
+    '90 fps isn\'t supported by the TV'
+  );
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  const sync = html.slice(html.indexOf('function syncTransport'), html.indexOf('function poll'));
+  const poll = html.slice(html.indexOf('function poll()'), html.indexOf('window.__sspCast = {'));
+  assert.match(load, /refreshCastBanner\(\)/);
+  assert.doesNotMatch(load, /setTimeout/);
+  assert.match(sync, /refreshCastBanner\(\)/);
+  assert.doesNotMatch(sync, /setTimeout/);
+  assert.match(poll, /applyCastBanner\(st\)/);
+  assert.doesNotMatch(poll, /setTimeout/);
+  assert.match(html, /SlideXCore\.castBannerText/);
+});
+
 test('the TV unreachable banner comes only from cast_status', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));

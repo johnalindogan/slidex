@@ -367,6 +367,15 @@
       || /may not play on this TV/i.test(s);
   }
 
+  function castBannerText(status, itemName) {
+    var err = status && status.error;
+    if (err) return String(err);
+    var state = String((status && status.player_state) || '').toLowerCase();
+    if (state === 'paused') return 'Paused';
+    var name = itemName ? String(itemName) : 'the current slide';
+    return 'Casting ' + name + '.';
+  }
+
   function itemUnsupportedForCast(item, opts) {
     if (!item) return true;
     opts = opts || {};
@@ -1341,6 +1350,7 @@
     DEFAULT_IMAGE_DURATION_MS: DEFAULT_IMAGE_DURATION_MS,
     IMAGE_DURATION_CHOICES_MS: IMAGE_DURATION_CHOICES_MS,
     isCastSkipMessage: isCastSkipMessage,
+    castBannerText: castBannerText,
     nextIndexSkippingUnsupported: nextIndexSkippingUnsupported,
     savedImageDuration: savedImageDuration,
     resolveImageDuration: resolveImageDuration,

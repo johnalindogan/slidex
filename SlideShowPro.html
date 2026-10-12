@@ -7497,6 +7497,25 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       if (skippedNotes.length) noteSkip(skippedNotes[0]);
     });
   }
+  function castItemName(st) {
+    var idx = Number(field(st, "item_index")) || 0;
+    if (idx > 0 && typeof getMediaItems === "function") {
+      var items = getMediaItems() || [];
+      var item = items[idx - 1];
+      if (item && item.name) return item.name;
+    }
+    return typeof sspCastCurrentName === "function" ? sspCastCurrentName() : "";
+  }
+  function applyCastBanner(st) {
+    if (!st || !field(st, "connected")) return;
+    if (!(window.SlideXCore && typeof window.SlideXCore.castBannerText === "function")) return;
+    setStatus(window.SlideXCore.castBannerText(st, castItemName(st)));
+  }
+  function refreshCastBanner() {
+    return call("cast_status").then(function (st) {
+      applyCastBanner(st);
+    }).catch(function () {});
+  }
   function loadCurrent(source, holdMs) {
     var src = source || "user";
     if (!castActive || !window.__sspCastActive) return Promise.resolve();
@@ -7524,7 +7543,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     }
     return call("cast_load", args).then(function () {
       skipBurst = 0;
-      setStatus("Casting " + (sspCastCurrentName() || "the current slide") + ".");
+      return refreshCastBanner();
     }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
       if (castSkipMessage(msg)) {
@@ -7545,7 +7564,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var src = source || "user";
     if (!castActive || !window.__sspCastActive) return Promise.resolve();
     var cmd = sspCastPlaying() ? "cast_play" : "cast_pause";
-    return call(cmd, { source: src }).catch(function (e) {
+    return call(cmd, { source: src }).then(function () {
+      return refreshCastBanner();
+    }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
       setStatus(msg);
     });
@@ -7578,6 +7599,8 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       if (!field(st, "connected")) {
         stopLocalCast();
         setStatus(field(st, "error") || "TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.");
+      } else {
+        applyCastBanner(st);
       }
     }).catch(function (e) { console.warn(e); });
   }
