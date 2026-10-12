@@ -4369,6 +4369,12 @@ fn handle_cmd(
                 // LOAD already carries autoplay. PLAY is only a resume from
                 // pause, and never for a photo: the TV does not answer it.
                 if flags.media_kind == "still" || flags.player_state != "paused" {
+                    let reason = if flags.media_kind == "still" {
+                        "photo"
+                    } else {
+                        "not_paused"
+                    };
+                    cast_log("play_skipped", &format!("reason={reason}"));
                     let _ = (sid, origin);
                     flags.player_state = "playing".into();
                     flags.slideshow_playing = true;
@@ -6088,8 +6094,12 @@ mod tests {
                     send_media_status(mm, 0, 7, "PAUSED");
                     continue;
                 }
+                // requestId 0 is unsolicited. It must not satisfy the LOAD wait.
+                note_trace(traces, "media-status requestId=0");
+                send_media_status(mm, 0, 1, "PAUSED");
                 note_trace(traces, "media-status");
                 send_media_status(mm, 999, 1, "PLAYING");
+                note_trace(traces, &format!("media-status requestId={id}"));
                 send_media_status(mm, id, 7, script.load_state);
                 for state in script.follow_states {
                     send_media_status(mm, 0, 7, state);
@@ -6184,7 +6194,12 @@ mod tests {
                     "STOP" => "IDLE",
                     _ => "PLAYING",
                 };
-                note_trace(traces, "media-status");
+                if typ == "PLAY" {
+                    // A video resume. requestId 0 must not satisfy this PLAY.
+                    note_trace(traces, "media-status requestId=0");
+                    send_media_status(mm, 0, 1, "PAUSED");
+                }
+                note_trace(traces, &format!("media-status requestId={id}"));
                 send_media_status(mm, id, sid, state);
             }
         }
@@ -6776,6 +6791,8 @@ mod tests {
         let written = cast.log.text();
         assert!(written.contains("reply=MEDIA_STATUS"), "{written}");
         assert!(written.contains("playerState=PLAYING"), "{written}");
+        assert!(written.contains("mediaSessionId=7"), "{written}");
+        assert!(written.contains("play_skipped reason=photo"), "{written}");
         assert!(
             !written.contains("timeout")
                 && !written.contains("didn't answer")
@@ -6802,6 +6819,11 @@ mod tests {
             "{}",
             cast.fake.trace_text()
         );
+        assert!(
+            cast.log.text().contains("play_skipped reason=not_paused"),
+            "{}",
+            cast.log.text()
+        );
         let (elapsed, paused) = cast.command(false);
         assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
         assert!(paused.is_ok(), "{paused:?}");
@@ -6820,6 +6842,82 @@ mod tests {
             cast.fake.trace_text()
         );
         assert_eq!(cast.flags.player_state, "playing");
+    }
+
+    #[test]
+    fn request_id_zero_does_not_satisfy_load_or_video_play() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/clip";
+        let sid = link
+            .load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .unwrap();
+        assert_eq!(sid, 7, "requestId 0 must not win the LOAD");
+        let written = log.text();
+        let load_line = written
+            .lines()
+            .find(|line| line.contains(" load "))
+            .unwrap_or_else(|| panic!("{written}"));
+        assert!(load_line.contains("reply=MEDIA_STATUS"), "{load_line}");
+        assert!(load_line.contains("playerState=PLAYING"), "{load_line}");
+        assert!(load_line.contains("mediaSessionId=7"), "{load_line}");
+        assert!(!load_line.contains("playerState=PAUSED"), "{load_line}");
+        assert!(!load_line.contains("requestId=0"), "{load_line}");
+        let text = fake.trace_text();
+        assert_status_after_zero(&text, "load ", "LOAD");
+
+        assert_eq!(
+            link.pause(7, CastOrigin::User).unwrap(),
+            PlayerState::Paused
+        );
+        let started = Instant::now();
+        assert_eq!(
+            link.play(7, CastOrigin::User).unwrap(),
+            PlayerState::Playing,
+            "requestId 0 PAUSED must not satisfy PLAY"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "PLAY waited {:?}",
+            started.elapsed()
+        );
+        let text = fake.trace_text();
+        assert_status_after_zero(&text, "PLAY ", "PLAY");
+        let written = log.text();
+        let play_line = written
+            .lines()
+            .find(|line| line.contains(" play "))
+            .unwrap_or_else(|| panic!("{written}"));
+        assert!(play_line.contains("reply=PLAYING"), "{play_line}");
+        assert!(!play_line.contains("requestId=0"), "{play_line}");
+        assert!(!play_line.contains("PAUSED"), "{play_line}");
+    }
+
+    /// The unsolicited `requestId=0` status is traced before the matching reply.
+    fn assert_status_after_zero(text: &str, command: &str, label: &str) {
+        let lines: Vec<&str> = text.lines().collect();
+        let cmd_at = lines
+            .iter()
+            .rposition(|line| line.starts_with(command))
+            .unwrap_or_else(|| panic!("{label} missing in {text}"));
+        let zero_at = lines
+            .iter()
+            .enumerate()
+            .position(|(i, line)| i > cmd_at && *line == "media-status requestId=0")
+            .unwrap_or_else(|| panic!("{label} sent no requestId 0: {text}"));
+        let real_at = lines
+            .iter()
+            .enumerate()
+            .position(|(i, line)| {
+                i > zero_at
+                    && line.starts_with("media-status requestId=")
+                    && *line != "media-status requestId=0"
+            })
+            .unwrap_or_else(|| panic!("{label} sent no matching status: {text}"));
+        assert!(cmd_at < zero_at && zero_at < real_at, "{label}: {text}");
     }
 
     #[test]
