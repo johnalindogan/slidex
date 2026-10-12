@@ -1195,6 +1195,29 @@ test('a cast skip message names TV limits and a level the TV may not play', () =
   assert.match(html, /__sspCastBadPaths/);
 });
 
+test('mkv, webm, and mp4 names are kept so cast can verify them', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('const IMAGE_EXTS'), html.indexOf('function normalizeMediaPathEntry'));
+  const kind = vm.runInNewContext(`${src}
+    ({
+      mkv: mediaKindFromName('clip.mkv'),
+      webm: mediaKindFromName('clip.webm'),
+      avi: mediaKindFromName('clip.avi'),
+      mp4: mediaKindFromName('cut.mp4'),
+      txt: mediaKindFromName('notes.txt'),
+      mkvFile: isAcceptedMediaFile({ name: 'clip.mkv', type: '' }),
+      webmFile: isAcceptedMediaFile({ name: 'clip.webm', type: '' })
+    })`, { String });
+  assert.equal(kind.mkv, 'video');
+  assert.equal(kind.webm, 'video');
+  assert.equal(kind.avi, 'video');
+  assert.equal(kind.mp4, 'video');
+  assert.equal(kind.txt, null);
+  assert.equal(kind.mkvFile, true);
+  assert.equal(kind.webmFile, true);
+  assert.match(html, /\.mkv/);
+});
+
 test('a cast skip during loadCurrent moves straight to the next slide', async () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const src = html.slice(html.indexOf('function currentSkipped'), html.indexOf('function syncTransport'));

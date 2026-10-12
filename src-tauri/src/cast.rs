@@ -1333,22 +1333,26 @@ struct Mp4Box {
 /// Anything that cannot be read — another container, a truncated box, or an
 /// I/O error — is skipped.
 fn decide_cast_video(path: &Path) -> CastVideoDecision {
+    decide_cast_video_logged(path, true)
+}
+
+fn decide_cast_video_logged(path: &Path, log: bool) -> CastVideoDecision {
     let ext = ext_of(path);
     if ext != "mp4" && ext != "mov" {
-        return unverifiable_video(path);
+        return unverifiable_video(path, log);
     }
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let probe = match read_mp4_video(path) {
         Ok(probe) => probe,
-        Err(_) => return unverifiable_video(path),
+        Err(_) => return unverifiable_video(path, log),
     };
     if probe.codec.is_none() {
-        return unverifiable_video(path);
+        return unverifiable_video(path, log);
     }
     // `trex` / `tfhd` are not read. A fragment with no `mdhd` timescale or no
     // `stts` samples cannot be checked, so it is not sent to the TV.
     if probe.fragmented && (probe.timescale == 0 || probe.sample_count == 0) {
-        return unverifiable_video(path);
+        return unverifiable_video(path, log);
     }
     let mut derived = None;
     let mut level = probe.level.filter(|tenths| *tenths != 0);
@@ -1423,12 +1427,14 @@ fn container_token(path: &Path) -> String {
     }
 }
 
-fn unverifiable_video(path: &Path) -> CastVideoDecision {
+fn unverifiable_video(path: &Path, log: bool) -> CastVideoDecision {
     let container = container_token(path);
-    cast_log(
-        "skip",
-        &format!("reason=unverifiable container={container}"),
-    );
+    if log {
+        cast_log(
+            "skip",
+            &format!("reason=unverifiable container={container}"),
+        );
+    }
     CastVideoDecision {
         skip: Some(format!(
             "can't verify this video for the TV ({container})"
@@ -2063,33 +2069,61 @@ fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
     let mut page_index = Vec::new();
     for (idx, path) in paths.iter().enumerate() {
         let page = (idx as u32).saturating_add(1);
-        match classify_playlist_file(path) {
-            Ok((ctype, kind)) => {
-                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-                if book.by_path.contains_key(&canon) {
-                    continue;
+        let accepted = match classify_playlist_file(path) {
+            Ok((ctype, kind)) => Some((ctype.to_string(), kind)),
+            Err(reason) => match video_for_cast_check(path) {
+                Some(pair) => Some(pair),
+                None => {
+                    skipped.push(reason);
+                    None
                 }
-                let key = new_token();
-                book.by_path.insert(canon.clone(), key.clone());
-                book.order.push(canon.clone());
-                page_index.push(page);
-                book.files.insert(
-                    key,
-                    AllowEntry {
-                        path: canon,
-                        content_type: ctype.to_string(),
-                        kind,
-                        page_index: page,
-                    },
-                );
+            },
+        };
+        if let Some((ctype, kind)) = accepted {
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if book.by_path.contains_key(&canon) {
+                continue;
             }
-            Err(reason) => skipped.push(reason),
+            let key = new_token();
+            book.by_path.insert(canon.clone(), key.clone());
+            book.order.push(canon.clone());
+            page_index.push(page);
+            book.files.insert(
+                key,
+                AllowEntry {
+                    path: canon,
+                    content_type: ctype,
+                    kind,
+                    page_index: page,
+                },
+            );
         }
     }
     PlaylistUpdate {
         registered: book.files.len(),
         skipped,
         page_index,
+    }
+}
+
+/// Classify rejected this file, but it is a video the cast check can still
+/// name. Register it so a LOAD runs `decide_cast_video` instead of the
+/// generic unsupported-media skip. Logging happens on that LOAD.
+fn video_for_cast_check(path: &Path) -> Option<(String, String)> {
+    let ctype = match ext_of(path).as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        _ => return None,
+    };
+    let decision = decide_cast_video_logged(path, false);
+    let skip = decision.skip.as_deref()?;
+    if skip.contains("can't verify this video") {
+        Some((ctype.to_string(), "video".to_string()))
+    } else {
+        None
     }
 }
 
@@ -6509,6 +6543,58 @@ mod tests {
             &h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000)),
         );
         assert!(decide_cast_video(&mov).skip.is_none(), "a readable MOV still loads");
+    }
+
+    #[test]
+    fn unverifiable_containers_reach_the_cast_check() {
+        let log = LogDir::new();
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let mkv = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        let webm = scratch("clip.webm", b"\x1a\x45\xdf\xa3");
+        let mut cut = h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000));
+        // moov is the last box. Cutting the tail makes that box extend past EOF,
+        // so classify never sees the sample entries.
+        cut.truncate(cut.len().saturating_sub(32));
+        let truncated = scratch("cut.mp4", &cut);
+        let after = scratch("two.jpg", &jpeg_bytes());
+        let no_aac = scratch("na.mp4", &mp4_with(&[b"avc1"]));
+        assert!(classify_playlist_file(&mkv).is_err());
+        assert!(classify_playlist_file(&webm).is_err());
+        assert!(classify_playlist_file(&truncated).is_err());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        let update = http
+            .set_playlist(&[
+                photo,
+                mkv.clone(),
+                webm.clone(),
+                truncated.clone(),
+                after,
+                no_aac,
+            ])
+            .unwrap();
+        assert_eq!(update.registered, 5, "{:?}", update.skipped);
+        assert_eq!(update.skipped.len(), 1, "{:?}", update.skipped);
+        assert!(
+            update.skipped[0].contains("Unsupported media"),
+            "{:?}",
+            update.skipped
+        );
+        let (succ, note) = http.next_castable(1);
+        let succ = succ.expect("the photo after the unverifiable videos");
+        assert_eq!(succ.item, 5);
+        assert_eq!(succ.media_type, "photo");
+        let note = note.expect("skip notes");
+        assert!(note.contains("can't verify this video for the TV (MKV)"), "{note}");
+        assert!(note.contains("can't verify this video for the TV (WEBM)"), "{note}");
+        assert!(note.contains("can't verify this video for the TV (MP4)"), "{note}");
+        assert!(!note.contains("Unsupported media"), "{note}");
+        let written = log.text();
+        assert!(written.contains("skip reason=unverifiable container=MKV"), "{written}");
+        assert!(written.contains("skip reason=unverifiable container=WEBM"), "{written}");
+        assert!(written.contains("skip reason=unverifiable container=MP4"), "{written}");
+        assert!(written.contains("video_skipped item=2 reasons=can't verify this video for the TV (MKV)"), "{written}");
+        assert!(written.contains("video_skipped item=3 reasons=can't verify this video for the TV (WEBM)"), "{written}");
+        assert!(written.contains("video_skipped item=4 reasons=can't verify this video for the TV (MP4)"), "{written}");
     }
 
     #[test]

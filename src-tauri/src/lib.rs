@@ -19,7 +19,7 @@ const HIGH_PERF_BROWSER_ARGS: &str =
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "ico",
 ];
-const VIDEO_EXTS: &[&str] = &["mp4", "mov", "webm", "m4v"];
+const VIDEO_EXTS: &[&str] = &["mp4", "mov", "webm", "m4v", "mkv", "avi"];
 
 /// Full recursive folder walk with sane media-extension filter.
 /// Cap guards against pathological trees (network mounts, etc.).
