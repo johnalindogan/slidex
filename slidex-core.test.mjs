@@ -471,7 +471,7 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.ok(C.IMAGE_DURATION_CHOICES_MS.includes(10000));
   assert.equal(C.savedImageDuration(null), 10000);
   assert.equal(C.savedImageDuration('8000'), 8000);
-  assert.equal(C.savedImageDuration('999'), 10000);
+  assert.equal(C.savedImageDuration('999'), 3000);
   assert.equal(C.resolveImageDuration(undefined, 10000), 10000);
   assert.equal(C.resolveImageDuration(4000, 10000), 4000);
   assert.equal(C.resolveImageDuration(20000, 10000), 20000);
@@ -481,13 +481,41 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
+test('a saved duration off the list falls back to the closest choice', () => {
+  const lines = [];
+  const orig = console.log;
+  console.log = function () {
+    lines.push(Array.prototype.join.call(arguments, ' '));
+  };
+  try {
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('999'), 3000);
+    assert.deepEqual(lines, ['dur_fallback from=999']);
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('3500'), 3000);
+    assert.deepEqual(lines, ['dur_fallback from=3500']);
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('25000'), 20000);
+    assert.deepEqual(lines, ['dur_fallback from=25000']);
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('20000'), 20000);
+    assert.equal(C.savedImageDuration(null), 10000);
+    assert.equal(C.savedImageDuration(''), 10000);
+    assert.equal(C.savedImageDuration('nope'), 10000);
+    assert.deepEqual(lines, []);
+    assert.equal(C.castPhotoHoldMs(null, 999), 3000);
+  } finally {
+    console.log = orig;
+  }
+});
+
 test('a 20s cast photo uses that duration, and a change waits for the next photo', () => {
   assert.equal(C.savedImageDuration('20000'), 20000);
   assert.equal(C.castPhotoHoldMs(null, 20000), 20000);
   assert.equal(C.castPhotoHoldMs({ customDur: 20000 }, 10000), 20000);
   assert.equal(C.castPhotoHoldMs({ imageUpdates: { customDur: 20000 } }, 10000), 20000);
   assert.equal(C.castPhotoHoldMs(null, 10000), 10000);
-  assert.equal(C.castPhotoHoldMs(null, 999), 10000);
+  assert.equal(C.castPhotoHoldMs(null, 999), 3000);
   assert.equal(C.resolveImageDuration(undefined, 20000), 20000);
 
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');

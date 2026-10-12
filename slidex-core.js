@@ -369,10 +369,21 @@
 
   function savedImageDuration(stored) {
     var n = parseInt(stored, 10);
+    if (!isFinite(n)) return DEFAULT_IMAGE_DURATION_MS;
     for (var i = 0; i < IMAGE_DURATION_CHOICES_MS.length; i++) {
       if (IMAGE_DURATION_CHOICES_MS[i] === n) return n;
     }
-    return DEFAULT_IMAGE_DURATION_MS;
+    var best = IMAGE_DURATION_CHOICES_MS[0];
+    var bestDist = Math.abs(n - best);
+    for (var j = 1; j < IMAGE_DURATION_CHOICES_MS.length; j++) {
+      var dist = Math.abs(n - IMAGE_DURATION_CHOICES_MS[j]);
+      if (dist < bestDist) {
+        best = IMAGE_DURATION_CHOICES_MS[j];
+        bestDist = dist;
+      }
+    }
+    console.log('dur_fallback from=' + n);
+    return best;
   }
 
   /* Per-item playlist duration wins, including values outside the old default menu (20s). */
