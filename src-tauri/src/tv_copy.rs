@@ -194,8 +194,10 @@ fn video_filter(plan: &TvPlan) -> String {
     if plan.tone_map {
         // Float RGB between the two zscale calls. Without it, zscale reports
         // "no path between colorspaces" on 10-bit sources.
+        // Primaries are set while the frame is still RGB. Asking that RGB
+        // frame for a YUV matrix in the same zscale has no colorspace path.
         parts.push(format!(
-            "zscale=transferin={}:transfer=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:primaries=bt709:range=tv",
+            "zscale=transferin={}:transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:range=tv",
             plan.transfer_in
         ));
     }
