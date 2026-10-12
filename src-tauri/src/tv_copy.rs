@@ -192,14 +192,7 @@ fn video_filter(plan: &TvPlan) -> String {
         parts.push("fps=60".to_string());
     }
     if plan.tone_map {
-        // Float RGB between the two zscale calls. Without it, zscale reports
-        // "no path between colorspaces" on 10-bit sources.
-        // Primaries are set while the frame is still RGB. Asking that RGB
-        // frame for a YUV matrix in the same zscale has no colorspace path.
-        parts.push(format!(
-            "zscale=transferin={}:transfer=linear:npl=100,format=gbrpf32le,zscale=primaries=bt709,tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:range=tv",
-            plan.transfer_in
-        ));
+        parts.push(tone_map_filter(plan.transfer_in));
     }
     parts.push(format!(
         "scale={}:{}:flags=lanczos",
@@ -207,6 +200,25 @@ fn video_filter(plan: &TvPlan) -> String {
     ));
     parts.push("format=yuv420p".to_string());
     parts.join(",")
+}
+
+/// HDR (PQ, HLG, BT.2020) is tone-mapped to BT.709. 10-bit BT.709, including a
+/// file that does not name a transfer, is already SDR: only the bit depth changes.
+///
+/// zscale on `gbrpf32le` returns "no path between colorspaces" in the pinned
+/// ffmpeg, and zscale also has no path from BT.709 into linear light. The HDR
+/// chain therefore runs zscale only on YUV, and the 10-bit SDR chain does not
+/// use zscale at all.
+fn tone_map_filter(transfer_in: &str) -> String {
+    let (primaries, matrix) = match transfer_in {
+        "smpte2084" | "arib-std-b67" | "bt2020-10" => ("bt2020", "bt2020nc"),
+        _ => {
+            return "format=yuv420p".to_string();
+        }
+    };
+    format!(
+        "zscale=transferin={transfer_in}:primariesin={primaries}:matrixin={matrix}:rangein=tv:transfer=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,format=yuv420p10le,zscale=transferin=linear:primariesin=bt709:matrixin=bt709:rangein=tv:transfer=bt709:primaries=bt709:matrix=bt709:range=tv"
+    )
 }
 
 pub(crate) enum ForCast {
@@ -1117,12 +1129,26 @@ mod tests {
             assert!(has_pair(&args, "-c:v", encoder.as_str()), "{args:?}");
         }
 
-        let hdr = plan_tv(1920, 1080, 24.0, true, AudioIn::Other, TvEncoder::H264Nvenc);
+        let ten_bit = plan_tv(1920, 1080, 24.0, true, AudioIn::Other, TvEncoder::H264Nvenc);
+        let ten_bit_vf = arg_value(
+            &ffmpeg_arguments(&ten_bit, Path::new("in.mov"), Path::new("out.mp4")),
+            "-vf",
+        );
+        assert!(!ten_bit_vf.contains("tonemap"), "{ten_bit_vf}");
+        assert!(!ten_bit_vf.contains("zscale"), "{ten_bit_vf}");
+        assert!(ten_bit_vf.contains("format=yuv420p"), "{ten_bit_vf}");
+
+        let mut hdr = ten_bit;
+        hdr.transfer_in = "smpte2084";
         let args = ffmpeg_arguments(&hdr, Path::new("in.mov"), Path::new("out.mp4"));
         let vf = arg_value(&args, "-vf");
         assert!(vf.contains("tonemap=hable"), "{vf}");
-        assert!(vf.contains("format=gbrpf32le"), "{vf}");
-        assert!(vf.contains("transferin=bt709"), "{vf}");
+        assert!(vf.contains("format=gbrpf32le,tonemap=hable"), "{vf}");
+        assert!(vf.contains("transferin=smpte2084"), "{vf}");
+        assert!(
+            vf.contains("format=yuv420p10le,zscale=transferin=linear"),
+            "{vf}"
+        );
         assert!(vf.contains("format=yuv420p"), "{vf}");
         assert!(has_pair(&args, "-c:v", "h264_nvenc"));
         assert!(has_pair(&args, "-c:a", "aac"));
