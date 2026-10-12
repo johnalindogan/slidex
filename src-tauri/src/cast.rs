@@ -9275,7 +9275,10 @@ mod tests {
             elapsed >= Duration::from_millis(350) && elapsed < Duration::from_secs(6),
             "ready wait should be ~400ms plus the TLS join, got {elapsed:?}"
         );
-        assert!(err.contains("TV unreachable"), "{err}");
+        // A Public Windows profile replaces the unreachable sentence. GitHub's
+        // runner is Public, so the timeout still has to match that wording.
+        let expected = with_public_network(link_down_message());
+        assert_eq!(err, expected);
         assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
         let written = log.text();
         let lines: Vec<_> = written
