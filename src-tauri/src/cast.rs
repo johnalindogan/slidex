@@ -1325,19 +1325,23 @@ struct Mp4Box {
 }
 
 /// SlideX does not ship ffmpeg. Limits come from the MP4 boxes (`avcC` /
-/// `hvcC`, `tkhd`, `mdhd`, `stts`, `btrt`). A value the file does not carry
-/// is not treated as a failure, so a stub sample entry still loads.
+/// `hvcC`, `tkhd`, `mdhd`, `stts`, `btrt`). A value a readable MP4 or MOV
+/// does not carry is not a failure, so a stub sample entry still loads.
+/// Anything that cannot be read — another container, a truncated box, or an
+/// I/O error — is skipped.
 fn decide_cast_video(path: &Path) -> CastVideoDecision {
+    let ext = ext_of(path);
+    if ext != "mp4" && ext != "mov" {
+        return unverifiable_video(path);
+    }
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let probe = match read_mp4_video(path) {
         Ok(probe) => probe,
-        Err(_) => {
-            return CastVideoDecision {
-                skip: None,
-                derived: None,
-            };
-        }
+        Err(_) => return unverifiable_video(path),
     };
+    if probe.codec.is_none() {
+        return unverifiable_video(path);
+    }
     let mut derived = None;
     let mut level = probe.level.filter(|tenths| *tenths != 0);
     if level.is_none() {
@@ -1399,6 +1403,29 @@ fn decide_cast_video(path: &Path) -> CastVideoDecision {
     CastVideoDecision {
         skip: skip_sentence(&parts, level_sentence),
         derived,
+    }
+}
+
+fn container_token(path: &Path) -> String {
+    let ext = ext_of(path);
+    if ext.is_empty() {
+        "unknown".to_string()
+    } else {
+        ext.to_ascii_uppercase()
+    }
+}
+
+fn unverifiable_video(path: &Path) -> CastVideoDecision {
+    let container = container_token(path);
+    cast_log(
+        "skip",
+        &format!("reason=unverifiable container={container}"),
+    );
+    CastVideoDecision {
+        skip: Some(format!(
+            "can't verify this video for the TV ({container})"
+        )),
+        derived: None,
     }
 }
 
@@ -1550,7 +1577,10 @@ fn read_box_header(f: &mut File, end: u64) -> std::io::Result<Option<Mp4Box>> {
     f.read_exact(&mut typ)?;
     let (size, header) = if size32 == 1 {
         if f.stream_position()? + 8 > end {
-            return Ok(None);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mp4 box header is truncated",
+            ));
         }
         (read_u64(f)?, 16u64)
     } else if size32 == 0 {
@@ -1558,13 +1588,13 @@ fn read_box_header(f: &mut File, end: u64) -> std::io::Result<Option<Mp4Box>> {
     } else {
         (size32, 8u64)
     };
-    if size < header {
-        return Ok(None);
+    if size < header || pos.saturating_add(size) > end || pos.saturating_add(size) <= pos {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "mp4 box extends past its parent",
+        ));
     }
-    let box_end = pos.saturating_add(size);
-    if box_end > end || box_end <= pos {
-        return Ok(None);
-    }
+    let box_end = pos + size;
     Ok(Some(Mp4Box {
         typ,
         payload: pos + header,
@@ -1703,7 +1733,10 @@ fn parse_visual_stsd(
             break;
         };
         if entry_end > end {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mp4 sample entry extends past its parent",
+            ));
         }
         let codec = match &four {
             b"avc1" | b"avc3" => Some(VisualCodec::Avc),
@@ -6333,6 +6366,64 @@ mod tests {
         let stub = decide_cast_video(&stub);
         assert!(stub.skip.is_none(), "{:?}", stub.skip);
         assert!(stub.derived.is_none());
+    }
+
+    #[test]
+    fn unreadable_videos_are_skipped_as_unverifiable() {
+        let log = LogDir::new();
+        let mkv = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        assert_eq!(
+            decide_cast_video(&mkv).skip.as_deref(),
+            Some("can't verify this video for the TV (MKV)")
+        );
+        let webm = scratch("clip.webm", b"\x1a\x45\xdf\xa3");
+        assert_eq!(
+            decide_cast_video(&webm).skip.as_deref(),
+            Some("can't verify this video for the TV (WEBM)")
+        );
+        let avi = scratch("clip.avi", b"RIFF");
+        assert_eq!(
+            decide_cast_video(&avi).skip.as_deref(),
+            Some("can't verify this video for the TV (AVI)")
+        );
+        // moov is complete, then a trailing box claims more bytes than remain.
+        let mut cut = h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000));
+        let mut trailer = 50u32.to_be_bytes().to_vec();
+        trailer.extend_from_slice(b"free");
+        trailer.extend_from_slice(&[0u8; 8]);
+        cut.extend_from_slice(&trailer);
+        let truncated = scratch("cut.mp4", &cut);
+        assert_eq!(
+            decide_cast_video(&truncated).skip.as_deref(),
+            Some("can't verify this video for the TV (MP4)")
+        );
+        let missing = truncated.with_file_name("missing-video.mp4");
+        assert_eq!(
+            decide_cast_video(&missing).skip.as_deref(),
+            Some("can't verify this video for the TV (MP4)")
+        );
+        let written = log.text();
+        assert!(
+            written.contains("skip reason=unverifiable container=MKV"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=unverifiable container=WEBM"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=unverifiable container=AVI"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=unverifiable container=MP4"),
+            "{written}"
+        );
+        let mov = scratch(
+            "ok.mov",
+            &h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000)),
+        );
+        assert!(decide_cast_video(&mov).skip.is_none(), "a readable MOV still loads");
     }
 
     #[test]

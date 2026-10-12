@@ -364,7 +364,8 @@
     return /unsupported|skipped/i.test(s)
       || /aren't supported by the TV/i.test(s)
       || /isn't supported by the TV/i.test(s)
-      || /may not play on this TV/i.test(s);
+      || /may not play on this TV/i.test(s)
+      || /can't verify this video/i.test(s);
   }
 
   function castBannerText(status, itemName) {
