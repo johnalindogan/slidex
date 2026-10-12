@@ -3682,57 +3682,6 @@ fn on_media_idle(
     }
 }
 
-/// Slideshow timer for the photo now on the TV. A video, or a paused slideshow,
-/// does not step. No finished event: the page already moved.
-/// Test stand-in for the page timer. Production advances photos from `schedNext`.
-#[cfg(test)]
-fn on_photo_timer(
-    link: &CastLink,
-    flags: &mut SessionFlags,
-    next: Successor,
-    duration_ms: Option<u64>,
-) -> Result<bool, String> {
-    if !flags.slideshow_playing || flags.media_kind != "still" {
-        return Ok(false);
-    }
-    link.photo_timer_ms.set(duration_ms);
-    match link.load_url(
-        &next.url,
-        &next.content_type,
-        true,
-        CastOrigin::Timer,
-        next.item,
-        next.media_type,
-    ) {
-        Ok(sid) => {
-            flags.media_session = Some(sid);
-            flags.advanced_session = None;
-            flags.failed_session = None;
-            flags.ignored_photo = None;
-            flags.item_index = next.item;
-            flags.media_kind = if next.media_type == "video" {
-                "video"
-            } else {
-                "still"
-            }
-            .into();
-            flags.player_state = "playing".into();
-            flags.error = None;
-            flags.local_cmd = Some("play");
-            flags.local_cmd_at = Instant::now();
-            Ok(true)
-        }
-        Err(err) if err == CAST_CANCELLED => {
-            cast_log(
-                "load_skipped",
-                &format!("item={} reason=cast stopped", item_log_token(next.item)),
-            );
-            Err(err)
-        }
-        Err(err) => Err(err),
-    }
-}
-
 enum CastCmd {
     SetPlaylist {
         paths: Vec<PathBuf>,
@@ -7596,7 +7545,7 @@ mod tests {
     }
 
     #[test]
-    fn photo_finished_at_10s_loads_the_next_item_only_at_15s() {
+    fn photo_finished_does_not_load_the_next_item() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
             idle_after: &[(1, "FINISHED", 7)],
@@ -7621,10 +7570,9 @@ mod tests {
         flags.ignored_photo = None;
         let mut saw_finished = false;
         let mut finished_at = Duration::ZERO;
-        let mut timer_at = None;
         let mut next_ping = Instant::now();
         let deadline = started + Duration::from_secs(20);
-        while Instant::now() < deadline {
+        while Instant::now() < deadline && !saw_finished {
             if Instant::now() >= next_ping {
                 link.ping().expect("ping");
                 next_ping = Instant::now() + PING_EVERY;
@@ -7663,30 +7611,6 @@ mod tests {
                 Ok(None) => {}
                 Err(e) => panic!("pump: {e}"),
             }
-            if timer_at.is_none() && started.elapsed() >= Duration::from_secs(15) {
-                assert_eq!(
-                    socket_loads(&fake),
-                    ["load transport-1 item=photo-1"],
-                    "the slideshow timer is the only photo advance"
-                );
-                let did = on_photo_timer(
-                    &link,
-                    &mut flags,
-                    Successor {
-                        url: photo2.to_string(),
-                        content_type: "image/jpeg".into(),
-                        item: 2,
-                        media_type: "photo",
-                    },
-                    Some(15_000),
-                )
-                .unwrap();
-                assert!(did, "the 15s timer must load the next photo");
-                timer_at = Some(started.elapsed());
-            }
-            if timer_at.is_some() && saw_finished && started.elapsed() >= Duration::from_secs(18) {
-                break;
-            }
         }
         assert!(saw_finished, "the fake TV never sent FINISHED");
         assert!(
@@ -7694,18 +7618,10 @@ mod tests {
                 && finished_at <= Duration::from_millis(12500),
             "FINISHED arrived at {finished_at:?}"
         );
-        let timer_at = timer_at.expect("the slideshow timer did not fire");
-        assert!(
-            timer_at >= Duration::from_secs(14) && timer_at <= Duration::from_secs(17),
-            "next LOAD went out at {timer_at:?}"
-        );
         assert_eq!(
             socket_loads(&fake),
-            [
-                "load transport-1 item=photo-1",
-                "load transport-1 item=photo-2",
-            ],
-            "the next photo is loaded once"
+            ["load transport-1 item=photo-1"],
+            "a photo FINISHED does not load the next item"
         );
         let written = log.text();
         let ignored: Vec<_> = written
@@ -7714,13 +7630,7 @@ mod tests {
             .collect();
         assert_eq!(ignored.len(), 1, "{written}");
         assert!(ignored[0].contains("item=1"), "{}", ignored[0]);
-        let timer_loads: Vec<_> = written
-            .lines()
-            .filter(|line| line.contains(" load ") && line.contains("source=timer"))
-            .collect();
-        assert_eq!(timer_loads.len(), 1, "{written}");
-        assert!(timer_loads[0].contains("item=2 type=photo"), "{}", timer_loads[0]);
-        assert!(timer_loads[0].contains("dur_ms=15000"), "{}", timer_loads[0]);
+        assert!(!written.contains("source=timer"), "{written}");
         assert!(!written.contains(" advance "), "{written}");
         assert!(!written.contains("source=remote"), "{written}");
         assert!(!written.contains("load_failed"), "{written}");
@@ -7801,7 +7711,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_slideshow_does_not_advance_on_a_photo_timer_or_a_video_finished() {
+    fn paused_slideshow_does_not_advance_on_photo_or_video_finished() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
             idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 7)],
@@ -7856,19 +7766,6 @@ mod tests {
             }
         }
         assert!(saw_photo, "the photo FINISHED never arrived");
-        let stepped = on_photo_timer(
-            &link,
-            &mut flags,
-            Successor {
-                url: next_photo.url.clone(),
-                content_type: next_photo.content_type.clone(),
-                item: next_photo.item,
-                media_type: next_photo.media_type,
-            },
-            None,
-        )
-        .unwrap();
-        assert!(!stepped, "a paused slideshow must not step on the photo timer");
         assert_eq!(flags.item_index, 1);
         assert_eq!(socket_loads(&fake), ["load transport-1 item=photo-1"]);
 
