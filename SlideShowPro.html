@@ -853,8 +853,8 @@ body.ssp-playlist-window #dock-toggle-btn {
     <p id="ldrophint">or drop files here</p>
   </div>
 </div>
-<input type="file" id="fi" multiple accept="image/*,video/*,.mp4,.mov,.webm,.m4v,.jpg,.jpeg,.png,.gif,.webp,.bmp,.tif,.tiff,.ico">
-<input type="file" id="fiadd" multiple accept="image/*,video/*,.mp4,.mov,.webm,.m4v,.jpg,.jpeg,.png,.gif,.webp,.bmp,.tif,.tiff,.ico">
+<input type="file" id="fi" multiple accept="image/*,video/*,.mp4,.mov,.webm,.mkv,.avi,.m4v,.jpg,.jpeg,.png,.gif,.webp,.bmp,.tif,.tiff,.ico">
+<input type="file" id="fiadd" multiple accept="image/*,video/*,.mp4,.mov,.webm,.mkv,.avi,.m4v,.jpg,.jpeg,.png,.gif,.webp,.bmp,.tif,.tiff,.ico">
 <input type="file" id="fiplist" accept=".json,.ssp,.m3u,.m3u8,application/json,audio/x-mpegurl">
 <input type="file" id="fiupd" accept=".json">
 
@@ -1158,19 +1158,22 @@ const g = id => document.getElementById(id);
 const dz = g('dz'), fi = g('fi'), viewer = g('viewer'), stage = g('stage'), app = g('app');
 const PICKER_OPTS = { multiple: true, types: [{ description: 'Images & Videos', accept: {
   'image/*': ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.tif','.tiff','.ico'],
-  'video/*': ['.mp4','.mov','.webm','.m4v'],
+  'video/*': ['.mp4','.mov','.webm','.mkv','.avi','.m4v'],
   'video/mp4': ['.mp4','.m4v'],
   'video/quicktime': ['.mov'],
-  'video/webm': ['.webm']
+  'video/webm': ['.webm'],
+  'video/x-matroska': ['.mkv'],
+  'video/x-msvideo': ['.avi']
 } }] };
 const IMAGE_EXTS = ['jpg','jpeg','png','gif','webp','bmp','tif','tiff','ico'];
-const VIDEO_EXTS = ['mp4','mov','webm','m4v'];
+const VIDEO_EXTS = ['mp4','mov','webm','m4v','mkv','avi'];
 const MEDIA_EXTS = IMAGE_EXTS.concat(VIDEO_EXTS);
 const MEDIA_MIME = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
   webp: 'image/webp', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
   ico: 'image/x-icon',
-  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', m4v: 'video/mp4'
+  mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', m4v: 'video/mp4',
+  mkv: 'video/x-matroska', avi: 'video/x-msvideo'
 };
 function fileExtName(name) {
   const n = String(name || '');
@@ -5746,6 +5749,19 @@ function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
   const ms = getEDur(cur);
   tmr = setTimeout(() => {
+    if (window.__sspCastActive && window.SlideXCore && typeof window.SlideXCore.nextIndexSkippingUnsupported === "function") {
+      var skipTo = window.SlideXCore.nextIndexSkippingUnsupported(cur, getMediaItems(), {
+        reverse: typeof reversePlay !== "undefined" && !!reversePlay,
+        skippedNotes: window.__sspCastSkipped || [],
+        badPaths: window.__sspCastBadPaths || null
+      });
+      if (skipTo == null) return;
+      if (skipTo !== nextMI()) {
+        goTo(skipTo, 'timer');
+        schedNext();
+        return;
+      }
+    }
     goTo(nextMI(), 'timer');
     schedNext();
   }, ms);
@@ -7298,7 +7314,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="castClose">Close</button>
   </div>
   <div id="castStatus">Open Cast to look for a TV. Play, pause, next, and previous on this PC follow on the TV.</div>
-  <div id="castFirewall"></div>
+  <div id="castFirewall">No Private inbound rule for slideshowpro.exe. Cast needs TCP 47200-47215 and UDP 5353 on private networks. Re-run the installer and accept the Windows prompt.</div>
 </div>
 <script>
 /* Cast spike UI. #lbcast and #bcast stay disabled until the stacked Cast PR removes disabled. */
@@ -7428,10 +7444,21 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function refreshFirewall() {
     if (!firewallEl) return;
     call("cast_firewall_status").then(function (fw) {
-      firewallEl.textContent = (fw && (fw.detail || fw.state)) || "";
-    }).catch(function () {
-      firewallEl.textContent = "";
-    });
+      var state = String((fw && fw.state) || "").toLowerCase();
+      var detail = String((fw && fw.detail) || "");
+      var blob = state + "\n" + detail.toLowerCase();
+      var rulesPresent = state === "added" || state === "match" || state === "present"
+        || blob.indexOf("status=match") !== -1 || blob.indexOf("status=present") !== -1;
+      if (rulesPresent) {
+        var lowered = detail.toLowerCase();
+        var tokenOnly = !detail || detail.indexOf("No Private inbound rule") !== -1
+          || lowered === "match" || lowered === "present" || lowered.indexOf("status=") === 0;
+        firewallEl.textContent = tokenOnly ? "" : detail;
+        return;
+      }
+      var text = detail || state;
+      if (text) firewallEl.textContent = text;
+    }).catch(function () {});
   }
   function watchNetwork() {
     if (!sspIsTauri()) return;
@@ -7460,7 +7487,19 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     }
     return "";
   }
+  function castSkipMessage(msg) {
+    if (window.SlideXCore && typeof SlideXCore.isCastSkipMessage === "function") {
+      return SlideXCore.isCastSkipMessage(msg);
+    }
+    return /unsupported|skipped/i.test(String(msg || ""));
+  }
+  function rememberCastBad(path) {
+    if (!path) return;
+    window.__sspCastBadPaths = window.__sspCastBadPaths || Object.create(null);
+    window.__sspCastBadPaths[path] = true;
+  }
   function noteSkip(msg) {
+    window.__sspCastToasted = msg;
     if (typeof showToast === "function") showToast(esc(msg), 4500);
     setStatus(msg);
   }
@@ -7468,8 +7507,28 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (!castActive) return Promise.resolve();
     return call("cast_set_playlist", { paths: sspCastPaths() }).then(function (upd) {
       skippedNotes = (upd && upd.skipped) || [];
+      window.__sspCastSkipped = skippedNotes;
       if (skippedNotes.length) noteSkip(skippedNotes[0]);
     });
+  }
+  function castItemName(st) {
+    var idx = Number(field(st, "item_index")) || 0;
+    if (idx > 0 && typeof getMediaItems === "function") {
+      var items = getMediaItems() || [];
+      var item = items[idx - 1];
+      if (item && item.name) return item.name;
+    }
+    return typeof sspCastCurrentName === "function" ? sspCastCurrentName() : "";
+  }
+  function applyCastBanner(st) {
+    if (!st || !field(st, "connected")) return;
+    if (!(window.SlideXCore && typeof window.SlideXCore.castBannerText === "function")) return;
+    setStatus(window.SlideXCore.castBannerText(st, castItemName(st)));
+  }
+  function refreshCastBanner() {
+    return call("cast_status").then(function (st) {
+      applyCastBanner(st);
+    }).catch(function () {});
   }
   function loadCurrent(source, holdMs) {
     var src = source || "user";
@@ -7498,10 +7557,11 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     }
     return call("cast_load", args).then(function () {
       skipBurst = 0;
-      setStatus("Casting " + (sspCastCurrentName() || "the current slide") + ".");
+      return refreshCastBanner();
     }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
-      if (/unsupported|skipped/i.test(msg)) {
+      if (castSkipMessage(msg)) {
+        rememberCastBad(path);
         noteSkip(msg);
         skipBurst++;
         if (skipBurst >= Math.max(1, sspCastPaths().length)) {
@@ -7518,7 +7578,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var src = source || "user";
     if (!castActive || !window.__sspCastActive) return Promise.resolve();
     var cmd = sspCastPlaying() ? "cast_play" : "cast_pause";
-    return call(cmd, { source: src }).catch(function (e) {
+    return call(cmd, { source: src }).then(function () {
+      return refreshCastBanner();
+    }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
       setStatus(msg);
     });
@@ -7527,6 +7589,10 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (!castActive) return;
     call("cast_status").then(function (st) {
       if (!st || !castActive) return;
+      var skipMsg = field(st, "error");
+      if (skipMsg && castSkipMessage(skipMsg) && skipMsg !== window.__sspCastToasted) {
+        noteSkip(skipMsg);
+      }
       var ev = field(st, "remote_event");
       if (ev === "load_failed") {
         setStatus(field(st, "error") || "The TV could not load this slide.");
@@ -7547,6 +7613,8 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       if (!field(st, "connected")) {
         stopLocalCast();
         setStatus(field(st, "error") || "TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.");
+      } else {
+        applyCastBanner(st);
       }
     }).catch(function (e) { console.warn(e); });
   }

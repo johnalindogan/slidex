@@ -46,6 +46,7 @@
     "allow-cast-status",
     "allow-cast-firewall-status",
     "allow-cast-log-path",
+    "allow-cast-log-dur-fallback",
     "allow-slidex-save-done"
   ]
 }

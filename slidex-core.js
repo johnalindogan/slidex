@@ -359,12 +359,89 @@
   var DEFAULT_IMAGE_DURATION_MS = 10000;
   var IMAGE_DURATION_CHOICES_MS = [3000, 4000, 6000, 8000, 10000, 12000, 20000];
 
+  function isCastSkipMessage(msg) {
+    var s = String(msg || '');
+    return /unsupported|skipped/i.test(s)
+      || /aren't supported by the TV/i.test(s)
+      || /isn't supported by the TV/i.test(s)
+      || /may not play on this TV/i.test(s)
+      || /can't verify this video/i.test(s);
+  }
+
+  function castBannerText(status, itemName) {
+    var err = status && status.error;
+    if (err) return String(err);
+    var state = String((status && status.player_state) || '').toLowerCase();
+    if (state === 'paused') return 'Paused';
+    var name = itemName ? String(itemName) : 'the current slide';
+    return 'Casting ' + name + '.';
+  }
+
+  function itemUnsupportedForCast(item, opts) {
+    if (!item) return true;
+    opts = opts || {};
+    var name = String(item.name || '');
+    var notes = opts.skippedNotes || [];
+    var i;
+    if (name) {
+      for (i = 0; i < notes.length; i++) {
+        if (String(notes[i]).indexOf(name) !== -1) return true;
+      }
+    }
+    var path = item.path || '';
+    if (!path) return false;
+    var bad = opts.badPaths;
+    if (bad && bad[path]) return true;
+    var skipped = opts.skippedPaths;
+    if (!skipped) return false;
+    if (Array.isArray(skipped)) {
+      for (i = 0; i < skipped.length; i++) {
+        if (skipped[i] === path) return true;
+      }
+      return false;
+    }
+    return !!skipped[path];
+  }
+
+  /* Index of the next castable slide, or null when every other slide is unsupported. */
+  function nextIndexSkippingUnsupported(cur, items, opts) {
+    items = items || [];
+    var n = items.length;
+    if (!n) return null;
+    opts = opts || {};
+    var step = opts.reverse ? -1 : 1;
+    var i = cur | 0;
+    var k;
+    for (k = 0; k < n; k++) {
+      i = (i + step + n) % n;
+      if (i === (cur | 0)) return null;
+      if (!itemUnsupportedForCast(items[i], opts)) return i;
+    }
+    return null;
+  }
+
   function savedImageDuration(stored) {
     var n = parseInt(stored, 10);
+    if (!isFinite(n)) return DEFAULT_IMAGE_DURATION_MS;
     for (var i = 0; i < IMAGE_DURATION_CHOICES_MS.length; i++) {
       if (IMAGE_DURATION_CHOICES_MS[i] === n) return n;
     }
-    return DEFAULT_IMAGE_DURATION_MS;
+    var best = IMAGE_DURATION_CHOICES_MS[0];
+    var bestDist = Math.abs(n - best);
+    for (var j = 1; j < IMAGE_DURATION_CHOICES_MS.length; j++) {
+      var dist = Math.abs(n - IMAGE_DURATION_CHOICES_MS[j]);
+      if (dist < bestDist) {
+        best = IMAGE_DURATION_CHOICES_MS[j];
+        bestDist = dist;
+      }
+    }
+    if (n >= 0 && typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.core
+        && typeof window.__TAURI__.core.invoke === 'function') {
+      try {
+        window.__TAURI__.core.invoke('cast_log_dur_fallback', { fromMs: n, toMs: best }).catch(() => {});
+      } catch (e) {}
+    }
+    return best;
   }
 
   /* Per-item playlist duration wins, including values outside the old default menu (20s). */
@@ -1278,6 +1355,9 @@
     playlistNamesMatch: playlistNamesMatch,
     DEFAULT_IMAGE_DURATION_MS: DEFAULT_IMAGE_DURATION_MS,
     IMAGE_DURATION_CHOICES_MS: IMAGE_DURATION_CHOICES_MS,
+    isCastSkipMessage: isCastSkipMessage,
+    castBannerText: castBannerText,
+    nextIndexSkippingUnsupported: nextIndexSkippingUnsupported,
     savedImageDuration: savedImageDuration,
     resolveImageDuration: resolveImageDuration,
     castPhotoHoldMs: castPhotoHoldMs,

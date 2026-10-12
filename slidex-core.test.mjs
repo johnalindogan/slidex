@@ -471,7 +471,7 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.ok(C.IMAGE_DURATION_CHOICES_MS.includes(10000));
   assert.equal(C.savedImageDuration(null), 10000);
   assert.equal(C.savedImageDuration('8000'), 8000);
-  assert.equal(C.savedImageDuration('999'), 10000);
+  assert.equal(C.savedImageDuration('999'), 3000);
   assert.equal(C.resolveImageDuration(undefined, 10000), 10000);
   assert.equal(C.resolveImageDuration(4000, 10000), 4000);
   assert.equal(C.resolveImageDuration(20000, 10000), 20000);
@@ -481,13 +481,138 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
+test('a saved duration off the list falls back to the closest choice', () => {
+  const lines = [];
+  const orig = console.log;
+  console.log = function () {
+    lines.push(Array.prototype.join.call(arguments, ' '));
+  };
+  context.window = {
+    __TAURI__: {
+      core: {
+        invoke: function (cmd, args) {
+          lines.push(cmd + ' from=' + args.fromMs + ' to=' + args.toMs);
+          return Promise.resolve();
+        }
+      }
+    }
+  };
+  try {
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('999'), 3000);
+    assert.deepEqual(lines, ['cast_log_dur_fallback from=999 to=3000']);
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('3500'), 3000);
+    assert.deepEqual(lines, ['cast_log_dur_fallback from=3500 to=3000']);
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('25000'), 20000);
+    assert.deepEqual(lines, ['cast_log_dur_fallback from=25000 to=20000']);
+    lines.length = 0;
+    assert.equal(C.savedImageDuration('20000'), 20000);
+    assert.equal(C.savedImageDuration(null), 10000);
+    assert.equal(C.savedImageDuration(''), 10000);
+    assert.equal(C.savedImageDuration('nope'), 10000);
+    assert.deepEqual(lines, []);
+    assert.equal(C.castPhotoHoldMs(null, 999), 3000);
+  } finally {
+    console.log = orig;
+    delete context.window;
+  }
+});
+
+test('dur_fallback invoke uses camelCase argument names', async () => {
+  const calls = [];
+  context.window = {
+    __TAURI__: {
+      core: {
+        invoke: function (cmd, args) {
+          calls.push({ cmd: cmd, args: args });
+          return Promise.reject(new Error('rejected'));
+        }
+      }
+    }
+  };
+  try {
+    assert.equal(C.savedImageDuration('999'), 3000);
+    await Promise.resolve();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].cmd, 'cast_log_dur_fallback');
+    assert.deepEqual(Object.keys(calls[0].args).sort(), ['fromMs', 'toMs']);
+    assert.equal(calls[0].args.fromMs, 999);
+    assert.equal(calls[0].args.toMs, 3000);
+    assert.equal(calls[0].args.from_ms, undefined);
+    assert.equal(calls[0].args.to_ms, undefined);
+  } finally {
+    delete context.window;
+  }
+});
+
+test('the cast timer skips unsupported files without another photo wait', () => {
+  const items = [
+    { name: 'one.jpg', path: '/p/one.jpg' },
+    { name: 'bad.mp4', path: '/p/bad.mp4' },
+    { name: 'skip.webp', path: '/p/skip.webp' },
+    { name: 'three.jpg', path: '/p/three.jpg' },
+  ];
+  const opts = {
+    skippedNotes: ['skip.webp: Unsupported media. Cast plays JPEG, PNG, and MP4 (H.264 + AAC). Skipped.'],
+    badPaths: { '/p/bad.mp4': true },
+  };
+  assert.equal(C.nextIndexSkippingUnsupported(0, items, opts), 3);
+  assert.equal(C.nextIndexSkippingUnsupported(3, items, opts), 0);
+  assert.equal(C.nextIndexSkippingUnsupported(0, items, { reverse: true, badPaths: { '/p/three.jpg': true } }), 2);
+  assert.equal(C.nextIndexSkippingUnsupported(0, [{ name: 'only.jpg', path: '/p/only.jpg' }], { badPaths: {} }), null);
+  assert.equal(C.nextIndexSkippingUnsupported(0, items, {
+    badPaths: { '/p/bad.mp4': true, '/p/skip.webp': true, '/p/three.jpg': true },
+  }), null);
+
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.match(sched, /goTo\(nextMI\(\), 'timer'\)/);
+  assert.match(sched, /if \(!playing \|\| isV\(cur\)\) return/);
+  assert.match(sched, /typeof window\.SlideXCore\.nextIndexSkippingUnsupported === "function"/);
+
+  const timers = [];
+  let seq = 1;
+  const visits = [];
+  const sandbox = {
+    console,
+    SlideXCore: C,
+    cur: 0,
+    playing: true,
+    tmr: null,
+    reversePlay: false,
+    items,
+    getMediaItems() { return sandbox.items; },
+    isV() { return false; },
+    nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
+    getEDur() { return 10000; },
+    setTimeout(fn, ms) { const id = seq++; timers.push({ id, fn, ms }); return id; },
+    clearTimeout() {},
+    goTo(i, source) { visits.push({ i, source }); sandbox.cur = i; },
+    window: {
+      SlideXCore: C,
+      __sspCastActive: true,
+      __sspCastSkipped: opts.skippedNotes,
+      __sspCastBadPaths: opts.badPaths,
+    },
+  };
+  vm.runInNewContext(sched, sandbox);
+  sandbox.schedNext();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 10000);
+  timers[0].fn();
+  assert.deepEqual(visits, [{ i: 3, source: 'timer' }]);
+  assert.equal(timers.length, 2, 'the landing photo arms one timer, not one per skipped file');
+});
+
 test('a 20s cast photo uses that duration, and a change waits for the next photo', () => {
   assert.equal(C.savedImageDuration('20000'), 20000);
   assert.equal(C.castPhotoHoldMs(null, 20000), 20000);
   assert.equal(C.castPhotoHoldMs({ customDur: 20000 }, 10000), 20000);
   assert.equal(C.castPhotoHoldMs({ imageUpdates: { customDur: 20000 } }, 10000), 20000);
   assert.equal(C.castPhotoHoldMs(null, 10000), 10000);
-  assert.equal(C.castPhotoHoldMs(null, 999), 10000);
+  assert.equal(C.castPhotoHoldMs(null, 999), 3000);
   assert.equal(C.resolveImageDuration(undefined, 20000), 20000);
 
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
@@ -1051,6 +1176,91 @@ test('the Cast panel can copy the Cast log path', () => {
   const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
   assert.match(perms, /allow-cast-log-path/);
   assert.match(perms, /cast_log_path/);
+  assert.match(perms, /cast_log_dur_fallback/);
+  assert.match(caps, /allow-cast-log-dur-fallback/);
+});
+
+test('a cast skip message names TV limits and a level the TV may not play', () => {
+  assert.equal(C.isCastSkipMessage("90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"), true);
+  assert.equal(C.isCastSkipMessage("10-bit isn't supported by the TV"), true);
+  assert.equal(C.isCastSkipMessage('H.264 level 5.2 may not play on this TV'), true);
+  assert.equal(C.isCastSkipMessage('HEVC level 5.2 may not play on this TV'), true);
+  assert.equal(C.isCastSkipMessage('Unsupported media. Cast plays JPEG, PNG, and MP4 (H.264 + AAC). Skipped.'), true);
+  assert.equal(C.isCastSkipMessage("can't verify this video for the TV (MKV)"), true);
+  assert.equal(C.isCastSkipMessage('TV unreachable. It may be off or the Wi-Fi dropped.'), false);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  assert.match(load, /castSkipMessage\(msg\)/);
+  assert.match(load, /rememberCastBad\(path\)/);
+  assert.match(html, /__sspCastBadPaths/);
+});
+
+test('mkv, webm, and mp4 names are kept so cast can verify them', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('const IMAGE_EXTS'), html.indexOf('function normalizeMediaPathEntry'));
+  const kind = vm.runInNewContext(`${src}
+    ({
+      mkv: mediaKindFromName('clip.mkv'),
+      webm: mediaKindFromName('clip.webm'),
+      avi: mediaKindFromName('clip.avi'),
+      mp4: mediaKindFromName('cut.mp4'),
+      txt: mediaKindFromName('notes.txt'),
+      mkvFile: isAcceptedMediaFile({ name: 'clip.mkv', type: '' }),
+      webmFile: isAcceptedMediaFile({ name: 'clip.webm', type: '' })
+    })`, { String });
+  assert.equal(kind.mkv, 'video');
+  assert.equal(kind.webm, 'video');
+  assert.equal(kind.avi, 'video');
+  assert.equal(kind.mp4, 'video');
+  assert.equal(kind.txt, null);
+  assert.equal(kind.mkvFile, true);
+  assert.equal(kind.webmFile, true);
+  assert.match(html, /\.mkv/);
+});
+
+test('a cast skip during loadCurrent moves straight to the next slide', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('function currentSkipped'), html.indexOf('function syncTransport'));
+  const moves = [];
+  const timers = [];
+  const core = {
+    isCastSkipMessage: C.isCastSkipMessage,
+    DEFAULT_IMAGE_DURATION_MS: C.DEFAULT_IMAGE_DURATION_MS
+  };
+  const sandbox = {
+    Promise,
+    String,
+    Number,
+    Math,
+    Object,
+    window: { __sspCastActive: true, SlideXCore: core },
+    SlideXCore: core,
+    castActive: true,
+    skipBurst: 0,
+    skippedNotes: [],
+    cur: 0,
+    setTimeout(fn, ms) { timers.push(ms); return 0; },
+    setStatus() {},
+    showToast() {},
+    esc(s) { return String(s); },
+    sspCastCurrentPath() { return 'C:/slides/bad.mp4'; },
+    sspCastCurrentName() { return 'bad.mp4'; },
+    sspCastPaths() { return ['C:/slides/a.jpg', 'C:/slides/bad.mp4', 'C:/slides/c.jpg']; },
+    sspCastPlaying() { return true; },
+    nextMI() { return 1; },
+    goTo(index, source) { moves.push([index, source]); },
+    call(cmd) {
+      assert.equal(cmd, 'cast_load');
+      return Promise.reject(new Error("90 fps isn't supported by the TV"));
+    }
+  };
+  const done = vm.runInNewContext(src + '\nloadCurrent("user");', sandbox);
+  await done;
+  assert.deepEqual(moves, [[1, 'user']]);
+  assert.deepEqual(timers, []);
+  assert.equal(sandbox.window.__sspCastBadPaths['C:/slides/bad.mp4'], true);
+  assert.equal(sandbox.skipBurst, 1);
+  assert.equal(sandbox.cur, 0);
 });
 
 test('a cast ignores local video events and tags the command source', () => {
@@ -1086,6 +1296,73 @@ test('a cast ignores local video events and tags the command source', () => {
   const disc = html.slice(html.indexOf('castDisconnect'), html.indexOf('setInterval(watchNetwork'));
   assert.match(disc, /stopLocalCast\(\)/);
   assert.match(disc, /cast_disconnect/);
+});
+
+test('the cast banner follows status immediately and shows Paused', () => {
+  assert.equal(C.castBannerText({ player_state: 'paused' }, 'clip.mp4'), 'Paused');
+  assert.equal(C.castBannerText({ player_state: 'PAUSED', error: '' }, 'clip.mp4'), 'Paused');
+  assert.equal(C.castBannerText({ player_state: 'playing' }, 'clip.mp4'), 'Casting clip.mp4.');
+  assert.equal(C.castBannerText({ player_state: 'playing' }, ''), 'Casting the current slide.');
+  assert.equal(
+    C.castBannerText({ player_state: 'playing', error: '90 fps isn\'t supported by the TV' }, 'clip.mp4'),
+    '90 fps isn\'t supported by the TV'
+  );
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  const sync = html.slice(html.indexOf('function syncTransport'), html.indexOf('function poll'));
+  const poll = html.slice(html.indexOf('function poll()'), html.indexOf('window.__sspCast = {'));
+  assert.match(load, /refreshCastBanner\(\)/);
+  assert.doesNotMatch(load, /setTimeout/);
+  assert.match(sync, /refreshCastBanner\(\)/);
+  assert.doesNotMatch(sync, /setTimeout/);
+  assert.match(poll, /applyCastBanner\(st\)/);
+  assert.doesNotMatch(poll, /setTimeout/);
+  assert.match(html, /SlideXCore\.castBannerText/);
+});
+
+test('the missing firewall rules message is shown before the panel opens', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const sentence = 'No Private inbound rule for slideshowpro.exe. Cast needs TCP 47200-47215 and UDP 5353 on private networks. Re-run the installer and accept the Windows prompt.';
+  const markup = html.slice(html.indexOf('id="castFirewall"'), html.indexOf('id="castFirewall"') + 400);
+  assert.match(markup, new RegExp(sentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const refresh = html.slice(html.indexOf('function refreshFirewall'), html.indexOf('function watchNetwork'));
+  const catchBody = refresh.slice(refresh.indexOf('.catch'));
+  assert.doesNotMatch(catchBody, /textContent/);
+  assert.match(refresh, /\.catch\(function \(\) \{\s*\}\)/);
+  assert.match(refresh, /status=match/);
+  assert.match(refresh, /status=present/);
+  const sandbox = {
+    Promise,
+    firewallEl: { textContent: sentence },
+    call() {
+      return Promise.resolve({
+        state: 'added',
+        detail: 'Private firewall rules are installed for slideshowpro.exe: TCP 47200-47215 and UDP 5353.'
+      });
+    }
+  };
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  assert.equal(
+    sandbox.firewallEl.textContent,
+    'Private firewall rules are installed for slideshowpro.exe: TCP 47200-47215 and UDP 5353.'
+  );
+  sandbox.firewallEl.textContent = sentence;
+  sandbox.call = () => Promise.resolve({ state: 'present', detail: '' });
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  assert.equal(sandbox.firewallEl.textContent, '');
+  sandbox.firewallEl.textContent = sentence;
+  sandbox.call = () => Promise.resolve({ state: 'match', detail: 'status=match' });
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  assert.equal(sandbox.firewallEl.textContent, '');
+  sandbox.firewallEl.textContent = sentence;
+  sandbox.call = () => Promise.reject(new Error('query failed'));
+  vm.runInNewContext(refresh + '\nrefreshFirewall();', sandbox);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(sandbox.firewallEl.textContent, sentence);
 });
 
 test('the TV unreachable banner comes only from cast_status', () => {

@@ -3,7 +3,7 @@
 //! → Default Media Receiver. Not chrome.cast, not desktop mirror, no cloud relay.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
@@ -64,6 +64,8 @@ pub enum CastOrigin {
     User,
     Timer,
     Remote,
+    /// The session-ready wait gave up. The page cannot send this source.
+    Timeout,
 }
 
 impl CastOrigin {
@@ -81,6 +83,7 @@ impl CastOrigin {
             Self::User => "user",
             Self::Timer => "timer",
             Self::Remote => "remote",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -198,11 +201,54 @@ fn with_public_network(existing: String) -> String {
 
 /// How long a network-profile query may run before the child is killed.
 const LAN_CATEGORY_WAIT: Duration = Duration::from_millis(2500);
+/// A stored category older than this is read again. Tests pass their own window.
+const LAN_CATEGORY_STALE: Duration = Duration::from_secs(30);
+
+struct ProfileCategory {
+    value: NetCategory,
+    timed_out: bool,
+}
+
+/// Start another profile read only when none is running.
+/// A timeout or a stale value is picked up on the next call, after the
+/// previous read has finished, so a timeout cannot spawn a tight loop.
+fn lan_category_needs_query(
+    in_flight: bool,
+    has_value: bool,
+    timed_out: bool,
+    age: Duration,
+    stale: Duration,
+) -> bool {
+    if in_flight {
+        return false;
+    }
+    if !has_value {
+        return true;
+    }
+    timed_out || age >= stale
+}
+
+/// A refresh that times out leaves the category the panel already showed.
+fn lan_category_after_refresh(
+    previous: NetCategory,
+    had_value: bool,
+    queried: NetCategory,
+    timed_out: bool,
+) -> NetCategory {
+    if timed_out && had_value {
+        previous
+    } else {
+        queried
+    }
+}
 
 #[cfg(windows)]
 struct LanCache {
     value: NetCategory,
+    has_value: bool,
+    timed_out: bool,
     done: bool,
+    updated: Instant,
 }
 
 #[cfg(windows)]
@@ -213,7 +259,10 @@ fn lan_cache() -> &'static (Mutex<LanCache>, std::sync::Condvar, AtomicBool) {
         (
             Mutex::new(LanCache {
                 value: NetCategory::Unknown,
+                has_value: false,
+                timed_out: false,
                 done: false,
+                updated: Instant::now(),
             }),
             Condvar::new(),
             AtomicBool::new(false),
@@ -224,28 +273,57 @@ fn lan_cache() -> &'static (Mutex<LanCache>, std::sync::Condvar, AtomicBool) {
 /// Start the profile query if it is not already running. Returns immediately.
 #[cfg(windows)]
 fn start_lan_category_query() {
+    let (lock, cv, started) = lan_cache();
+    let should = match lock.lock() {
+        Ok(slot) => lan_category_needs_query(
+            started.load(Ordering::SeqCst),
+            slot.has_value,
+            slot.timed_out,
+            slot.updated.elapsed(),
+            LAN_CATEGORY_STALE,
+        ),
+        Err(_) => false,
+    };
+    if !should {
+        return;
+    }
+    if started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
     {
-        let (lock, cv, started) = lan_cache();
-        if started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let spawned = thread::Builder::new()
-            .name("cast-lan-category".into())
-            .spawn(move || {
-                let alias = snapshot_ifaces().bind.map(|b| b.name);
-                let value = windows_lan_category(alias.as_deref());
-                if let Ok(mut slot) = lock.lock() {
-                    slot.value = value;
-                    slot.done = true;
+        return;
+    }
+    if let Ok(mut slot) = lock.lock() {
+        slot.done = false;
+    }
+    let spawned = thread::Builder::new()
+        .name("cast-lan-category".into())
+        .spawn(move || {
+            let alias = snapshot_ifaces().bind.map(|b| b.name);
+            let queried = windows_lan_category(alias.as_deref());
+            if let Ok(mut slot) = lock.lock() {
+                let had = slot.has_value;
+                let previous = slot.value;
+                slot.value =
+                    lan_category_after_refresh(previous, had, queried.value, queried.timed_out);
+                if queried.timed_out {
+                    slot.timed_out = true;
+                } else {
+                    slot.has_value = true;
+                    slot.timed_out = false;
+                    slot.updated = Instant::now();
                 }
-                cv.notify_all();
-            });
-        if spawned.is_err() {
-            if let Ok(mut slot) = lan_cache().0.lock() {
                 slot.done = true;
             }
-            lan_cache().1.notify_all();
+            started.store(false, Ordering::SeqCst);
+            cv.notify_all();
+        });
+    if spawned.is_err() {
+        started.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = lock.lock() {
+            slot.done = true;
         }
+        cv.notify_all();
     }
 }
 
@@ -311,27 +389,40 @@ fn powershell_profile_command() -> std::process::Command {
 }
 
 #[cfg(windows)]
-fn windows_lan_category(alias: Option<&str>) -> NetCategory {
+fn windows_lan_category(alias: Option<&str>) -> ProfileCategory {
     net_category_from_profile_command(alias, powershell_profile_command(), LAN_CATEGORY_WAIT)
 }
 
 /// Run `cmd` and map its profile listing to a category. A hang returns
-/// `Unknown` when `limit` elapses; the child is killed.
+/// `Unknown` when `limit` elapses; the child is killed. `timed_out` is set
+/// only for that hang, so the next call can read the profile again.
 fn net_category_from_profile_command(
     alias: Option<&str>,
     cmd: std::process::Command,
     limit: Duration,
-) -> NetCategory {
+) -> ProfileCategory {
     let Some(alias) = alias else {
-        return NetCategory::Unknown;
+        return ProfileCategory {
+            value: NetCategory::Unknown,
+            timed_out: false,
+        };
     };
     let Some(output) = output_bounded(cmd, limit) else {
-        return NetCategory::Unknown;
+        return ProfileCategory {
+            value: NetCategory::Unknown,
+            timed_out: true,
+        };
     };
     if !output.status.success() {
-        return NetCategory::Unknown;
+        return ProfileCategory {
+            value: NetCategory::Unknown,
+            timed_out: false,
+        };
     }
-    category_from_profile_text(alias, &String::from_utf8_lossy(&output.stdout))
+    ProfileCategory {
+        value: category_from_profile_text(alias, &String::from_utf8_lossy(&output.stdout)),
+        timed_out: false,
+    }
 }
 
 fn category_from_profile_text(alias: &str, text: &str) -> NetCategory {
@@ -975,7 +1066,9 @@ fn ext_of(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// JPEG, PNG, or MP4 (H.264 + AAC). Anything else is refused before it is tokenized.
+/// JPEG, PNG, or MP4 (H.264 or HEVC + AAC). Anything else is refused before it
+/// is tokenized. TV limits (level, frame size, frame rate, bit depth, bitrate)
+/// are applied when the file is cast, not here.
 pub fn classify_playlist_file(path: &Path) -> Result<(&'static str, String), String> {
     let canon = path
         .canonicalize()
@@ -998,7 +1091,7 @@ pub fn classify_playlist_file(path: &Path) -> Result<(&'static str, String), Str
             if ext == "m4v" {
                 return Err(format!("{label}: {UNSUPPORTED_MEDIA}"));
             }
-            if !mp4_is_h264_aac(&canon).unwrap_or(false) {
+            if !mp4_is_tv_video(&canon).unwrap_or(false) {
                 return Err(format!("{label}: {UNSUPPORTED_MEDIA}"));
             }
             Ok(("video/mp4", "video".into()))
@@ -1038,12 +1131,22 @@ fn read_u64(f: &mut File) -> std::io::Result<u64> {
 
 /// Walk MP4 boxes without reading `mdat`. True only when an `avc1`/`avc3` sample and an `mp4a` sample both exist.
 pub fn mp4_is_h264_aac(path: &Path) -> std::io::Result<bool> {
+    mp4_has_codecs(path, false)
+}
+
+/// H.264 (`avc1`/`avc3`) or HEVC (`hvc1`/`hev1`) plus AAC. `hev1` is registered
+/// so cast time can name that tag; the TV limit check still skips it.
+fn mp4_is_tv_video(path: &Path) -> std::io::Result<bool> {
+    mp4_has_codecs(path, true)
+}
+
+fn mp4_has_codecs(path: &Path, hevc: bool) -> std::io::Result<bool> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
-    let mut saw_avc = false;
+    let mut saw_visual = false;
     let mut saw_aac = false;
-    walk_boxes(&mut f, 0, len, 0, &mut saw_avc, &mut saw_aac)?;
-    Ok(saw_avc && saw_aac)
+    walk_boxes(&mut f, 0, len, 0, &mut saw_visual, &mut saw_aac, hevc)?;
+    Ok(saw_visual && saw_aac)
 }
 
 fn walk_boxes(
@@ -1051,10 +1154,11 @@ fn walk_boxes(
     start: u64,
     end: u64,
     depth: u8,
-    saw_avc: &mut bool,
+    saw_visual: &mut bool,
     saw_aac: &mut bool,
+    hevc: bool,
 ) -> std::io::Result<()> {
-    if depth > 8 || *saw_avc && *saw_aac {
+    if depth > 8 || *saw_visual && *saw_aac {
         return Ok(());
     }
     f.seek(SeekFrom::Start(start))?;
@@ -1079,13 +1183,13 @@ fn walk_boxes(
             return Ok(());
         }
         if &typ == b"stsd" {
-            parse_stsd(f, box_end, saw_avc, saw_aac)?;
+            parse_stsd(f, box_end, saw_visual, saw_aac, hevc)?;
         } else if matches!(&typ, b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl") {
             let child = f.stream_position()?;
-            walk_boxes(f, child, box_end, depth + 1, saw_avc, saw_aac)?;
+            walk_boxes(f, child, box_end, depth + 1, saw_visual, saw_aac, hevc)?;
         }
         f.seek(SeekFrom::Start(box_end))?;
-        if *saw_avc && *saw_aac {
+        if *saw_visual && *saw_aac {
             return Ok(());
         }
     }
@@ -1095,8 +1199,9 @@ fn walk_boxes(
 fn parse_stsd(
     f: &mut File,
     box_end: u64,
-    saw_avc: &mut bool,
+    saw_visual: &mut bool,
     saw_aac: &mut bool,
+    hevc: bool,
 ) -> std::io::Result<()> {
     if f.stream_position()? + 8 > box_end {
         return Ok(());
@@ -1112,7 +1217,8 @@ fn parse_stsd(
         let mut four = [0u8; 4];
         f.read_exact(&mut four)?;
         match &four {
-            b"avc1" | b"avc3" => *saw_avc = true,
+            b"avc1" | b"avc3" => *saw_visual = true,
+            b"hvc1" | b"hev1" if hevc => *saw_visual = true,
             b"mp4a" => *saw_aac = true,
             _ => {}
         }
@@ -1127,6 +1233,751 @@ fn parse_stsd(
         f.seek(SeekFrom::Start(entry_end))?;
     }
     Ok(())
+}
+
+/// Highest H.264/HEVC level SlideX will cast, in tenths (52 = level 5.2).
+const CAST_MAX_VIDEO_LEVEL: u8 = 52;
+
+/// H.264 Table A-1, in tenths: level, MaxFS, MaxMBPS. Used for a missing level
+/// on both H.264 and HEVC (16×16 macroblocks, rounded up).
+const H264_LEVEL_TABLE: &[(u8, u32, u32)] = &[
+    (10, 99, 1_485),
+    (11, 396, 3_000),
+    (12, 396, 6_000),
+    (13, 396, 11_880),
+    (20, 396, 11_880),
+    (21, 792, 19_800),
+    (22, 1_620, 20_250),
+    (30, 1_620, 40_500),
+    (31, 3_600, 108_000),
+    (32, 5_120, 216_000),
+    (40, 8_192, 245_760),
+    (41, 8_192, 245_760),
+    (42, 8_704, 522_240),
+    (50, 22_080, 589_824),
+    (51, 36_864, 983_040),
+    (52, 36_864, 2_073_600),
+    (60, 139_264, 4_177_920),
+    (61, 139_264, 8_355_840),
+    (62, 139_264, 16_711_680),
+];
+
+const UHD_W: u32 = 3840;
+const UHD_H: u32 = 2160;
+const FHD_W: u32 = 1920;
+const FHD_H: u32 = 1080;
+const BITRATE_FHD: u64 = 20_000_000;
+const BITRATE_UHD: u64 = 40_000_000;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisualCodec {
+    Avc,
+    Hvc1,
+    Hev1,
+}
+
+struct TrackProbe {
+    width: u32,
+    height: u32,
+    timescale: u32,
+    duration: u64,
+    /// Sample count summed across every `stts` entry.
+    sample_count: u64,
+    /// Σ(sample_count × sample_delta) across every `stts` entry.
+    sample_ticks: u128,
+    /// `moof` or `mvex` is present, so timing may live in the fragments.
+    fragmented: bool,
+    codec: Option<VisualCodec>,
+    /// Tenths from avcC, or the HEVC general_level_idc converted to tenths.
+    /// `Some(0)` means the box was present and the level byte was 0.
+    level: Option<u8>,
+    /// `bit_depth_luma_minus8`. Missing when the file does not say.
+    bit_depth: Option<u8>,
+    bitrate: Option<u64>,
+}
+
+impl TrackProbe {
+    fn new() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            timescale: 0,
+            duration: 0,
+            sample_count: 0,
+            sample_ticks: 0,
+            fragmented: false,
+            codec: None,
+            level: None,
+            bit_depth: None,
+            bitrate: None,
+        }
+    }
+}
+
+struct CastVideoDecision {
+    /// Sentence shown to the user. `None` means the file may be cast.
+    skip: Option<String>,
+    /// Set only when avcC/hvcC had no level (missing box or 0). Format `5.1`.
+    derived: Option<String>,
+}
+
+struct Mp4Box {
+    typ: [u8; 4],
+    payload: u64,
+    end: u64,
+}
+
+/// SlideX does not ship ffmpeg. Limits come from the MP4 boxes (`avcC` /
+/// `hvcC`, `tkhd`, `mdhd`, `stts`, `btrt`). A value a readable MP4 or MOV
+/// does not carry is not a failure, so a stub sample entry still loads.
+/// Anything that cannot be read — another container, a truncated box, or an
+/// I/O error — is skipped.
+fn decide_cast_video(path: &Path) -> CastVideoDecision {
+    decide_cast_video_logged(path, true)
+}
+
+fn decide_cast_video_logged(path: &Path, log: bool) -> CastVideoDecision {
+    let ext = ext_of(path);
+    if ext != "mp4" && ext != "mov" {
+        return unverifiable_video(path, log);
+    }
+    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let probe = match read_mp4_video(path) {
+        Ok(probe) => probe,
+        Err(_) => return unverifiable_video(path, log),
+    };
+    if probe.codec.is_none() {
+        return unverifiable_video(path, log);
+    }
+    // `trex` / `tfhd` are not read. A fragment with no `mdhd` timescale or no
+    // `stts` samples cannot be checked, so it is not sent to the TV.
+    if probe.fragmented && (probe.timescale == 0 || probe.sample_count == 0) {
+        return unverifiable_video(path, log);
+    }
+    let mut derived = None;
+    let mut level = probe.level.filter(|tenths| *tenths != 0);
+    if level.is_none() {
+        if let Some(tenths) = derive_h264_level(
+            probe.width,
+            probe.height,
+            probe.timescale,
+            probe.sample_count,
+            probe.sample_ticks,
+        ) {
+            derived = Some(format_level(tenths));
+            level = Some(tenths);
+        }
+    }
+    let mut parts = Vec::new();
+    if probe.codec == Some(VisualCodec::Hev1) {
+        parts.push("HEVC (hev1)".to_string());
+    }
+    if let Some(minus8) = probe.bit_depth {
+        if minus8 != 0 {
+            parts.push(format!("{}-bit", 8u32.saturating_add(minus8 as u32)));
+        }
+    }
+    if fps_over_60(probe.timescale, probe.sample_count, probe.sample_ticks) {
+        parts.push(format_fps(
+            probe.timescale,
+            probe.sample_count,
+            probe.sample_ticks,
+        ));
+    }
+    let have_size = probe.width > 0 && probe.height > 0;
+    if have_size && !fits_box(probe.width, probe.height, UHD_W, UHD_H) {
+        parts.push(format!("{}x{}", probe.width, probe.height));
+    }
+    let bitrate = probe
+        .bitrate
+        .or_else(|| bitrate_from_file(file_len, probe.timescale, probe.duration));
+    if let (Some(rate), true) = (bitrate, have_size) {
+        let above_fhd = !fits_box(probe.width, probe.height, FHD_W, FHD_H);
+        let cap = if above_fhd { BITRATE_UHD } else { BITRATE_FHD };
+        if rate > cap {
+            parts.push(format_mbit(rate, cap));
+        }
+    }
+    let level_sentence = level.and_then(|tenths| {
+        if tenths > CAST_MAX_VIDEO_LEVEL {
+            let name = match probe.codec {
+                Some(VisualCodec::Hvc1) | Some(VisualCodec::Hev1) => "HEVC",
+                _ => "H.264",
+            };
+            Some(format!(
+                "{name} level {} may not play on this TV",
+                format_level(tenths)
+            ))
+        } else {
+            None
+        }
+    });
+    CastVideoDecision {
+        skip: skip_sentence(&parts, level_sentence),
+        derived,
+    }
+}
+
+fn container_token(path: &Path) -> String {
+    let ext = ext_of(path);
+    if ext.is_empty() {
+        "unknown".to_string()
+    } else {
+        ext.to_ascii_uppercase()
+    }
+}
+
+fn unverifiable_video(path: &Path, log: bool) -> CastVideoDecision {
+    let container = container_token(path);
+    if log {
+        cast_log(
+            "skip",
+            &format!("reason=unverifiable container={container}"),
+        );
+    }
+    CastVideoDecision {
+        skip: Some(format!(
+            "can't verify this video for the TV ({container})"
+        )),
+        derived: None,
+    }
+}
+
+fn join_skip_notes(notes: &[String]) -> Option<String> {
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(". "))
+    }
+}
+
+fn skip_sentence(parts: &[String], level_sentence: Option<String>) -> Option<String> {
+    if parts.is_empty() && level_sentence.is_none() {
+        return None;
+    }
+    let mut out = String::new();
+    if !parts.is_empty() {
+        let verb = if parts.len() == 1 { "isn't" } else { "aren't" };
+        out = format!("{} {verb} supported by the TV", join_limits(parts));
+    }
+    if let Some(level) = level_sentence {
+        if out.is_empty() {
+            out = level;
+        } else {
+            out.push_str(". ");
+            out.push_str(&level);
+        }
+    }
+    Some(out)
+}
+
+fn join_limits(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        _ => {
+            let (last, rest) = parts.split_last().unwrap();
+            format!("{} and {last}", rest.join(", "))
+        }
+    }
+}
+
+fn format_level(tenths: u8) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+fn fits_box(w: u32, h: u32, box_w: u32, box_h: u32) -> bool {
+    (w <= box_w && h <= box_h) || (w <= box_h && h <= box_w)
+}
+
+/// Average frame rate is `samples × timescale / Σ(sample_count × delta)`.
+/// The cap is 60 plus 0.5% (60.3). Exactly 60.3 passes. 61 does not.
+fn fps_over_60(timescale: u32, samples: u64, ticks: u128) -> bool {
+    if timescale == 0 || samples == 0 || ticks == 0 {
+        return false;
+    }
+    let numer = (samples as u128).saturating_mul(timescale as u128);
+    numer.saturating_mul(1000) > ticks.saturating_mul(60_300)
+}
+
+fn format_fps(timescale: u32, samples: u64, ticks: u128) -> String {
+    if timescale == 0 || samples == 0 || ticks == 0 {
+        return "0 fps".to_string();
+    }
+    let numer = (samples as u128).saturating_mul(timescale as u128);
+    if numer % ticks == 0 {
+        let fps = numer / ticks;
+        return format!("{fps} fps");
+    }
+    let tenths = numer.saturating_mul(10).saturating_add(ticks / 2) / ticks;
+    format!("{}.{} fps", tenths / 10, tenths % 10)
+}
+
+/// Nearest Mbit/s. One decimal when the integer would hide a value over `cap`.
+fn format_mbit(bitrate: u64, cap: u64) -> String {
+    let nearest = bitrate.saturating_add(500_000) / 1_000_000;
+    let cap_mbit = cap / 1_000_000;
+    if bitrate > cap && nearest <= cap_mbit {
+        let tenths = bitrate.saturating_add(50_000) / 100_000;
+        return format!("{}.{} Mbit/s", tenths / 10, tenths % 10);
+    }
+    format!("{nearest} Mbit/s")
+}
+
+fn bitrate_from_file(len: u64, timescale: u32, duration: u64) -> Option<u64> {
+    if timescale == 0 || duration == 0 || len == 0 {
+        return None;
+    }
+    let bits = (len as u128)
+        .saturating_mul(8)
+        .saturating_mul(timescale as u128);
+    let rate = bits / duration as u128;
+    if rate == 0 {
+        None
+    } else {
+        Some(rate.min(u64::MAX as u128) as u64)
+    }
+}
+
+/// Lowest Table A-1 level whose MaxFS and MaxMBPS both hold.
+/// Average frame rate is `samples × timescale / ticks`, so
+/// `fs × samples × timescale <= MaxMBPS × ticks`.
+fn derive_h264_level(
+    width: u32,
+    height: u32,
+    timescale: u32,
+    samples: u64,
+    ticks: u128,
+) -> Option<u8> {
+    if width == 0 || height == 0 || timescale == 0 || samples == 0 || ticks == 0 {
+        return None;
+    }
+    let mb_w = (width as u64).saturating_add(15) / 16;
+    let mb_h = (height as u64).saturating_add(15) / 16;
+    let fs = mb_w.saturating_mul(mb_h);
+    let left = (fs as u128)
+        .saturating_mul(samples as u128)
+        .saturating_mul(timescale as u128);
+    for &(level, max_fs, max_mbps) in H264_LEVEL_TABLE {
+        if fs <= max_fs as u64 && left <= (max_mbps as u128).saturating_mul(ticks) {
+            return Some(level);
+        }
+    }
+    Some(62)
+}
+
+fn hevc_level_tenths(idc: u8) -> u8 {
+    let major = idc / 30;
+    let minor = (idc % 30) / 3;
+    major.saturating_mul(10).saturating_add(minor)
+}
+
+fn read_mp4_video(path: &Path) -> std::io::Result<TrackProbe> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut probe = TrackProbe::new();
+    walk_probe(&mut f, 0, len, 0, &mut probe)?;
+    Ok(probe)
+}
+
+fn read_box_header(f: &mut File, end: u64) -> std::io::Result<Option<Mp4Box>> {
+    if f.stream_position()? + 8 > end {
+        return Ok(None);
+    }
+    let pos = f.stream_position()?;
+    let size32 = read_u32(f)? as u64;
+    let mut typ = [0u8; 4];
+    f.read_exact(&mut typ)?;
+    let (size, header) = if size32 == 1 {
+        if f.stream_position()? + 8 > end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mp4 box header is truncated",
+            ));
+        }
+        (read_u64(f)?, 16u64)
+    } else if size32 == 0 {
+        (end.saturating_sub(pos), 8u64)
+    } else {
+        (size32, 8u64)
+    };
+    if size < header || pos.saturating_add(size) > end || pos.saturating_add(size) <= pos {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "mp4 box extends past its parent",
+        ));
+    }
+    let box_end = pos + size;
+    Ok(Some(Mp4Box {
+        typ,
+        payload: pos + header,
+        end: box_end,
+    }))
+}
+
+fn walk_probe(
+    f: &mut File,
+    start: u64,
+    end: u64,
+    depth: u8,
+    probe: &mut TrackProbe,
+) -> std::io::Result<()> {
+    if depth > 8 {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(start))?;
+    while f.stream_position()? + 8 <= end {
+        let Some(bx) = read_box_header(f, end)? else {
+            break;
+        };
+        match &bx.typ {
+            b"trak" => {
+                let mut inner = TrackProbe::new();
+                walk_probe(f, bx.payload, bx.end, depth + 1, &mut inner)?;
+                if inner.codec.is_some() {
+                    let fragmented = probe.fragmented || inner.fragmented;
+                    *probe = inner;
+                    probe.fragmented = fragmented;
+                }
+            }
+            b"moov" | b"mdia" | b"minf" | b"stbl" => {
+                walk_probe(f, bx.payload, bx.end, depth + 1, probe)?;
+            }
+            b"mvex" | b"moof" => {
+                probe.fragmented = true;
+            }
+            b"tkhd" => parse_tkhd(f, bx.payload, bx.end, probe)?,
+            b"mdhd" => parse_mdhd(f, bx.payload, bx.end, probe)?,
+            b"stts" => parse_stts(f, bx.payload, bx.end, probe)?,
+            b"stsd" => parse_visual_stsd(f, bx.payload, bx.end, probe)?,
+            _ => {}
+        }
+        f.seek(SeekFrom::Start(bx.end))?;
+    }
+    Ok(())
+}
+
+fn parse_tkhd(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    if payload + 1 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload))?;
+    let mut ver = [0u8; 1];
+    f.read_exact(&mut ver)?;
+    let width_at = payload + if ver[0] == 0 { 76 } else { 88 };
+    if width_at + 8 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(width_at))?;
+    let width = read_u32(f)? >> 16;
+    let height = read_u32(f)? >> 16;
+    if width > 0 && height > 0 {
+        probe.width = width;
+        probe.height = height;
+    }
+    Ok(())
+}
+
+fn parse_mdhd(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    if payload + 1 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload))?;
+    let mut ver = [0u8; 1];
+    f.read_exact(&mut ver)?;
+    if ver[0] == 0 {
+        if payload + 20 > end {
+            return Ok(());
+        }
+        f.seek(SeekFrom::Start(payload + 12))?;
+        probe.timescale = read_u32(f)?;
+        probe.duration = read_u32(f)? as u64;
+    } else {
+        if payload + 32 > end {
+            return Ok(());
+        }
+        f.seek(SeekFrom::Start(payload + 20))?;
+        probe.timescale = read_u32(f)?;
+        probe.duration = read_u64(f)?;
+    }
+    Ok(())
+}
+
+fn parse_stts(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    if payload + 8 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload + 4))?;
+    let count = read_u32(f)?.min(4096);
+    let mut entries: Vec<(u64, u128)> = Vec::new();
+    for _ in 0..count {
+        if f.stream_position()? + 8 > end {
+            break;
+        }
+        let n = read_u32(f)? as u64;
+        let delta = read_u32(f)? as u128;
+        entries.push((n, delta));
+    }
+    // A short final sample (count 1, delta below the previous entry) is the
+    // remainder of the last frame, not the clip's frame rate.
+    if entries.len() >= 2 {
+        let (n, delta) = entries[entries.len() - 1];
+        let prev = entries[entries.len() - 2].1;
+        if n == 1 && delta < prev {
+            entries.pop();
+        }
+    }
+    let mut samples: u64 = 0;
+    let mut ticks: u128 = 0;
+    for (n, delta) in entries {
+        samples = samples.saturating_add(n);
+        ticks = ticks.saturating_add((n as u128).saturating_mul(delta));
+    }
+    probe.sample_count = probe.sample_count.saturating_add(samples);
+    probe.sample_ticks = probe.sample_ticks.saturating_add(ticks);
+    Ok(())
+}
+
+fn parse_visual_stsd(
+    f: &mut File,
+    payload: u64,
+    end: u64,
+    probe: &mut TrackProbe,
+) -> std::io::Result<()> {
+    if payload + 8 > end {
+        return Ok(());
+    }
+    f.seek(SeekFrom::Start(payload))?;
+    let _ver_flags = read_u32(f)?;
+    let count = read_u32(f)?.min(32);
+    for _ in 0..count {
+        if f.stream_position()? + 8 > end {
+            break;
+        }
+        let entry_pos = f.stream_position()?;
+        let entry_size = read_u32(f)? as u64;
+        let mut four = [0u8; 4];
+        f.read_exact(&mut four)?;
+        let entry_end = if entry_size >= 8 {
+            entry_pos.saturating_add(entry_size)
+        } else {
+            break;
+        };
+        if entry_end > end {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mp4 sample entry extends past its parent",
+            ));
+        }
+        let codec = match &four {
+            b"avc1" | b"avc3" => Some(VisualCodec::Avc),
+            b"hvc1" => Some(VisualCodec::Hvc1),
+            b"hev1" => Some(VisualCodec::Hev1),
+            _ => None,
+        };
+        if let Some(codec) = codec {
+            probe.codec = Some(codec);
+            // VisualSampleEntry fields are 78 bytes after the 8-byte box header.
+            let child = entry_pos.saturating_add(86);
+            if child < entry_end {
+                walk_sample_children(f, child, entry_end, probe)?;
+            }
+        }
+        f.seek(SeekFrom::Start(entry_end))?;
+    }
+    Ok(())
+}
+
+fn walk_sample_children(
+    f: &mut File,
+    start: u64,
+    end: u64,
+    probe: &mut TrackProbe,
+) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(start))?;
+    while f.stream_position()? + 8 <= end {
+        let Some(bx) = read_box_header(f, end)? else {
+            break;
+        };
+        match &bx.typ {
+            b"avcC" => parse_avcc(f, bx.payload, bx.end, probe)?,
+            b"hvcC" => parse_hvcc(f, bx.payload, bx.end, probe)?,
+            b"btrt" => parse_btrt(f, bx.payload, bx.end, probe)?,
+            _ => {}
+        }
+        f.seek(SeekFrom::Start(bx.end))?;
+    }
+    Ok(())
+}
+
+fn read_span(f: &mut File, payload: u64, end: u64, cap: usize) -> std::io::Result<Vec<u8>> {
+    let n = ((end.saturating_sub(payload)) as usize).min(cap);
+    let mut buf = vec![0u8; n];
+    if n > 0 {
+        f.seek(SeekFrom::Start(payload))?;
+        f.read_exact(&mut buf)?;
+    }
+    Ok(buf)
+}
+
+fn parse_avcc(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    let buf = read_span(f, payload, end, 512)?;
+    if buf.len() < 4 {
+        return Ok(());
+    }
+    let profile = buf[1];
+    probe.level = Some(buf[3]);
+    if matches!(profile, 66 | 77 | 88) {
+        probe.bit_depth = Some(0);
+        return Ok(());
+    }
+    if let Some(depth) = avcc_sps_bit_depth(&buf) {
+        probe.bit_depth = Some(depth);
+    }
+    Ok(())
+}
+
+fn avcc_sps_bit_depth(buf: &[u8]) -> Option<u8> {
+    if buf.len() < 6 {
+        return None;
+    }
+    let num_sps = (buf[5] & 0x1f) as usize;
+    if num_sps == 0 {
+        return None;
+    }
+    let mut off = 6usize;
+    if off + 2 > buf.len() {
+        return None;
+    }
+    let sps_len = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
+    off += 2;
+    if sps_len < 2 || off + sps_len > buf.len() {
+        return None;
+    }
+    sps_bit_depth(&buf[off..off + sps_len])
+}
+
+fn parse_hvcc(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    let buf = read_span(f, payload, end, 64)?;
+    // general_level_idc is byte 12. A shorter box has no level.
+    if buf.len() < 13 {
+        return Ok(());
+    }
+    probe.level = Some(hevc_level_tenths(buf[12]));
+    if buf.len() > 17 {
+        probe.bit_depth = Some(buf[17] & 0x07);
+    }
+    Ok(())
+}
+
+fn parse_btrt(f: &mut File, payload: u64, end: u64, probe: &mut TrackProbe) -> std::io::Result<()> {
+    let buf = read_span(f, payload, end, 12)?;
+    if buf.len() < 12 {
+        return Ok(());
+    }
+    let max_rate = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let avg_rate = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if avg_rate != 0 {
+        probe.bitrate = Some(avg_rate as u64);
+    } else if max_rate != 0 {
+        probe.bitrate = Some(max_rate as u64);
+    }
+    Ok(())
+}
+
+fn ebsp_to_rbsp(ebsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ebsp.len());
+    let mut i = 0;
+    while i < ebsp.len() {
+        if i + 2 < ebsp.len() && ebsp[i] == 0 && ebsp[i + 1] == 0 && ebsp[i + 2] == 3 {
+            out.push(0);
+            out.push(0);
+            i += 3;
+        } else {
+            out.push(ebsp[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<u8> {
+        let i = self.bit / 8;
+        if i >= self.data.len() {
+            return None;
+        }
+        let shift = 7 - (self.bit % 8);
+        self.bit += 1;
+        Some((self.data[i] >> shift) & 1)
+    }
+
+    fn read_bits(&mut self, n: u32) -> Option<u32> {
+        if n > 31 {
+            return None;
+        }
+        let mut v = 0u32;
+        for _ in 0..n {
+            v = (v << 1) | self.read_bit()? as u32;
+        }
+        Some(v)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut zeros = 0u32;
+        loop {
+            if self.read_bit()? == 1 {
+                break;
+            }
+            zeros += 1;
+            if zeros > 31 {
+                return None;
+            }
+        }
+        if zeros == 0 {
+            return Some(0);
+        }
+        let rest = self.read_bits(zeros)?;
+        Some(((1u32 << zeros) - 1).saturating_add(rest))
+    }
+}
+
+fn sps_bit_depth(nal: &[u8]) -> Option<u8> {
+    if nal.is_empty() {
+        return None;
+    }
+    let rbsp = ebsp_to_rbsp(nal);
+    if rbsp.len() < 4 {
+        return None;
+    }
+    let mut bits = BitReader::new(&rbsp[1..]);
+    let profile = bits.read_bits(8)? as u8;
+    let _constraint = bits.read_bits(8)?;
+    let _level = bits.read_bits(8)?;
+    let _sps_id = bits.read_ue()?;
+    const HIGH: &[u8] = &[100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135];
+    if !HIGH.contains(&profile) {
+        return Some(0);
+    }
+    let chroma = bits.read_ue()?;
+    if chroma == 3 {
+        let _separate = bits.read_bits(1)?;
+    }
+    let luma = bits.read_ue()?;
+    if luma > 6 {
+        return None;
+    }
+    Some(luma as u8)
 }
 
 #[derive(Clone, Debug)]
@@ -1218,33 +2069,61 @@ fn replace_playlist(book: &mut AllowBook, paths: &[PathBuf]) -> PlaylistUpdate {
     let mut page_index = Vec::new();
     for (idx, path) in paths.iter().enumerate() {
         let page = (idx as u32).saturating_add(1);
-        match classify_playlist_file(path) {
-            Ok((ctype, kind)) => {
-                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-                if book.by_path.contains_key(&canon) {
-                    continue;
+        let accepted = match classify_playlist_file(path) {
+            Ok((ctype, kind)) => Some((ctype.to_string(), kind)),
+            Err(reason) => match video_for_cast_check(path) {
+                Some(pair) => Some(pair),
+                None => {
+                    skipped.push(reason);
+                    None
                 }
-                let key = new_token();
-                book.by_path.insert(canon.clone(), key.clone());
-                book.order.push(canon.clone());
-                page_index.push(page);
-                book.files.insert(
-                    key,
-                    AllowEntry {
-                        path: canon,
-                        content_type: ctype.to_string(),
-                        kind,
-                        page_index: page,
-                    },
-                );
+            },
+        };
+        if let Some((ctype, kind)) = accepted {
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if book.by_path.contains_key(&canon) {
+                continue;
             }
-            Err(reason) => skipped.push(reason),
+            let key = new_token();
+            book.by_path.insert(canon.clone(), key.clone());
+            book.order.push(canon.clone());
+            page_index.push(page);
+            book.files.insert(
+                key,
+                AllowEntry {
+                    path: canon,
+                    content_type: ctype,
+                    kind,
+                    page_index: page,
+                },
+            );
         }
     }
     PlaylistUpdate {
         registered: book.files.len(),
         skipped,
         page_index,
+    }
+}
+
+/// Classify rejected this file, but it is a video the cast check can still
+/// name. Register it so a LOAD runs `decide_cast_video` instead of the
+/// generic unsupported-media skip. Logging happens on that LOAD.
+fn video_for_cast_check(path: &Path) -> Option<(String, String)> {
+    let ctype = match ext_of(path).as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        _ => return None,
+    };
+    let decision = decide_cast_video_logged(path, false);
+    let skip = decision.skip.as_deref()?;
+    if skip.contains("can't verify this video") {
+        Some((ctype.to_string(), "video".to_string()))
+    } else {
+        None
     }
 }
 
@@ -1424,6 +2303,92 @@ impl MediaHttp {
             item: next.0,
             media_type: media_type_label(&entry.kind),
         })
+    }
+
+    /// The next item a FINISHED video should LOAD. Videos that break a TV
+    /// limit are logged and passed over with no wait. The walk stops when it
+    /// returns to `item_index`.
+    fn next_castable(&self, item_index: u32) -> (Result<Successor, &'static str>, Option<String>) {
+        let (token, steps) = {
+            let book = match self.book.lock() {
+                Ok(book) => book,
+                Err(_) => return (Err("playlist lock"), None),
+            };
+            if book.order.is_empty() {
+                return (Err("empty playlist"), None);
+            }
+            if item_index == 0 {
+                return (Err("current item unknown"), None);
+            }
+            let mut ranked: Vec<(u32, String)> = Vec::new();
+            for path in &book.order {
+                let Some(key) = book.by_path.get(path) else {
+                    return (Err("current item unknown"), None);
+                };
+                let Some(entry) = book.files.get(key) else {
+                    return (Err("current item unknown"), None);
+                };
+                ranked.push((entry.page_index, key.clone()));
+            }
+            ranked.sort_by_key(|(page, _)| *page);
+            let mut steps = Vec::with_capacity(ranked.len());
+            for (page, key) in ranked {
+                let Some(entry) = book.files.get(&key) else {
+                    return (Err("current item unknown"), None);
+                };
+                steps.push((
+                    page,
+                    key,
+                    entry.path.clone(),
+                    entry.content_type.clone(),
+                    entry.kind.clone(),
+                ));
+            }
+            (book.token.clone(), steps)
+        };
+        let start = steps
+            .iter()
+            .position(|(page, ..)| *page > item_index)
+            .unwrap_or(0);
+        let mut seen = HashSet::new();
+        seen.insert(item_index);
+        let mut skipped = Vec::new();
+        let n = steps.len();
+        for step in 0..n {
+            let (page, key, path, content_type, kind) = &steps[(start + step) % n];
+            if !seen.insert(*page) {
+                break;
+            }
+            if kind == "video" {
+                let decision = decide_cast_video(path);
+                if let Some(level) = decision.derived.as_deref() {
+                    cast_log(
+                        "level_derived",
+                        &format!("item={} level_derived={level}", item_log_token(*page)),
+                    );
+                }
+                if let Some(reasons) = decision.skip {
+                    cast_log(
+                        "video_skipped",
+                        &format!("item={} reasons={reasons}", item_log_token(*page)),
+                    );
+                    skipped.push(reasons);
+                    continue;
+                }
+            }
+            let url = format!("http://{}:{}/m/{}/{}", self.bind_ip, self.port, token, key);
+            let note = join_skip_notes(&skipped);
+            return (
+                Ok(Successor {
+                    url,
+                    content_type: content_type.clone(),
+                    item: *page,
+                    media_type: media_type_label(kind),
+                }),
+                note,
+            );
+        }
+        (Err("nothing castable"), join_skip_notes(&skipped))
     }
 
     fn shutdown(&mut self) {
@@ -2772,7 +3737,7 @@ impl CastLink {
                                 kind: "INVALID_PLAYER_STATE",
                             });
                         }
-                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id) => {
+                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id, true) => {
                             return Ok(Waited::LoadRejected { kind: "ERROR" });
                         }
                         _ => {
@@ -2808,7 +3773,7 @@ impl CastLink {
                             let _ = err;
                             return Err("The TV refused the media command (LOAD_FAILED).".into());
                         }
-                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id) => {
+                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id, false) => {
                             return Err("The TV refused the media command (ERROR).".into());
                         }
                         _ => {
@@ -2873,9 +3838,12 @@ impl CastLink {
                 cast_log(&step, &format!("{ids} error={err}"));
                 Err(err)
             }
-            Err(err) if (typ == "PLAY" || typ == "PAUSE") && media_cmd_unanswered(&err) => {
+            Err(err)
+                if matches!(typ, "PLAY" | "PAUSE" | "SEEK") && media_cmd_unanswered(&err) =>
+            {
                 // The TV often never replies to PLAY or PAUSE for a still, and a
-                // missed reply must not become "TV unreachable".
+                // missed SEEK must not become an error. A missed reply must not
+                // become "TV unreachable".
                 cast_log(&step, &format!("{ids} warning=unanswered"));
                 Ok(if typ == "PAUSE" {
                     PlayerState::Paused
@@ -3136,11 +4104,12 @@ fn media_error_reply(msg: &CastMessage, id: u32) -> Option<&'static str> {
     }
 }
 
-/// A parsed ERROR carries no request id in rust_cast. Accept it when the
-/// payload does not name a different request. requestId 0 stays ignored.
-fn parsed_error_matches(msg: &CastMessage, id: u32) -> bool {
+/// A parsed ERROR carries no request id in rust_cast. That satisfies a LOAD
+/// wait only. PLAY, PAUSE, and SEEK ignore it and keep waiting. An explicit
+/// requestId must match, and requestId 0 stays ignored.
+fn parsed_error_matches(msg: &CastMessage, id: u32, allow_missing_request: bool) -> bool {
     match media_reply_type(msg) {
-        Some((None, typ)) if typ == "ERROR" => true,
+        Some((None, typ)) if typ == "ERROR" => allow_missing_request,
         Some((Some(rid), _)) => rid == id && id != 0,
         _ => false,
     }
@@ -3321,6 +4290,11 @@ fn cast_log_path_in(local_app_data: &Path) -> PathBuf {
         .join("cast.log")
 }
 
+/// Page duration fallback. The detail is only `from=<digits> to=<digits>`.
+pub fn log_dur_fallback(from_ms: u64, to_ms: u64) {
+    cast_log("dur_fallback", &format!("from={from_ms} to={to_ms}"));
+}
+
 fn cast_log(step: &str, detail: &str) {
     let _guard = CAST_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let safe = sanitize_cast_log_detail(detail);
@@ -3379,6 +4353,8 @@ fn unmasked_media_token(detail: &str) -> bool {
 
 fn strip_allowed_log_slashes(detail: &str) -> String {
     let mut out = detail.replace("https://", "https:").replace("http://", "http:");
+    // `245 Mbit/s` is a limit, not a path. Hide that slash before the check.
+    out = out.replace("Mbit/s", "Mbit_s");
     while let Some(start) = out.find("/m/") {
         let after = start + 3;
         let Some(mark) = out[after..].find("?t=***") else {
@@ -3514,9 +4490,10 @@ struct SessionFlags {
 }
 
 impl SessionFlags {
-    /// Still images ignore `playerState`. The Default Media Receiver reports
-    /// PAUSED for every photo, which is not a remote pause. A remote pause is
-    /// a video going from PLAYING to PAUSED.
+    /// Still images ignore `playerState`. The Default Media Receiver has no
+    /// playback timeline for a still, so it reports PAUSED for every photo
+    /// (often BUFFERING, then PAUSED). That is not a pause command and not a
+    /// failed load. A remote pause is a video going from PLAYING to PAUSED.
     fn note_state(&mut self, state: PlayerState, from_local: bool) {
         if self.media_kind == "still" && !from_local {
             return;
@@ -3559,7 +4536,7 @@ impl SessionFlags {
             return false;
         }
         self.advanced_session = Some(session);
-        cast_log("advance", "source=remote");
+        cast_log("advance", "source=tv_finished");
         true
     }
 
@@ -3592,43 +4569,52 @@ impl SessionFlags {
     }
 }
 
-/// IDLE for the current media session.
-/// A video FINISHED loads `next` while the slideshow is playing, or logs why
-/// that LOAD was not sent. A photo FINISHED is logged and ignored: the
-/// slideshow timer is the only photo advance. ERROR is a failed fetch: tell
-/// the user and do not skip to the next slide.
-/// `Ok(true)` means the next LOAD was sent. The caller publishes `item_index`
-/// before raising the finished event, so the page moves to that item.
-fn on_media_idle(
-    link: &CastLink,
+/// Side effects of an IDLE status, up to the point where the next LOAD is
+/// chosen. `true` means the caller should load a successor.
+fn idle_wants_next(
     flags: &mut SessionFlags,
     session: Option<i32>,
     reason: Option<IdleReason>,
-    next: Result<Successor, &'static str>,
-) -> Result<bool, String> {
+) -> bool {
     let Some(session) = session else {
-        return Ok(false);
+        return false;
     };
     let Some(current) = flags.media_session else {
-        return Ok(false);
+        return false;
     };
     if session != current {
-        return Ok(false);
+        return false;
     }
     if reason == Some(IdleReason::Error) {
         flags.note_load_failed(session);
-        return Ok(false);
+        return false;
     }
     if flags.media_kind == "still" && reason == Some(IdleReason::Finished) {
         flags.note_photo_finished_ignored(session);
-        return Ok(false);
+        return false;
     }
     if reason == Some(IdleReason::Finished) && !flags.slideshow_playing {
-        return Ok(false);
+        return false;
     }
-    if !flags.note_finished(Some(session), reason) {
-        return Ok(false);
+    flags.note_finished(Some(session), reason)
+}
+
+/// `loaded` means the successor LOAD was sent, which already cleared
+/// `flags.error`. The skip sentence stays only when that LOAD did not happen.
+fn apply_skip_note(flags: &mut SessionFlags, loaded: bool, skipped: Option<String>) {
+    if loaded {
+        return;
     }
+    if let Some(msg) = skipped {
+        flags.error = Some(msg);
+    }
+}
+
+fn apply_successor(
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    next: Result<Successor, &'static str>,
+) -> Result<bool, String> {
     let next = match next {
         Ok(next) => next,
         Err(why) => {
@@ -3680,6 +4666,26 @@ fn on_media_idle(
             Err(err)
         }
     }
+}
+
+/// IDLE for the current media session.
+/// A video FINISHED loads `next` while the slideshow is playing, or logs why
+/// that LOAD was not sent. A photo FINISHED is logged and ignored: the
+/// slideshow timer is the only photo advance. ERROR is a failed fetch: tell
+/// the user and do not skip to the next slide.
+/// `Ok(true)` means the next LOAD was sent. The caller publishes `item_index`
+/// before raising the finished event, so the page moves to that item.
+fn on_media_idle(
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    session: Option<i32>,
+    reason: Option<IdleReason>,
+    next: Result<Successor, &'static str>,
+) -> Result<bool, String> {
+    if !idle_wants_next(flags, session, reason) {
+        return Ok(false);
+    }
+    apply_successor(link, flags, next)
 }
 
 enum CastCmd {
@@ -3735,12 +4741,15 @@ struct LiveSession {
 
 pub struct CastState {
     inner: Mutex<Option<LiveSession>>,
+    /// Connect failures are not stored as a session. status() still reports them.
+    last_error: Mutex<Option<String>>,
 }
 
 impl Default for CastState {
     fn default() -> Self {
         Self {
             inner: Mutex::new(None),
+            last_error: Mutex::new(None),
         }
     }
 }
@@ -3752,6 +4761,39 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
     ) -> Result<CastConnectInfo, String> {
+        self.connect_wait(host, port, name, SESSION_READY_WAIT)
+    }
+
+    fn connect_wait(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        name: Option<String>,
+        ready_wait: Duration,
+    ) -> Result<CastConnectInfo, String> {
+        match self.connect_wait_inner(host, port, name, ready_wait) {
+            Ok(info) => {
+                if let Ok(mut slot) = self.last_error.lock() {
+                    *slot = None;
+                }
+                Ok(info)
+            }
+            Err(err) => {
+                if let Ok(mut slot) = self.last_error.lock() {
+                    *slot = Some(err.clone());
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn connect_wait_inner(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        name: Option<String>,
+        ready_wait: Duration,
+    ) -> Result<CastConnectInfo, String> {
         // The profile query runs on its own thread. Do not wait for it here.
         let _ = lan_category_now();
         let (ip, port) = parse_cast_host(host, port)?;
@@ -3760,7 +4802,7 @@ impl CastState {
             .cloned()
             .ok_or_else(|| NO_HOME_LAN_MESSAGE.to_string())?;
         // Replacing a session that was never opened is not a user Disconnect.
-        self.disconnect_session(false)?;
+        self.disconnect_session()?;
 
         let device_name = name.unwrap_or_else(|| "Chromecast".into());
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -3793,7 +4835,7 @@ impl CastState {
             })
             .map_err(|e| format!("cast thread: {e}"))?;
 
-        let info = match ready_rx.recv_timeout(SESSION_READY_WAIT) {
+        let info = match ready_rx.recv_timeout(ready_wait) {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
                 let _ = worker.join();
@@ -3802,9 +4844,12 @@ impl CastState {
             Err(_) => {
                 cancel.store(true, Ordering::SeqCst);
                 let _ = cmd_tx.send(CastCmd::Disconnect {
-                    origin: CastOrigin::User,
+                    origin: CastOrigin::Timeout,
                     reply: mpsc::channel().0,
                 });
+                // The worker is often still inside TLS or launch and exits
+                // before it reads Disconnect, so the caller records the line.
+                log_disconnect_once(&disconnect_logged, "source=timeout");
                 let _ = worker.join();
                 let reason = with_public_network(link_down_message());
                 log_connect_error(&reason, ip);
@@ -3894,20 +4939,16 @@ impl CastState {
     }
 
     pub fn disconnect(&self) -> Result<(), String> {
-        self.disconnect_session(true)
+        self.disconnect_session()
     }
 
-    /// `log_if_absent` is true for a user Disconnect, including a dead link.
-    /// Cast slideshow passes false so clearing an empty session writes nothing.
-    fn disconnect_session(&self, log_if_absent: bool) -> Result<(), String> {
+    /// Drop the live session. A Disconnect with nothing connected writes no line.
+    fn disconnect_session(&self) -> Result<(), String> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| "cast state lock".to_string())?;
         let Some(mut live) = guard.take() else {
-            if log_if_absent {
-                cast_log("disconnect", "source=user error=not connected");
-            }
             return Ok(());
         };
         // Cancel before the Disconnect command so a queued slideshow LOAD is dropped.
@@ -3953,11 +4994,12 @@ impl CastState {
             }
         };
         let Some(live) = guard.as_ref() else {
+            let error = self.last_error.lock().ok().and_then(|slot| slot.clone());
             return CastLiveStatus {
                 connected: false,
                 player_state: "idle".into(),
                 remote_event: None,
-                error: None,
+                error,
                 media_kind: String::new(),
                 http_port: 0,
                 bind_ip: String::new(),
@@ -4187,31 +5229,27 @@ fn run_session(
                     flags.note_state(state, false);
                     let mut advanced = false;
                     if state == PlayerState::Idle {
-                        let next = match http.successor(flags.item_index) {
-                            Ok(next) => Ok(next),
-                            Err(err) if err == "empty playlist" => Err("empty playlist"),
-                            Err(err) if err == "current item unknown" => Err("current item unknown"),
-                            Err(_) => Err("playlist lock"),
-                        };
-                        match on_media_idle(
-                            &link,
-                            &mut flags,
-                            update.media_session,
-                            update.idle_reason,
-                            next,
-                        ) {
-                            Ok(did) => advanced = did,
-                            Err(err) if err.contains("TV unreachable") => {
-                                flags.connected = false;
-                                flags.error = Some(link_down_message());
-                                publish(&status, |s| {
-                                    s.connected = false;
-                                    s.error = Some(link_down_message());
-                                });
-                                fail_pending(&cmd_rx, &err, &link);
-                                break;
+                        if idle_wants_next(&mut flags, update.media_session, update.idle_reason) {
+                            let (next, skipped_video) = http.next_castable(flags.item_index);
+                            match apply_successor(&link, &mut flags, next) {
+                                Ok(did) => {
+                                    advanced = did;
+                                    // A LOAD that went out cleared the note. Keep
+                                    // it only when nothing was cast.
+                                    apply_skip_note(&mut flags, did, skipped_video);
+                                }
+                                Err(err) if err.contains("TV unreachable") => {
+                                    flags.connected = false;
+                                    flags.error = Some(link_down_message());
+                                    publish(&status, |s| {
+                                        s.connected = false;
+                                        s.error = Some(link_down_message());
+                                    });
+                                    fail_pending(&cmd_rx, &err, &link);
+                                    break;
+                                }
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
                     }
                     let name = flags.player_state.clone();
@@ -4306,6 +5344,22 @@ fn handle_cmd(
                 let (url, ctype) = http.media_url(&path)?;
                 let kind = http.kind_of(&path)?;
                 let item = http.index_of(&path).unwrap_or(0);
+                if kind == "video" {
+                    let decision = decide_cast_video(&path);
+                    if let Some(level) = decision.derived.as_deref() {
+                        cast_log(
+                            "level_derived",
+                            &format!("item={} level_derived={level}", item_log_token(item)),
+                        );
+                    }
+                    if let Some(reasons) = decision.skip {
+                        cast_log(
+                            "video_skipped",
+                            &format!("item={} reasons={reasons}", item_log_token(item)),
+                        );
+                        return Err(reasons);
+                    }
+                }
                 let play = if kind == "still" { true } else { autoplay };
                 link.photo_timer_ms.set(if origin == CastOrigin::Timer {
                     duration_ms
@@ -4350,9 +5404,11 @@ fn handle_cmd(
                     .media_session
                     .ok_or_else(|| "Nothing is casting.".to_string())?;
                 if flags.media_kind == "still" {
-                    // The receiver reports a still as PAUSED or BUFFERING and
-                    // does not answer PAUSE. Waiting out the media deadline
-                    // makes the panel say the TV never loaded the photo.
+                    // A still has no playback timeline. The receiver reports
+                    // PAUSED or BUFFERING and does not answer PAUSE. That is
+                    // normal, not a pause command and not a failed load.
+                    // Waiting out the media deadline makes the panel say the
+                    // TV never loaded the photo.
                     let _ = (sid, origin);
                     flags.player_state = "paused".into();
                     flags.slideshow_playing = false;
@@ -4531,7 +5587,7 @@ fn query_firewall_text() -> String {
 
 pub fn parse_firewall_script_output(text: &str) -> CastFirewallStatus {
     let lower = text.to_ascii_lowercase();
-    if lower.contains("status=match") {
+    if lower.contains("status=match") || lower.contains("status=present") {
         CastFirewallStatus {
             state: "added".into(),
             detail: format!(
@@ -4943,18 +5999,846 @@ mod tests {
         let png = scratch("b.png", &png_bytes());
         let mp4 = scratch("c.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
         let hevc = scratch("d.mp4", &mp4_with(&[b"hvc1", b"mp4a"]));
+        let hev1 = scratch("d2.mp4", &mp4_with(&[b"hev1", b"mp4a"]));
         let no_aac = scratch("e.mp4", &mp4_with(&[b"avc1"]));
         let webp = scratch("f.webp", b"RIFF");
         let mov = scratch("g.mov", &mp4_with(&[b"avc1", b"mp4a"]));
         assert!(classify_playlist_file(&jpg).is_ok());
         assert!(classify_playlist_file(&png).is_ok());
         assert!(classify_playlist_file(&mp4).is_ok());
-        assert!(classify_playlist_file(&hevc).is_err());
+        assert!(classify_playlist_file(&hevc).is_ok());
+        assert!(classify_playlist_file(&hev1).is_ok());
         assert!(classify_playlist_file(&no_aac).is_err());
         assert!(classify_playlist_file(&webp).is_err());
         assert!(classify_playlist_file(&mov).is_err());
         assert!(mp4_is_h264_aac(&mp4).unwrap());
         assert!(!mp4_is_h264_aac(&hevc).unwrap());
+        assert!(!mp4_is_h264_aac(&hev1).unwrap());
+    }
+
+    fn mp4_box(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&size.to_be_bytes());
+        out.extend_from_slice(typ);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn full_box(typ: &[u8; 4], version: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![version, 0, 0, 0];
+        body.extend_from_slice(payload);
+        mp4_box(typ, &body)
+    }
+
+    /// A video the TV-limit probe can measure. `level` `None` omits avcC/hvcC.
+    /// `Some(0)` writes a level byte of 0. Bitrate `None` omits `btrt`.
+    fn limited_mp4(
+        fourcc: &[u8; 4],
+        width: u32,
+        height: u32,
+        timescale: u32,
+        sample_delta: u32,
+        level: Option<u8>,
+        hevc_idc: Option<u8>,
+        bitrate: Option<u32>,
+        pad: usize,
+    ) -> Vec<u8> {
+        limited_mp4_entries(
+            fourcc,
+            width,
+            height,
+            timescale,
+            &[(1, sample_delta)],
+            level,
+            hevc_idc,
+            bitrate,
+            pad,
+            false,
+        )
+    }
+
+    fn limited_mp4_entries(
+        fourcc: &[u8; 4],
+        width: u32,
+        height: u32,
+        timescale: u32,
+        stts_entries: &[(u32, u32)],
+        level: Option<u8>,
+        hevc_idc: Option<u8>,
+        bitrate: Option<u32>,
+        pad: usize,
+        fragment: bool,
+    ) -> Vec<u8> {
+        let mut tkhd_rest = vec![0u8; 72];
+        tkhd_rest.extend_from_slice(&(width << 16).to_be_bytes());
+        tkhd_rest.extend_from_slice(&(height << 16).to_be_bytes());
+        let tkhd = full_box(b"tkhd", 0, &tkhd_rest);
+        let mut mdhd_rest = vec![0u8; 8];
+        mdhd_rest.extend_from_slice(&timescale.to_be_bytes());
+        mdhd_rest.extend_from_slice(&timescale.to_be_bytes());
+        let mdhd = full_box(b"mdhd", 0, &mdhd_rest);
+        let mut stts_rest = Vec::new();
+        stts_rest.extend_from_slice(&(stts_entries.len() as u32).to_be_bytes());
+        for &(count, delta) in stts_entries {
+            stts_rest.extend_from_slice(&count.to_be_bytes());
+            stts_rest.extend_from_slice(&delta.to_be_bytes());
+        }
+        let stts = full_box(b"stts", 0, &stts_rest);
+        let mut visual = vec![0u8; 78];
+        if let Some(idc) = hevc_idc {
+            let mut hvcc = vec![0u8; 18];
+            hvcc[0] = 1;
+            hvcc[12] = idc;
+            hvcc[17] = 0xf8;
+            visual.extend_from_slice(&mp4_box(b"hvcC", &hvcc));
+        } else if let Some(level_byte) = level {
+            // Baseline profile, 8-bit, no SPS. Level is byte 3 (tenths).
+            let avcc = [0x01u8, 0x42, 0x00, level_byte, 0xff, 0xe0];
+            visual.extend_from_slice(&mp4_box(b"avcC", &avcc));
+        }
+        if let Some(avg) = bitrate {
+            let mut btrt = vec![0u8; 4];
+            btrt.extend_from_slice(&avg.to_be_bytes());
+            btrt.extend_from_slice(&avg.to_be_bytes());
+            visual.extend_from_slice(&mp4_box(b"btrt", &btrt));
+        }
+        let entry = mp4_box(fourcc, &visual);
+        let mut stsd_payload = vec![0, 0, 0, 0];
+        stsd_payload.extend_from_slice(&1u32.to_be_bytes());
+        stsd_payload.extend_from_slice(&entry);
+        let stsd = mp4_box(b"stsd", &stsd_payload);
+        let stbl = mp4_box(b"stbl", &[stsd, stts].concat());
+        let minf = mp4_box(b"minf", &stbl);
+        let mdia = mp4_box(b"mdia", &[mdhd, minf].concat());
+        let video = mp4_box(b"trak", &[tkhd, mdia].concat());
+        let mut audio_entry = Vec::new();
+        audio_entry.extend_from_slice(&16u32.to_be_bytes());
+        audio_entry.extend_from_slice(b"mp4a");
+        audio_entry.extend_from_slice(&[0u8; 8]);
+        let mut audio_stsd = vec![0, 0, 0, 0];
+        audio_stsd.extend_from_slice(&1u32.to_be_bytes());
+        audio_stsd.extend_from_slice(&audio_entry);
+        let audio = mp4_box(
+            b"trak",
+            &mp4_box(
+                b"mdia",
+                &mp4_box(b"minf", &mp4_box(b"stbl", &mp4_box(b"stsd", &audio_stsd))),
+            ),
+        );
+        let mut moov_payload = [video, audio].concat();
+        if fragment {
+            moov_payload.extend_from_slice(&mp4_box(b"mvex", &[]));
+        }
+        let moov = mp4_box(b"moov", &moov_payload);
+        let mut file = mp4_box(b"ftyp", b"isom");
+        file.extend_from_slice(&mp4_box(b"mdat", &vec![0u8; pad]));
+        file.extend_from_slice(&moov);
+        if fragment {
+            file.extend_from_slice(&mp4_box(b"moof", &[]));
+        }
+        file
+    }
+
+    fn h264_clip(
+        width: u32,
+        height: u32,
+        timescale: u32,
+        sample_delta: u32,
+        level: Option<u8>,
+        bitrate: Option<u32>,
+    ) -> Vec<u8> {
+        limited_mp4(
+            b"avc1",
+            width,
+            height,
+            timescale,
+            sample_delta,
+            level,
+            None,
+            bitrate,
+            8,
+        )
+    }
+
+    #[test]
+    fn level_5_1_passes_and_a_declared_level_is_trusted() {
+        assert_eq!(CAST_MAX_VIDEO_LEVEL, 52);
+        let exact = scratch(
+            "level51.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(51), Some(8_000_000)),
+        );
+        let decision = decide_cast_video(&exact);
+        assert!(decision.skip.is_none(), "{:?}", decision.skip);
+        assert!(decision.derived.is_none(), "{:?}", decision.derived);
+        // 2160×2160 @ 60 needs 5.2, but a declared 5.1 is not recomputed.
+        let trusted = scratch(
+            "declared51.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(51), Some(8_000_000)),
+        );
+        let trusted = decide_cast_video(&trusted);
+        assert!(trusted.skip.is_none(), "{:?}", trusted.skip);
+        assert!(trusted.derived.is_none());
+        let hevc = scratch(
+            "hevc51.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(153),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert!(decide_cast_video(&hevc).skip.is_none());
+        // 60000/1001 is under 60 fps and must not be skipped for frame rate.
+        let film = scratch(
+            "film.mp4",
+            &h264_clip(1920, 1080, 60_000, 1001, Some(51), Some(8_000_000)),
+        );
+        assert!(decide_cast_video(&film).skip.is_none());
+    }
+
+    #[test]
+    fn average_frame_rate_uses_every_stts_entry() {
+        // 100×1490 + 100×1510 = 300_000 ticks. 200×90000 / 300_000 = 60 exactly.
+        // The 1490 gap alone is about 60.4 fps and must not decide the clip.
+        let uneven = scratch(
+            "uneven60.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                90_000,
+                &[(100, 1490), (100, 1510)],
+                Some(51),
+                None,
+                Some(8_000_000),
+                8,
+                false,
+            ),
+        );
+        let uneven = decide_cast_video(&uneven);
+        assert!(uneven.skip.is_none(), "{:?}", uneven.skip);
+
+        // One short last sample stays near 30 fps on average.
+        let tail = scratch(
+            "short-tail.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                90_000,
+                &[(100, 3000), (1, 1)],
+                Some(40),
+                None,
+                Some(8_000_000),
+                8,
+                false,
+            ),
+        );
+        let tail = decide_cast_video(&tail);
+        assert!(tail.skip.is_none(), "{:?}", tail.skip);
+    }
+
+    #[test]
+    fn pass_short_last_sample() {
+        // 300×1500 is exactly 60 fps at timescale 90000. One shorter final
+        // sample (delta 100) would pull the average to about 60.2 if counted.
+        let tail = scratch(
+            "short-last.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                90_000,
+                &[(300, 1500), (1, 100)],
+                Some(51),
+                None,
+                Some(8_000_000),
+                8,
+                false,
+            ),
+        );
+        let tail = decide_cast_video(&tail);
+        assert!(tail.skip.is_none(), "{:?}", tail.skip);
+
+        let fast = scratch(
+            "sixtyone.mp4",
+            &h264_clip(1920, 1080, 61, 1, Some(42), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&fast).skip.as_deref(),
+            Some("61 fps isn't supported by the TV")
+        );
+    }
+
+    #[test]
+    fn level_5_2_passes_and_a_higher_level_is_skipped() {
+        // John's Google TV plays 2160×2160 at 60 fps, which is level 5.2.
+        let square = scratch(
+            "square52.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(52), Some(8_000_000)),
+        );
+        let square = decide_cast_video(&square);
+        assert!(square.skip.is_none(), "{:?}", square.skip);
+        assert!(square.derived.is_none());
+        let path = scratch(
+            "level52.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(52), Some(8_000_000)),
+        );
+        let decision = decide_cast_video(&path);
+        assert!(decision.skip.is_none(), "{:?}", decision.skip);
+        assert!(decision.derived.is_none());
+        let hevc = scratch(
+            "hevc52.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(156),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert!(decide_cast_video(&hevc).skip.is_none());
+
+        let five_three = scratch(
+            "level53.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&five_three).skip.as_deref(),
+            Some("H.264 level 5.3 may not play on this TV")
+        );
+        let six = scratch(
+            "level60.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(60), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&six).skip.as_deref(),
+            Some("H.264 level 6.0 may not play on this TV")
+        );
+        let six_one = scratch(
+            "level61.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(61), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&six_one).skip.as_deref(),
+            Some("H.264 level 6.1 may not play on this TV")
+        );
+        // general_level_idc 180 is HEVC level 6.0.
+        let hevc6 = scratch(
+            "hevc60.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(180),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&hevc6).skip.as_deref(),
+            Some("HEVC level 6.0 may not play on this TV")
+        );
+        let both = scratch(
+            "fps-and-level.mp4",
+            &h264_clip(1920, 1080, 90, 1, Some(60), Some(8_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&both).skip.as_deref(),
+            Some("90 fps isn't supported by the TV. H.264 level 6.0 may not play on this TV")
+        );
+    }
+
+    #[test]
+    fn missing_or_zero_level_is_derived_from_macroblocks() {
+        // 1920×1080 @ 30 → mb 120×68 = 8160, MBPS 244800 → level 4.0, and it plays.
+        assert_eq!(derive_h264_level(1920, 1080, 30, 1, 1), Some(40));
+        // 2160×2160 @ 60 → mb 135×135 = 18225, MBPS 1_093_500 → level 5.2.
+        assert_eq!(derive_h264_level(2160, 2160, 60, 1, 1), Some(52));
+        // A frame rate at or under 60 that still needs 5.1 passes once derived.
+        assert_eq!(derive_h264_level(2000, 1536, 60, 1, 1), Some(51));
+
+        let zero = scratch(
+            "level0.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(0), Some(8_000_000)),
+        );
+        let zero = decide_cast_video(&zero);
+        assert_eq!(zero.derived.as_deref(), Some("4.0"));
+        assert!(zero.skip.is_none(), "{:?}", zero.skip);
+
+        let absent = scratch(
+            "nolevel.mp4",
+            &h264_clip(1920, 1080, 30, 1, None, Some(8_000_000)),
+        );
+        let absent = decide_cast_video(&absent);
+        assert_eq!(absent.derived.as_deref(), Some("4.0"));
+        assert!(absent.skip.is_none(), "{:?}", absent.skip);
+
+        let square = scratch(
+            "square.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(0), Some(8_000_000)),
+        );
+        let square = decide_cast_video(&square);
+        assert_eq!(square.derived.as_deref(), Some("5.2"));
+        assert!(
+            square.skip.is_none(),
+            "a derived 5.2 plays: {:?}",
+            square.skip
+        );
+
+        let passes = scratch(
+            "derived51.mp4",
+            &h264_clip(2000, 1536, 60, 1, Some(0), Some(8_000_000)),
+        );
+        let passes = decide_cast_video(&passes);
+        assert_eq!(passes.derived.as_deref(), Some("5.1"));
+        assert!(passes.skip.is_none(), "{:?}", passes.skip);
+
+        let hevc_zero = scratch(
+            "hevc0.mp4",
+            &limited_mp4(
+                b"hvc1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(0),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        let hevc_zero = decide_cast_video(&hevc_zero);
+        assert_eq!(hevc_zero.derived.as_deref(), Some("4.0"));
+        assert!(hevc_zero.skip.is_none(), "{:?}", hevc_zero.skip);
+    }
+
+    #[test]
+    fn unsupported_limits_are_named_in_one_sentence() {
+        let path = scratch(
+            "too-big.mp4",
+            &h264_clip(2560, 2560, 90, 1, Some(51), Some(245_000_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&path).skip.as_deref(),
+            Some("90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV")
+        );
+        let square = scratch(
+            "square-ok.mp4",
+            &h264_clip(2160, 2160, 30, 1, Some(51), Some(8_000_000)),
+        );
+        assert!(decide_cast_video(&square).skip.is_none());
+        let hid = scratch(
+            "hid.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(51), Some(20_400_000)),
+        );
+        assert_eq!(
+            decide_cast_video(&hid).skip.as_deref(),
+            Some("20.4 Mbit/s isn't supported by the TV")
+        );
+        let sized = scratch(
+            "sized.mp4",
+            &limited_mp4(b"avc1", 1920, 1080, 30, 1, Some(51), None, None, 3_000_000),
+        );
+        let len = std::fs::metadata(&sized).unwrap().len();
+        let rate = bitrate_from_file(len, 30, 30).unwrap();
+        assert!(rate > 20_000_000, "{rate}");
+        assert_eq!(
+            decide_cast_video(&sized).skip.as_deref(),
+            Some(format!(
+                "{} isn't supported by the TV",
+                format_mbit(rate, 20_000_000)
+            ))
+            .as_deref()
+        );
+        let hev = scratch(
+            "hev1.mp4",
+            &limited_mp4(
+                b"hev1",
+                1920,
+                1080,
+                30,
+                1,
+                None,
+                Some(153),
+                Some(8_000_000),
+                8,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&hev).skip.as_deref(),
+            Some("HEVC (hev1) isn't supported by the TV")
+        );
+        // A stub sample entry has no size, rate, or level, so it still loads.
+        let stub = scratch("stub.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
+        let stub = decide_cast_video(&stub);
+        assert!(stub.skip.is_none(), "{:?}", stub.skip);
+        assert!(stub.derived.is_none());
+    }
+
+    #[test]
+    fn unreadable_videos_are_skipped_as_unverifiable() {
+        let log = LogDir::new();
+        let mkv = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        assert_eq!(
+            decide_cast_video(&mkv).skip.as_deref(),
+            Some("can't verify this video for the TV (MKV)")
+        );
+        let webm = scratch("clip.webm", b"\x1a\x45\xdf\xa3");
+        assert_eq!(
+            decide_cast_video(&webm).skip.as_deref(),
+            Some("can't verify this video for the TV (WEBM)")
+        );
+        let avi = scratch("clip.avi", b"RIFF");
+        assert_eq!(
+            decide_cast_video(&avi).skip.as_deref(),
+            Some("can't verify this video for the TV (AVI)")
+        );
+        // moov is complete, then a trailing box claims more bytes than remain.
+        let mut cut = h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000));
+        let mut trailer = 50u32.to_be_bytes().to_vec();
+        trailer.extend_from_slice(b"free");
+        trailer.extend_from_slice(&[0u8; 8]);
+        cut.extend_from_slice(&trailer);
+        let truncated = scratch("cut.mp4", &cut);
+        assert_eq!(
+            decide_cast_video(&truncated).skip.as_deref(),
+            Some("can't verify this video for the TV (MP4)")
+        );
+        let missing = truncated.with_file_name("missing-video.mp4");
+        assert_eq!(
+            decide_cast_video(&missing).skip.as_deref(),
+            Some("can't verify this video for the TV (MP4)")
+        );
+        let written = log.text();
+        assert!(
+            written.contains("skip reason=unverifiable container=MKV"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=unverifiable container=WEBM"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=unverifiable container=AVI"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=unverifiable container=MP4"),
+            "{written}"
+        );
+        let mov = scratch(
+            "ok.mov",
+            &h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000)),
+        );
+        assert!(decide_cast_video(&mov).skip.is_none(), "a readable MOV still loads");
+    }
+
+    #[test]
+    fn unverifiable_containers_reach_the_cast_check() {
+        let log = LogDir::new();
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let mkv = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        let webm = scratch("clip.webm", b"\x1a\x45\xdf\xa3");
+        let mut cut = h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000));
+        // moov is the last box. Cutting the tail makes that box extend past EOF,
+        // so classify never sees the sample entries.
+        cut.truncate(cut.len().saturating_sub(32));
+        let truncated = scratch("cut.mp4", &cut);
+        let after = scratch("two.jpg", &jpeg_bytes());
+        let no_aac = scratch("na.mp4", &mp4_with(&[b"avc1"]));
+        assert!(classify_playlist_file(&mkv).is_err());
+        assert!(classify_playlist_file(&webm).is_err());
+        assert!(classify_playlist_file(&truncated).is_err());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        let update = http
+            .set_playlist(&[
+                photo,
+                mkv.clone(),
+                webm.clone(),
+                truncated.clone(),
+                after,
+                no_aac,
+            ])
+            .unwrap();
+        assert_eq!(update.registered, 5, "{:?}", update.skipped);
+        assert_eq!(update.skipped.len(), 1, "{:?}", update.skipped);
+        assert!(
+            update.skipped[0].contains("Unsupported media"),
+            "{:?}",
+            update.skipped
+        );
+        let (succ, note) = http.next_castable(1);
+        let succ = succ.expect("the photo after the unverifiable videos");
+        assert_eq!(succ.item, 5);
+        assert_eq!(succ.media_type, "photo");
+        let note = note.expect("skip notes");
+        assert!(note.contains("can't verify this video for the TV (MKV)"), "{note}");
+        assert!(note.contains("can't verify this video for the TV (WEBM)"), "{note}");
+        assert!(note.contains("can't verify this video for the TV (MP4)"), "{note}");
+        assert!(!note.contains("Unsupported media"), "{note}");
+        let written = log.text();
+        assert!(written.contains("skip reason=unverifiable container=MKV"), "{written}");
+        assert!(written.contains("skip reason=unverifiable container=WEBM"), "{written}");
+        assert!(written.contains("skip reason=unverifiable container=MP4"), "{written}");
+        assert!(written.contains("video_skipped item=2 reasons=can't verify this video for the TV (MKV)"), "{written}");
+        assert!(written.contains("video_skipped item=3 reasons=can't verify this video for the TV (WEBM)"), "{written}");
+        assert!(written.contains("video_skipped item=4 reasons=can't verify this video for the TV (MP4)"), "{written}");
+    }
+
+    #[test]
+    fn fragmented_mp4_with_empty_timing_is_unverifiable() {
+        let log = LogDir::new();
+        let empty = scratch(
+            "frag.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                0,
+                &[],
+                Some(40),
+                None,
+                Some(8_000_000),
+                8,
+                true,
+            ),
+        );
+        assert_eq!(
+            decide_cast_video(&empty).skip.as_deref(),
+            Some("can't verify this video for the TV (MP4)")
+        );
+        let written = log.text();
+        assert!(
+            written.contains("skip reason=unverifiable container=MP4"),
+            "{written}"
+        );
+        // mvex/moof with a real stts is still measured from those samples.
+        let timed = scratch(
+            "frag-timed.mp4",
+            &limited_mp4_entries(
+                b"avc1",
+                1920,
+                1080,
+                30,
+                &[(1, 1)],
+                Some(40),
+                None,
+                Some(8_000_000),
+                8,
+                true,
+            ),
+        );
+        let timed = decide_cast_video(&timed);
+        assert!(timed.skip.is_none(), "{:?}", timed.skip);
+    }
+
+    #[test]
+    fn auto_advance_skips_an_unsupported_video_and_logs_it() {
+        let log = LogDir::new();
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let bad = scratch(
+            "skip-me.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(60), Some(8_000_000)),
+        );
+        let next = scratch("three.jpg", &jpeg_bytes());
+        let derived = scratch(
+            "derived.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(0), Some(8_000_000)),
+        );
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[photo, bad, next.clone(), derived])
+            .unwrap();
+        let started = Instant::now();
+        let (succ, skipped) = http.next_castable(1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a skipped video must not wait out the load deadline: {:?}",
+            started.elapsed()
+        );
+        let succ = succ.expect("the photo after the bad video");
+        assert_eq!(succ.item, 3);
+        assert_eq!(succ.media_type, "photo");
+        assert_eq!(
+            skipped.as_deref(),
+            Some("H.264 level 6.0 may not play on this TV")
+        );
+        let written = log.text();
+        assert!(written.contains("video_skipped"), "{written}");
+        assert!(written.contains("item=2"), "{written}");
+        assert!(
+            written.contains("reasons=H.264 level 6.0 may not play on this TV"),
+            "{written}"
+        );
+        let (play, none) = http.next_castable(3);
+        let play = play.expect("derived 4.0 video");
+        assert_eq!(play.item, 4);
+        assert_eq!(play.media_type, "video");
+        assert!(none.is_none());
+        let written = log.text();
+        assert!(written.contains("level_derived=4.0"), "{written}");
+    }
+
+    fn drive_load(
+        name: &str,
+        bytes: &[u8],
+    ) -> (LogDir, FakeTv, Result<(), String>, CastLiveStatus) {
+        let log = LogDir::new();
+        let path = scratch(name, bytes);
+        let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(std::slice::from_ref(&path)).unwrap();
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let status = Mutex::new(CastLiveStatus {
+            connected: true,
+            player_state: "idle".into(),
+            remote_event: None,
+            error: None,
+            media_kind: String::new(),
+            http_port: http.port,
+            bind_ip: http.bind_ip.to_string(),
+            item_index: 0,
+        });
+        let (_remote, mut flags) = session_after_load("still");
+        flags.media_kind.clear();
+        flags.media_session = None;
+        flags.player_state = "idle".into();
+        flags.item_index = 0;
+        let mut running = true;
+        let (tx, rx) = mpsc::channel();
+        let kept = handle_cmd(
+            CastCmd::Load {
+                path,
+                autoplay: true,
+                origin: CastOrigin::User,
+                duration_ms: None,
+                reply: tx,
+            },
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+        );
+        assert!(kept);
+        let result = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let live = status.lock().unwrap().clone();
+        // Keep the link up until the reply is in hand. Drop order is the
+        // return tuple, then these locals.
+        let _ = link;
+        let _ = http;
+        (log, fake, result, live)
+    }
+
+    #[test]
+    fn level_5_2_load_is_sent() {
+        let (log, fake, result, live) = drive_load(
+            "level52.mp4",
+            &h264_clip(2160, 2160, 60, 1, Some(52), Some(8_000_000)),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert_eq!(live.media_kind, "video");
+        let text = fake.trace_text();
+        assert!(
+            text.lines().any(|line| line.starts_with("load ")),
+            "level 5.2 is loaded: {text}"
+        );
+        let written = log.text();
+        assert!(!written.contains("video_skipped"), "{written}");
+        assert!(!written.contains("level_derived="), "{written}");
+    }
+
+    #[test]
+    fn level_above_5_2_load_sends_no_load_and_logs_video_skipped() {
+        let (log, fake, result, live) = drive_load(
+            "no-load.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
+        );
+        let err = result.expect_err("a level above 5.2 is not loaded");
+        assert_eq!(err, "H.264 level 5.3 may not play on this TV");
+        assert!(live.connected);
+        assert_eq!(live.error.as_deref(), Some(err.as_str()));
+        let text = fake.trace_text();
+        assert!(
+            !text.lines().any(|line| line.starts_with("load ")),
+            "no LOAD is sent: {text}"
+        );
+        let written = log.text();
+        assert!(written.contains("video_skipped"), "{written}");
+        assert!(
+            written.contains("item=1 reasons=H.264 level 5.3 may not play on this TV"),
+            "{written}"
+        );
+        assert!(!written.contains("level_derived="), "{written}");
+    }
+
+    #[test]
+    fn video_skipped_log_keeps_the_bitrate_limit() {
+        let (log, _fake, result, _live) = drive_load(
+            "over-rate.mp4",
+            &h264_clip(2560, 2560, 90, 1, Some(51), Some(245_000_000)),
+        );
+        let err = result.expect_err("over the frame rate, size, and bitrate");
+        assert_eq!(
+            err,
+            "90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"
+        );
+        let written = log.text();
+        assert!(
+            written.contains(
+                "video_skipped item=1 reasons=90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"
+            ),
+            "{written}"
+        );
+        assert!(!written.contains("video_skipped redacted"), "{written}");
+        assert_eq!(
+            sanitize_cast_log_detail(r"item=1 reasons=C:\slides\secret.mp4 245 Mbit/s"),
+            "redacted"
+        );
+        assert_eq!(
+            sanitize_cast_log_detail("item=1 reasons=/tmp/secret.mp4 20 Mbit/s"),
+            "redacted"
+        );
+        assert_eq!(
+            sanitize_cast_log_detail("item=1 reasons=/m/tokensecret/ab 20 Mbit/s"),
+            "redacted"
+        );
+    }
+
+    #[test]
+    fn derived_level_4_0_still_loads_and_logs_level_derived() {
+        let (log, fake, result, live) = drive_load(
+            "derived-load.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(0), Some(8_000_000)),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert_eq!(live.media_kind, "video");
+        let text = fake.trace_text();
+        assert!(
+            text.lines().any(|line| line.starts_with("load ")),
+            "a derived 4.0 file is loaded: {text}"
+        );
+        let written = log.text();
+        assert!(written.contains("level_derived=4.0"), "{written}");
+        assert!(written.contains("item=1"), "{written}");
+        assert!(!written.contains("video_skipped"), "{written}");
     }
 
     #[test]
@@ -5550,6 +7434,12 @@ mod tests {
         assert!(!joined.contains("-Command"));
         assert!(joined.contains("-ExecutionPolicy Bypass -File"));
         assert_eq!(parse_firewall_script_output("status=match").state, "added");
+        assert_eq!(parse_firewall_script_output("status=present").state, "added");
+        assert!(
+            !parse_firewall_script_output("status=present")
+                .detail
+                .contains("No Private inbound rule")
+        );
         assert_eq!(
             parse_firewall_script_output("status=partial").state,
             "partial"
@@ -5734,7 +7624,9 @@ mod tests {
         /// Unsolicited MEDIA_STATUS frames sent after the LOAD reply (requestId 0).
         follow_states: &'static [&'static str],
         /// After the Nth successful LOAD (1-based), send IDLE with this idleReason.
-        /// Session 0 means the loaded session (7). A non-matching id is a stale item.
+        /// Session 0 means the mediaSessionId assigned to that LOAD. The first
+        /// LOAD is 7 and each later LOAD gets the next id. A non-zero id is
+        /// sent as given, including a stale item.
         idle_after: &'static [(u32, &'static str, i32)],
         /// When non-zero, `idle_after` waits this long after the LOAD instead of
         /// being sent inside the LOAD handler. Zero keeps the immediate send.
@@ -5745,6 +7637,12 @@ mod tests {
         still: bool,
         /// PLAY is left unanswered. PAUSE still gets a status.
         silence_play: bool,
+        /// SEEK is left unanswered.
+        silence_seek: bool,
+        /// LOAD is answered only with ERROR and no requestId.
+        load_bare_error: bool,
+        /// A media command is first sent ERROR with no requestId, then its real reply.
+        media_bare_error: bool,
         /// PLAY is answered with this type instead of MEDIA_STATUS.
         /// `ERROR` is a raw reply with no detailedErrorCode.
         play_reply: Option<&'static str>,
@@ -5761,6 +7659,9 @@ mod tests {
                 idle_delay: Duration::ZERO,
                 still: false,
                 silence_play: false,
+                silence_seek: false,
+                load_bare_error: false,
+                media_bare_error: false,
                 play_reply: None,
             }
         }
@@ -5978,6 +7879,7 @@ mod tests {
         let mut awaiting_pong = false;
         let mut launch_id = 0u32;
         let mut loads = 0u32;
+        let mut next_media_session: i32 = 7;
         let mut due: Vec<DueIdle> = Vec::new();
         let mut image_session = false;
         while !stop.load(Ordering::SeqCst) {
@@ -6056,6 +7958,8 @@ mod tests {
                     continue;
                 }
                 loads += 1;
+                let media_session = next_media_session;
+                next_media_session = next_media_session.saturating_add(1);
                 let content_id = value
                     .pointer("/media/contentId")
                     .and_then(|v| v.as_str())
@@ -6084,6 +7988,18 @@ mod tests {
                         "autoplay=false"
                     },
                 );
+                if script.load_bare_error {
+                    // detailedErrorCode is what rust_cast needs to parse ERROR.
+                    // The parsed error still has no requestId.
+                    note_trace(traces, "bare-error");
+                    fake_send(
+                        mm,
+                        NS_MEDIA,
+                        "transport-1",
+                        r#"{"type":"ERROR","detailedErrorCode":104}"#,
+                    );
+                    continue;
+                }
                 if script.load_failed {
                     let body = serde_json::json!({
                         "requestId": id,
@@ -6095,12 +8011,14 @@ mod tests {
                 }
                 if script.still {
                     // requestId 0, and a different mediaSessionId, must not satisfy LOAD.
+                    // A still has no playback timeline. The receiver answers BUFFERING,
+                    // then PAUSED. That PAUSED is not a pause command.
                     note_trace(traces, "media-status requestId=0");
                     send_media_status(mm, 0, 1, "PAUSED");
                     note_trace(traces, "media-status");
-                    send_media_status(mm, id, 7, "BUFFERING");
+                    send_media_status(mm, id, media_session, "BUFFERING");
                     note_trace(traces, "media-status requestId=0");
-                    send_media_status(mm, 0, 7, "PAUSED");
+                    send_media_status(mm, 0, media_session, "PAUSED");
                     continue;
                 }
                 // requestId 0 is unsolicited. It must not satisfy the LOAD wait.
@@ -6109,15 +8027,15 @@ mod tests {
                 note_trace(traces, "media-status");
                 send_media_status(mm, 999, 1, "PLAYING");
                 note_trace(traces, &format!("media-status requestId={id}"));
-                send_media_status(mm, id, 7, script.load_state);
+                send_media_status(mm, id, media_session, script.load_state);
                 for state in script.follow_states {
-                    send_media_status(mm, 0, 7, state);
+                    send_media_status(mm, 0, media_session, state);
                 }
                 for &(n, reason, session) in script.idle_after {
                     if n != loads {
                         continue;
                     }
-                    let sid = if session == 0 { 7 } else { session };
+                    let sid = if session == 0 { media_session } else { session };
                     if script.idle_delay.is_zero() {
                         note_trace(traces, &format!("idle {reason} session={sid}"));
                         send_media_status_idle(mm, 0, sid, "IDLE", Some(reason));
@@ -6174,6 +8092,19 @@ mod tests {
                 if script.silence_play && typ == "PLAY" {
                     note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
                     continue;
+                }
+                if script.silence_seek && typ == "SEEK" {
+                    note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
+                    continue;
+                }
+                if script.media_bare_error {
+                    note_trace(traces, "bare-error");
+                    fake_send(
+                        mm,
+                        NS_MEDIA,
+                        "transport-1",
+                        r#"{"type":"ERROR","detailedErrorCode":104}"#,
+                    );
                 }
                 if typ == "PLAY" {
                     if let Some(kind) = script.play_reply {
@@ -6291,6 +8222,7 @@ mod tests {
             "os error 110"
         )));
         assert_eq!(LAN_CATEGORY_WAIT, Duration::from_millis(2500));
+        assert_eq!(LAN_CATEGORY_STALE, Duration::from_secs(30));
         assert_eq!(unix_to_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_utc(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(
@@ -6307,7 +8239,8 @@ mod tests {
         let category =
             net_category_from_profile_command(Some("Wi-Fi"), hanging_process_command(), limit);
         let elapsed = started.elapsed();
-        assert_eq!(category, NetCategory::Unknown);
+        assert_eq!(category.value, NetCategory::Unknown);
+        assert!(category.timed_out);
         assert!(
             elapsed < limit + Duration::from_secs(4),
             "hung profile query took {elapsed:?}"
@@ -6315,6 +8248,58 @@ mod tests {
         assert!(
             elapsed + Duration::from_millis(250) >= limit,
             "returned in {elapsed:?} without waiting out the deadline"
+        );
+    }
+
+    #[test]
+    fn lan_category_requeries_after_a_timeout_or_a_stale_value_without_stacking() {
+        let stale = Duration::from_secs(30);
+        assert!(lan_category_needs_query(
+            false,
+            false,
+            false,
+            Duration::ZERO,
+            stale
+        ));
+        assert!(!lan_category_needs_query(
+            true,
+            true,
+            true,
+            Duration::from_secs(60),
+            stale
+        ));
+        assert!(lan_category_needs_query(
+            false,
+            true,
+            true,
+            Duration::from_secs(1),
+            stale
+        ));
+        assert!(!lan_category_needs_query(
+            false,
+            true,
+            false,
+            Duration::from_secs(29),
+            stale
+        ));
+        assert!(lan_category_needs_query(
+            false,
+            true,
+            false,
+            stale,
+            stale
+        ));
+        assert_eq!(
+            lan_category_after_refresh(NetCategory::Private, true, NetCategory::Unknown, true),
+            NetCategory::Private
+        );
+        assert_eq!(
+            lan_category_after_refresh(NetCategory::Unknown, false, NetCategory::Unknown, true),
+            NetCategory::Unknown
+        );
+        assert_eq!(
+            lan_category_after_refresh(NetCategory::Private, true, NetCategory::Public, false),
+            NetCategory::Public
         );
     }
 
@@ -6958,6 +8943,95 @@ mod tests {
     }
 
     #[test]
+    fn error_without_request_id_satisfies_only_the_load_wait() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            load_bare_error: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/clip";
+        let started = Instant::now();
+        let err = link
+            .load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .expect_err("bare ERROR ends the LOAD wait");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "LOAD treated a requestId-less ERROR as silence: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(err, MEDIA_FETCH_MESSAGE);
+        let written = log.text();
+        assert!(written.contains("reply=ERROR"), "{written}");
+        assert!(fake.trace_text().contains("bare-error"), "{}", fake.trace_text());
+
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            media_bare_error: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .unwrap();
+        let started = Instant::now();
+        let state = link.pause(7, CastOrigin::User).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "PAUSE must ignore ERROR with no requestId, waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(state, PlayerState::Paused);
+        let written = log.text();
+        let pause = written
+            .lines()
+            .find(|l| l.contains(" pause "))
+            .unwrap_or_else(|| panic!("{written}"));
+        assert!(pause.contains("reply=PAUSED"), "{pause}");
+        assert!(!pause.contains("error="), "{pause}");
+        assert!(fake.trace_text().contains("bare-error"), "{}", fake.trace_text());
+    }
+
+    #[test]
+    fn unanswered_seek_warns_instead_of_erroring() {
+        let log = LogDir::new();
+        let fake = spawn_fake(FakeScript {
+            silence_seek: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let url = "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/clip";
+        link.load_url(url, "video/mp4", true, CastOrigin::User, 1, "video")
+            .unwrap();
+        let started = Instant::now();
+        let state = link.seek(7, 1.5, CastOrigin::User).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(6),
+            "unanswered SEEK should wait out the media deadline, got {elapsed:?}"
+        );
+        assert_eq!(state, PlayerState::Playing);
+        let written = log.text();
+        let seek = written
+            .lines()
+            .find(|l| l.contains(" seek "))
+            .unwrap_or_else(|| panic!("{written}"));
+        assert!(seek.contains("warning=unanswered"), "{seek}");
+        assert!(!seek.contains("error="), "{seek}");
+        assert!(!written.contains("TV unreachable"), "{written}");
+        assert!(
+            fake.trace_text().contains("SEEK transport-1"),
+            "{}",
+            fake.trace_text()
+        );
+    }
+
+    #[test]
     fn play_error_replies_match_the_request_and_stay_connected() {
         for kind in ["ERROR", "LOAD_FAILED", "INVALID_REQUEST"] {
             let mut cast = Driven::load(
@@ -7300,22 +9374,100 @@ mod tests {
             !written.contains(" disconnect "),
             "clearing an empty session must not log disconnect: {written}"
         );
+        assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
         state.disconnect().unwrap();
+        let written = log.text();
+        assert!(
+            !written.contains(" disconnect "),
+            "a user Disconnect with nothing connected must not log: {written}"
+        );
+        assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn session_ready_timeout_logs_source_timeout_and_sets_status_error() {
+        assert!(CastOrigin::parse("timeout").is_err());
+        assert_eq!(CastOrigin::Timeout.as_str(), "timeout");
+        let log = LogDir::new();
+        let snap = snapshot_ifaces();
+        let iface = snap
+            .bind
+            .clone()
+            .or_else(|| snap.preferred.first().cloned())
+            .expect("a home-LAN address is required to start a cast");
+        let listener = TcpListener::bind((iface.ip, 0)).expect("bind stalling peer");
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            while !stop_t.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        // Keep the TCP session open and never answer TLS.
+                        sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                        let mut buf = [0u8; 1024];
+                        while !stop_t.load(Ordering::SeqCst) {
+                            match sock.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(err)
+                                    if err.kind() == ErrorKind::WouldBlock
+                                        || err.kind() == ErrorKind::TimedOut => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let state = CastState::default();
+        let started = Instant::now();
+        let err = state
+            .connect_wait(
+                &iface.ip.to_string(),
+                Some(port),
+                None,
+                Duration::from_millis(400),
+            )
+            .expect_err("a peer that accepts and stays silent must time out");
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            elapsed >= Duration::from_millis(350) && elapsed < Duration::from_secs(6),
+            "ready wait should be ~400ms plus the TLS join, got {elapsed:?}"
+        );
+        // A Public Windows profile replaces the unreachable sentence. GitHub's
+        // runner is Public, so the timeout still has to match that wording.
+        let expected = with_public_network(link_down_message());
+        assert_eq!(err, expected);
+        assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
         let written = log.text();
         let lines: Vec<_> = written
             .lines()
             .filter(|l| l.contains(" disconnect "))
             .collect();
         assert_eq!(lines.len(), 1, "{written}");
-        assert!(lines[0].contains("source=user"), "{}", lines[0]);
-        assert!(lines[0].contains("error=not connected"), "{}", lines[0]);
+        assert!(lines[0].contains("source=timeout"), "{}", lines[0]);
+        assert!(!lines[0].contains("source=user"), "{}", lines[0]);
+        state.disconnect().unwrap();
+        let after = log.text();
+        let lines: Vec<_> = after
+            .lines()
+            .filter(|l| l.contains(" disconnect "))
+            .collect();
+        assert_eq!(lines.len(), 1, "{after}");
     }
 
     #[test]
     fn finished_video_loads_the_next_photo_with_no_user_input() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
-            idle_after: &[(2, "FINISHED", 7)],
+            idle_after: &[(2, "FINISHED", 0)],
             ..FakeScript::default()
         });
         let (ip, port) = fake.host_port();
@@ -7372,7 +9524,7 @@ mod tests {
             "load transport-1 item=video-2",
             "load transport-1 item=photo-3",
         ], "{text}");
-        let idle_at = text.find("idle FINISHED session=7").expect(&text);
+        let idle_at = text.find("idle FINISHED session=8").expect(&text);
         let third_at = text.rfind("item=photo-3").expect(&text);
         assert!(idle_at < third_at, "{text}");
         assert!(!text.contains("PAUSE") && !text.contains("STOP"), "{text}");
@@ -7381,7 +9533,7 @@ mod tests {
             .lines()
             .find(|l| l.contains(" advance "))
             .expect(&written);
-        assert!(advance.contains("source=remote"), "{advance}");
+        assert!(advance.contains("source=tv_finished"), "{advance}");
         assert!(!advance.contains('/') && !advance.contains('\\'), "{advance}");
         let remote_loads: Vec<_> = written
             .lines()
@@ -7400,6 +9552,62 @@ mod tests {
         );
         assert!(written.contains("item=1 type=photo"), "{written}");
         assert!(written.contains("item=2 type=video"), "{written}");
+    }
+
+    #[test]
+    fn dur_fallback_is_written_to_the_cast_log() {
+        let log = LogDir::new();
+        log_dur_fallback(999, 3000);
+        log_dur_fallback(3500, 3000);
+        log_dur_fallback(25000, 20000);
+        let written = log.text();
+        assert!(written.contains("dur_fallback from=999 to=3000"), "{written}");
+        assert!(written.contains("dur_fallback from=3500 to=3000"), "{written}");
+        assert!(
+            written.contains("dur_fallback from=25000 to=20000"),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_successful_load_clears_the_skip_note() {
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let (_remote, mut flags) = session_after_load("video");
+        flags.item_index = 1;
+        flags.media_session = Some(7);
+        flags.error = Some("90 fps isn't supported by the TV".into());
+        let skip = Some("90 fps isn't supported by the TV".to_string());
+        let did = apply_successor(
+            &link,
+            &mut flags,
+            Ok(Successor {
+                url: "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/photo-3"
+                    .into(),
+                content_type: "image/jpeg".into(),
+                item: 3,
+                media_type: "photo",
+            }),
+        )
+        .unwrap();
+        assert!(did);
+        apply_skip_note(&mut flags, did, skip.clone());
+        assert!(
+            flags.error.is_none(),
+            "a sent LOAD must clear the skip note: {:?}",
+            flags.error
+        );
+
+        flags.error = Some("90 fps isn't supported by the TV".into());
+        let did = apply_successor(&link, &mut flags, Err("nothing castable")).unwrap();
+        assert!(!did);
+        apply_skip_note(&mut flags, did, skip);
+        assert_eq!(
+            flags.error.as_deref(),
+            Some("90 fps isn't supported by the TV")
+        );
     }
 
     #[test]
@@ -7714,7 +9922,7 @@ mod tests {
     fn paused_slideshow_does_not_advance_on_photo_or_video_finished() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
-            idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 7)],
+            idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 0)],
             ..FakeScript::default()
         });
         let (ip, port) = fake.host_port();
