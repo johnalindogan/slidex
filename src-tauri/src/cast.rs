@@ -4368,9 +4368,10 @@ struct SessionFlags {
 }
 
 impl SessionFlags {
-    /// Still images ignore `playerState`. The Default Media Receiver reports
-    /// PAUSED for every photo, which is not a remote pause. A remote pause is
-    /// a video going from PLAYING to PAUSED.
+    /// Still images ignore `playerState`. The Default Media Receiver has no
+    /// playback timeline for a still, so it reports PAUSED for every photo
+    /// (often BUFFERING, then PAUSED). That is not a pause command and not a
+    /// failed load. A remote pause is a video going from PLAYING to PAUSED.
     fn note_state(&mut self, state: PlayerState, from_local: bool) {
         if self.media_kind == "still" && !from_local {
             return;
@@ -5270,9 +5271,11 @@ fn handle_cmd(
                     .media_session
                     .ok_or_else(|| "Nothing is casting.".to_string())?;
                 if flags.media_kind == "still" {
-                    // The receiver reports a still as PAUSED or BUFFERING and
-                    // does not answer PAUSE. Waiting out the media deadline
-                    // makes the panel say the TV never loaded the photo.
+                    // A still has no playback timeline. The receiver reports
+                    // PAUSED or BUFFERING and does not answer PAUSE. That is
+                    // normal, not a pause command and not a failed load.
+                    // Waiting out the media deadline makes the panel say the
+                    // TV never loaded the photo.
                     let _ = (sid, origin);
                     flags.player_state = "paused".into();
                     flags.slideshow_playing = false;
@@ -7183,7 +7186,9 @@ mod tests {
         /// Unsolicited MEDIA_STATUS frames sent after the LOAD reply (requestId 0).
         follow_states: &'static [&'static str],
         /// After the Nth successful LOAD (1-based), send IDLE with this idleReason.
-        /// Session 0 means the loaded session (7). A non-matching id is a stale item.
+        /// Session 0 means the mediaSessionId assigned to that LOAD. The first
+        /// LOAD is 7 and each later LOAD gets the next id. A non-zero id is
+        /// sent as given, including a stale item.
         idle_after: &'static [(u32, &'static str, i32)],
         /// When non-zero, `idle_after` waits this long after the LOAD instead of
         /// being sent inside the LOAD handler. Zero keeps the immediate send.
@@ -7436,6 +7441,7 @@ mod tests {
         let mut awaiting_pong = false;
         let mut launch_id = 0u32;
         let mut loads = 0u32;
+        let mut next_media_session: i32 = 7;
         let mut due: Vec<DueIdle> = Vec::new();
         let mut image_session = false;
         while !stop.load(Ordering::SeqCst) {
@@ -7514,6 +7520,8 @@ mod tests {
                     continue;
                 }
                 loads += 1;
+                let media_session = next_media_session;
+                next_media_session = next_media_session.saturating_add(1);
                 let content_id = value
                     .pointer("/media/contentId")
                     .and_then(|v| v.as_str())
@@ -7565,12 +7573,14 @@ mod tests {
                 }
                 if script.still {
                     // requestId 0, and a different mediaSessionId, must not satisfy LOAD.
+                    // A still has no playback timeline. The receiver answers BUFFERING,
+                    // then PAUSED. That PAUSED is not a pause command.
                     note_trace(traces, "media-status requestId=0");
                     send_media_status(mm, 0, 1, "PAUSED");
                     note_trace(traces, "media-status");
-                    send_media_status(mm, id, 7, "BUFFERING");
+                    send_media_status(mm, id, media_session, "BUFFERING");
                     note_trace(traces, "media-status requestId=0");
-                    send_media_status(mm, 0, 7, "PAUSED");
+                    send_media_status(mm, 0, media_session, "PAUSED");
                     continue;
                 }
                 // requestId 0 is unsolicited. It must not satisfy the LOAD wait.
@@ -7579,15 +7589,15 @@ mod tests {
                 note_trace(traces, "media-status");
                 send_media_status(mm, 999, 1, "PLAYING");
                 note_trace(traces, &format!("media-status requestId={id}"));
-                send_media_status(mm, id, 7, script.load_state);
+                send_media_status(mm, id, media_session, script.load_state);
                 for state in script.follow_states {
-                    send_media_status(mm, 0, 7, state);
+                    send_media_status(mm, 0, media_session, state);
                 }
                 for &(n, reason, session) in script.idle_after {
                     if n != loads {
                         continue;
                     }
-                    let sid = if session == 0 { 7 } else { session };
+                    let sid = if session == 0 { media_session } else { session };
                     if script.idle_delay.is_zero() {
                         note_trace(traces, &format!("idle {reason} session={sid}"));
                         send_media_status_idle(mm, 0, sid, "IDLE", Some(reason));
@@ -9016,7 +9026,7 @@ mod tests {
     fn finished_video_loads_the_next_photo_with_no_user_input() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
-            idle_after: &[(2, "FINISHED", 7)],
+            idle_after: &[(2, "FINISHED", 0)],
             ..FakeScript::default()
         });
         let (ip, port) = fake.host_port();
@@ -9073,7 +9083,7 @@ mod tests {
             "load transport-1 item=video-2",
             "load transport-1 item=photo-3",
         ], "{text}");
-        let idle_at = text.find("idle FINISHED session=7").expect(&text);
+        let idle_at = text.find("idle FINISHED session=8").expect(&text);
         let third_at = text.rfind("item=photo-3").expect(&text);
         assert!(idle_at < third_at, "{text}");
         assert!(!text.contains("PAUSE") && !text.contains("STOP"), "{text}");
@@ -9415,7 +9425,7 @@ mod tests {
     fn paused_slideshow_does_not_advance_on_photo_or_video_finished() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
-            idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 7)],
+            idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 0)],
             ..FakeScript::default()
         });
         let (ip, port) = fake.host_port();

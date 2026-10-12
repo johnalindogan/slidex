@@ -62,6 +62,8 @@ Each step is appended to `%LOCALAPPDATA%\com.johnalindogan.slideshowpro\logs\cas
 
 The TV follows the PC order, including reverse playback, and the PC slide timer. Controls are sent on the Cast channel; the idle read is 350 ms, so a healthy LAN should land play, pause, next, and previous within a second. A TV-remote pause or play comes back as `remote_event` and the PC player follows it.
 
+A photo reload is answered `PAUSED`. The Default Media Receiver has no playback timeline for a still, so the status is often `BUFFERING` and then `PAUSED`. That is normal receiver behavior for a still image. It is not a pause command and not a failed load, and SlideX does not treat it as a remote pause. Each `LOAD` gets a new `mediaSessionId`.
+
 If the TV is off or Wi-Fi drops, the session reports after about 15 seconds of silence (the panel polls at 400 ms):
 
 > TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.
