@@ -1,6 +1,6 @@
 {
   "name": "slideshowpro",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "private": true,
   "description": "Thin Tauri Windows wrapper + Android TV WebView shell for SlideX",
   "scripts": {

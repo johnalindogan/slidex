@@ -162,6 +162,87 @@ test('legacy SlideX and SlideShowX playlist JSON loads', () => {
   assert.throws(() => C.normalizePlaylist({ name: 'nope' }));
 });
 
+test('session restore counts one file missing from disk and ignores entries with no path', () => {
+  const items = [
+    { type: 'folder', name: 'F' },
+    { id: 'a', type: 'image', name: 'here.jpg', path: 'D:\\here.jpg' },
+    { id: 'b', type: 'image', name: 'gone.jpg', path: '\\\\AX03\\share\\gone.jpg' },
+    { id: 'c', type: 'image', name: 'nopath.jpg' }
+  ];
+  const plan = C.planSessionRestore(items, (p) => p === 'D:\\here.jpg');
+  assert.equal(plan.missing, 1);
+  assert.equal(C.missingFilesNotice(plan.missing), "1 file couldn't be found");
+  assert.equal(plan.items.length, 4);
+  assert.equal(plan.items[1].missing, false);
+  assert.equal(plan.items[2].missing, true);
+  assert.equal(plan.items[2].unavailable, true);
+  assert.equal(plan.items[2].path, '\\\\AX03\\share\\gone.jpg');
+  assert.ok(!plan.items[3].missing);
+  assert.equal(items[2].missing, undefined);
+});
+
+test('session restore counts every file missing from disk', () => {
+  const items = [
+    { id: 'a', type: 'image', name: 'a.jpg', path: '\\\\AX03\\share\\a.jpg' },
+    { id: 'b', type: 'video', name: 'b.mp4', path: '\\\\AX03\\share\\b.mp4' }
+  ];
+  const plan = C.planSessionRestore(items, () => false);
+  assert.equal(plan.missing, 2);
+  assert.equal(C.missingFilesNotice(plan.missing), "2 files couldn't be found");
+  assert.equal(plan.items.length, 2);
+  assert.equal(plan.items[0].missing, true);
+  assert.equal(plan.items[1].missing, true);
+});
+
+test('a 0.1.8 session with \\\\?\\ paths is fully present and the saved strings stay', () => {
+  const session = {
+    sspVersion: 1,
+    savedAt: 1710000000000,
+    items: [
+      {
+        id: 'a',
+        type: 'image',
+        name: 'lake.jpg',
+        path: '\\\\?\\C:\\Users\\qa\\Pictures\\lake.jpg',
+        imageUpdates: { customDur: 10000 }
+      },
+      {
+        id: 'b',
+        type: 'image',
+        name: 'dock.jpg',
+        path: '\\\\?\\UNC\\AX03\\photos\\dock.jpg',
+        imageUpdates: { customDur: 8000 }
+      }
+    ]
+  };
+  const plan = C.planSessionRestore(session.items, () => true);
+  assert.equal(plan.missing, 0);
+  assert.equal(C.missingFilesNotice(plan.missing), '');
+  assert.equal(plan.items[0].missing, false);
+  assert.equal(plan.items[0].unavailable, undefined);
+  assert.equal(plan.items[0].path, '\\\\?\\C:\\Users\\qa\\Pictures\\lake.jpg');
+  assert.equal(plan.items[1].path, '\\\\?\\UNC\\AX03\\photos\\dock.jpg');
+  assert.equal(plan.items[1].imageUpdates.customDur, 8000);
+  const doc = C.buildPlaylistDocument({ items: plan.items, savedAt: session.savedAt });
+  assert.equal(doc.items.length, 2);
+  assert.equal(doc.items[0].path, session.items[0].path);
+  assert.equal(doc.items[1].path, session.items[1].path);
+});
+
+test('session restore keeps missing entries so the next save still has their paths', () => {
+  const items = [
+    { id: 'keep', type: 'image', name: 'keep.jpg', path: 'D:\\keep.jpg', imageUpdates: { customDur: 4000 } },
+    { id: 'gone', type: 'image', name: 'gone.jpg', path: '\\\\AX03\\share\\gone.jpg', imageUpdates: { customDur: 8000 } }
+  ];
+  const plan = C.planSessionRestore(items, (p) => p === 'D:\\keep.jpg');
+  const doc = C.buildPlaylistDocument({ items: plan.items, savedAt: 1 });
+  assert.equal(doc.items.length, 2);
+  assert.equal(doc.items[0].path, 'D:\\keep.jpg');
+  assert.equal(doc.items[1].path, '\\\\AX03\\share\\gone.jpg');
+  assert.equal(plan.items[1].imageUpdates.customDur, 8000);
+  assert.equal(items[1].path, '\\\\AX03\\share\\gone.jpg');
+});
+
 test('missing items are marked and skipped without dropping the playlist', () => {
   const items = [
     { type: 'folder', name: 'F' },
@@ -400,17 +481,17 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
-test('0.1.8 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.9 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.8');
-  assert.equal(tauri.version, '0.1.8');
+  assert.equal(pkg.version, '0.1.9');
+  assert.equal(tauri.version, '0.1.9');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.8"/m);
-  assert.match(lock, /"version": "0\.1\.8"/);
+  assert.match(cargo, /^version = "0\.1\.9"/m);
+  assert.match(lock, /"version": "0\.1\.9"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -810,9 +891,145 @@ test('HTML and JS have no bare confirm() and the four prompts await a dialog', (
   const locate = html.slice(html.indexOf('async function locateMissingFolder'), html.indexOf('function bindFramingExtras'));
   assert.match(locate, /await sspConfirm\(/);
   assert.ok(locate.indexOf('await sspConfirm') < locate.indexOf('register_allowed_paths'));
+  assert.ok(locate.indexOf('items[idx] = hit') < locate.indexOf('autoSave()'));
+  assert.ok(locate.indexOf('autoSave()') < locate.lastIndexOf('showToast'));
   const caps = fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8');
   assert.match(caps, /dialog:allow-ask/);
   assert.match(caps, /dialog:allow-confirm/);
   assert.match(html, /missingFilesNotice/);
+  assert.match(html, /planSessionRestore/);
+  assert.match(html, /async function restoreTauriSession/);
   assert.match(html, /toggleTimer/);
+});
+
+test('the Cast panel can copy the Cast log path', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /id="castLog"/);
+  assert.match(html, /Copy Cast log path/);
+  assert.match(html, /cast_log_path/);
+  const caps = fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8');
+  assert.match(caps, /allow-cast-log-path/);
+  const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  assert.match(perms, /allow-cast-log-path/);
+  assert.match(perms, /cast_log_path/);
+});
+
+test('a cast ignores local video events and tags the command source', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /window\.__sspCastActive/);
+  assert.match(html, /window\.__sspCastGen/);
+  assert.match(html, /stopImmediatePropagation/);
+  assert.match(html, /function sspCastHook\(name, source\)/);
+  assert.match(html, /goTo\(nextMI\(\), 'timer'\)/);
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.match(sched, /if \(!playing \|\| isV\(cur\)\) return/);
+  assert.match(html, /ev === "finished"/);
+  assert.match(html, /else if \(ev === "finished" && sspCastPlaying\(\)\)/);
+  assert.match(html, /loaded > 0 && loaded - 1 !== cur\) goTo\(loaded - 1, 'remote'\)/);
+  assert.doesNotMatch(html, /__sspCastMoved/);
+  assert.match(html, /ev === "load_failed"/);
+  const failed = html.slice(html.indexOf('ev === "load_failed"'), html.indexOf('ev === "paused"'));
+  assert.doesNotMatch(failed, /goTo\(/);
+  const finished = html.slice(html.indexOf('ev === "finished"'), html.indexOf('if (!field(st, "connected"))'));
+  assert.match(finished, /sspCastPlaying\(\)/);
+  assert.match(finished, /__sspCastEcho = true/);
+  assert.doesNotMatch(finished, /__sspCastMoved/);
+  assert.match(finished, /loaded - 1 !== cur/);
+  assert.match(finished, /goTo\(loaded - 1, 'remote'\)/);
+  assert.match(finished, /item_index/);
+  assert.match(html, /sspCastHook\('transport', window\.__sspCastEcho \? 'remote' : 'user'\)/);
+  assert.match(html, /sspCastHook\('slide', source \|\| 'user'\)/);
+  assert.match(html, /source: src/);
+  const play = html.slice(html.indexOf('async function playCurVid'), html.indexOf('function showSlide'));
+  assert.match(play, /if \(window\.__sspCastActive\) return/);
+  const ended = html.slice(html.indexOf('med.onended'), html.indexOf('return sl;'));
+  assert.match(ended, /if \(window\.__sspCastActive\) return/);
+  const disc = html.slice(html.indexOf('castDisconnect'), html.indexOf('setInterval(watchNetwork'));
+  assert.match(disc, /stopLocalCast\(\)/);
+  assert.match(disc, /cast_disconnect/);
+});
+
+test('the TV unreachable banner comes only from cast_status', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  const sync = html.slice(html.indexOf('function syncTransport'), html.indexOf('function poll'));
+  const poll = html.slice(html.indexOf('if (!field(st, "connected"))'), html.indexOf('window.__sspCast = {'));
+  assert.doesNotMatch(load, /stopLocalCast/);
+  assert.doesNotMatch(load, /unreachable/);
+  assert.doesNotMatch(sync, /stopLocalCast/);
+  assert.doesNotMatch(sync, /unreachable/);
+  assert.match(poll, /if \(!field\(st, "connected"\)\)/);
+  assert.match(poll, /stopLocalCast\(\)/);
+  assert.match(poll, /TV unreachable/);
+});
+
+test('a photo timer then a video FINISHED leaves cur on item 3', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const goToSrc = html.slice(html.indexOf('function goTo('), html.indexOf('function updPlayBtn'));
+  const finishedSrc = html.slice(
+    html.indexOf('else if (ev === "finished" && sspCastPlaying())'),
+    html.indexOf('if (!field(st, "connected"))')
+  );
+  const sandbox = {
+    console,
+    clearTimeout,
+    clearInterval,
+    setTimeout,
+    cancelAnimationFrame() {},
+    cur: 0,
+    playing: true,
+    tmr: null,
+    ptmr: null,
+    kbId: null,
+    compKbId: null,
+    kbManualHold: false,
+    transitionType: 'none',
+    sls: [],
+    stage: { classList: { remove() {} } },
+    getMediaItems() {
+      return [
+        { name: 'one.jpg', path: '/p/one.jpg' },
+        { name: 'two.mp4', path: '/p/two.mp4' },
+        { name: 'three.jpg', path: '/p/three.jpg' },
+      ];
+    },
+    isV(i) { return i === 1; },
+    remountStageWindow() {},
+    getSl() { return null; },
+    sspCastHook() {},
+    applySlideSettings() {},
+    scrollStripTo() {},
+    updStripActive() {},
+    g() { return { textContent: '' }; },
+    pauseVids() {},
+    showMaxCompanion() {},
+    staticT() {},
+    startKB() {},
+    startProg() {},
+    schedNext() {},
+    updPlCur() {},
+    scheduleStagePrune() {},
+    notifyPlaylistSync() {},
+    playCurVid() {},
+    startVProg() {},
+    window: { __sspCastActive: true },
+  };
+  vm.runInNewContext(`
+    function field(obj, name) {
+      if (!obj) return undefined;
+      if (obj[name] != null) return obj[name];
+      return undefined;
+    }
+    function sspCastPlaying() { return !!playing; }
+    ${goToSrc}
+    function applyFinished(st) {
+      var ev = field(st, "remote_event");
+      if (false) {}
+      ${finishedSrc}
+    }
+  `, sandbox);
+  sandbox.goTo(1, 'timer');
+  assert.equal(sandbox.cur, 1);
+  sandbox.applyFinished({ remote_event: 'finished', item_index: 3 });
+  assert.equal(sandbox.cur, 2);
 });

@@ -99,14 +99,24 @@ description = "Allow mDNS discovery of Chromecast / Google TV devices on LAN"
 commands.allow = ["cast_discover"]
 
 [[permission]]
-identifier = "allow-cast-load-still"
-description = "Allow casting the spike sample still to Default Media Receiver"
-commands.allow = ["cast_load_still"]
+identifier = "allow-cast-network-fingerprint"
+description = "Allow reading the home-LAN adapter fingerprint so Cast can rescan when it changes"
+commands.allow = ["cast_network_fingerprint"]
 
 [[permission]]
-identifier = "allow-cast-load-video"
-description = "Allow casting the spike sample video to Default Media Receiver"
-commands.allow = ["cast_load_video"]
+identifier = "allow-cast-connect"
+description = "Allow connecting a Cast session to a LAN receiver"
+commands.allow = ["cast_connect"]
+
+[[permission]]
+identifier = "allow-cast-set-playlist"
+description = "Allow registering the open playlist for the Cast media server"
+commands.allow = ["cast_set_playlist"]
+
+[[permission]]
+identifier = "allow-cast-load"
+description = "Allow loading the current playlist item on the Cast receiver"
+commands.allow = ["cast_load"]
 
 [[permission]]
 identifier = "allow-cast-pause"
@@ -119,19 +129,24 @@ description = "Allow resuming active cast media"
 commands.allow = ["cast_play"]
 
 [[permission]]
-identifier = "allow-cast-next"
-description = "Allow swapping still/video on active cast session"
-commands.allow = ["cast_next"]
-
-[[permission]]
 identifier = "allow-cast-disconnect"
 description = "Allow clean cast disconnect and LAN HTTP teardown"
 commands.allow = ["cast_disconnect"]
 
 [[permission]]
-identifier = "allow-cast-session"
-description = "Allow reading active cast session info"
-commands.allow = ["cast_session"]
+identifier = "allow-cast-status"
+description = "Allow reading cast playback status, including TV-remote pause"
+commands.allow = ["cast_status"]
+
+[[permission]]
+identifier = "allow-cast-firewall-status"
+description = "Allow reading whether the Private Cast firewall rules are installed"
+commands.allow = ["cast_firewall_status"]
+
+[[permission]]
+identifier = "allow-cast-log-path"
+description = "Allow copying the path of the size-capped Cast log"
+commands.allow = ["cast_log_path"]
 
 [[permission]]
 identifier = "allow-slidex-save-done"

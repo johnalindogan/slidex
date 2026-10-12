@@ -36,13 +36,16 @@
     "allow-delete-named-playlist",
     "allow-paths-exist",
     "allow-cast-discover",
-    "allow-cast-load-still",
-    "allow-cast-load-video",
+    "allow-cast-network-fingerprint",
+    "allow-cast-connect",
+    "allow-cast-set-playlist",
+    "allow-cast-load",
     "allow-cast-pause",
     "allow-cast-play",
-    "allow-cast-next",
     "allow-cast-disconnect",
-    "allow-cast-session",
+    "allow-cast-status",
+    "allow-cast-firewall-status",
+    "allow-cast-log-path",
     "allow-slidex-save-done"
   ]
 }

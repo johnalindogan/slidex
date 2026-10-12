@@ -10,7 +10,38 @@ fn main() {
         );
     }
 
+    assert_cast_ports(&manifest_dir);
+
     tauri_build::build()
+}
+
+/// `CAST_FW_TCP` in the NSIS template must match `CAST_PORT_LO`/`CAST_PORT_HI`.
+fn assert_cast_ports(manifest_dir: &std::path::Path) {
+    let cast = std::fs::read_to_string(manifest_dir.join("src/cast.rs"))
+        .unwrap_or_else(|e| panic!("read cast.rs: {e}"));
+    let lo = rust_u16_const(&cast, "CAST_PORT_LO");
+    let hi = rust_u16_const(&cast, "CAST_PORT_HI");
+    let nsi = std::fs::read_to_string(manifest_dir.join("windows/installer.nsi"))
+        .unwrap_or_else(|e| panic!("read installer.nsi: {e}"));
+    let expected = format!("!define CAST_FW_TCP \"{lo}-{hi}\"");
+    if !nsi.lines().any(|line| line.trim() == expected) {
+        panic!("cast port range drift: installer.nsi must contain {expected}");
+    }
+}
+
+fn rust_u16_const(src: &str, name: &str) -> u16 {
+    let prefix = format!("const {name}: u16 = ");
+    for line in src.lines() {
+        let trimmed = line.trim().trim_start_matches("pub ").trim();
+        let Some(rest) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        let num = rest.trim().trim_end_matches(';').trim();
+        return num
+            .parse()
+            .unwrap_or_else(|_| panic!("bad {name} in cast.rs"));
+    }
+    panic!("{name} not found in cast.rs");
 }
 
 /// First `"version"` string in a JSON file. For this repo that is the app version.

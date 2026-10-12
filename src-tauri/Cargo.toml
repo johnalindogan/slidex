@@ -1,6 +1,6 @@
 [package]
 name = "slideshowpro"
-version = "0.1.8"
+version = "0.1.9"
 description = "Thin Tauri Windows wrapper for SlideX"
 authors = ["johnalindogan"]
 edition = "2021"
@@ -21,11 +21,11 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 url = "2"
 base64 = "0.22"
-# Cast spike (locked stack): Cast V2 + mDNS + LAN HTTP → Default Media Receiver
+# Cast: Cast V2 + mDNS + LAN HTTP → Default Media Receiver. Not chrome.cast.
 rust_cast = "0.21"
+rustls = "0.23"
 mdns-sd = "0.13"
-if-addrs = "0.13"  # enumerate ifaces for Discover diagnostic (also used by mdns-sd)
-tiny_http = "0.12"
+if-addrs = "0.13"
 uuid = { version = "1", features = ["v4"] }
 
 [profile.release]

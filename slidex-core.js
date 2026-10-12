@@ -551,6 +551,39 @@
     };
   }
 
+  function copyItem(it) {
+    var copy = {};
+    if (!it) return copy;
+    Object.keys(it).forEach(function (k) { copy[k] = it[k]; });
+    return copy;
+  }
+
+  /*
+   * Continue / restoreFromSnapshot. Count a file only when it has a saved path
+   * and that path is not on disk. An entry with no path is kept and not counted.
+   * Missing entries stay in the list so the next save still has \\server\share\...
+   */
+  function planSessionRestore(items, pathExists) {
+    var missing = 0;
+    var exists = typeof pathExists === 'function' ? pathExists : function () { return false; };
+    var out = (items || []).map(function (it) {
+      if (!it || it.type === 'folder') return copyItem(it);
+      var path = it.path;
+      if (!path) return copyItem(it);
+      if (exists(path)) {
+        var ok = copyItem(it);
+        ok.missing = false;
+        return ok;
+      }
+      missing++;
+      var miss = copyItem(it);
+      miss.missing = true;
+      miss.unavailable = true;
+      return miss;
+    });
+    return { items: out, missing: missing };
+  }
+
   function markMissing(items, pathExists) {
     var missing = 0;
     var out = (items || []).map(function (it) {
@@ -1244,6 +1277,7 @@
     buildPlaylistDocument: buildPlaylistDocument,
     normalizePlaylist: normalizePlaylist,
     restoreItemFields: restoreItemFields,
+    planSessionRestore: planSessionRestore,
     markMissing: markMissing,
     slideshowItems: slideshowItems,
     isAltBackspaceReset: isAltBackspaceReset,

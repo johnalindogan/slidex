@@ -795,9 +795,12 @@ body.ssp-playlist-window #dock-toggle-btn {
 #castPanel button{background:#243247;border:1px solid rgba(255,255,255,.12);color:#e8eef7;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:12px;}
 #castPanel button:hover{border-color:rgba(90,180,255,.5);}
 #castPanel button:disabled{opacity:.45;cursor:default;}
-#castPanel select{flex:1;min-width:140px;background:#0f1622;color:#e8eef7;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:6px 8px;}
+#castPanel select,#castPanel input{flex:1;min-width:90px;background:#0f1622;color:#e8eef7;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:6px 8px;font:12px system-ui,sans-serif;}
+#castPanel input[type="number"]{flex:0 0 84px;min-width:72px;}
+#castPanel .hint{margin:0 0 6px;font-size:11px;color:#8ea0b8;}
 #castStatus{margin-top:8px;font-size:11px;color:#9aa8bc;min-height:2.6em;white-space:pre-wrap;}
-#lbcast{border-color:rgba(90,180,255,.45)!important;color:#9fd0ff!important;}
+#castFirewall{margin-top:6px;font-size:11px;color:#b7c4d6;white-space:pre-wrap;}
+#lbcast,#bcast.cast-on{border-color:rgba(90,180,255,.55)!important;color:#9fd0ff!important;}
 #lbcast:disabled{border-color:rgba(255,255,255,.1)!important;color:inherit!important;}
 </style>
 </head>
@@ -837,7 +840,7 @@ body.ssp-playlist-window #dock-toggle-btn {
         <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
         Open Playlist
       </button>
-      <button id="lbcast" type="button" disabled title="Cast is coming in a later SlideX release">
+      <button id="lbcast" type="button" title="Cast the slideshow to a Google TV on this Wi-Fi">
         <svg viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 015.9 20M2 12.05A9 9 0 019.95 20M2 8V6a2 2 0 012-2h16a2 2 0 012 2v12a2 2 0 01-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
         Cast…
       </button>
@@ -929,7 +932,7 @@ body.ssp-playlist-window #dock-toggle-btn {
         <button class="cb" id="bked" title="Keyboard shortcuts">
           <svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/></svg>
         </button>
-        <button class="cb" id="bcast" type="button" disabled title="Cast is coming in a later SlideX release">
+        <button class="cb" id="bcast" type="button" title="Cast the slideshow to a Google TV on this Wi-Fi">
           <svg viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 015.9 20M2 12.05A9 9 0 019.95 20M2 8V6a2 2 0 012-2h16a2 2 0 012 2v12a2 2 0 01-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
           Cast…
         </button>
@@ -1276,6 +1279,31 @@ function sspIsTauri() {
 }
 function tauriInvoke(cmd, args) {
   return window.__TAURI__.core.invoke(cmd, args || {});
+}
+function sspCastHook(name, source) {
+  try {
+    if (window.__sspCastEcho) return;
+    var fn = window.__sspCast && window.__sspCast[name];
+    if (typeof fn === 'function') fn(source || 'user');
+  } catch (e) {
+    console.warn('cast hook', name, e);
+  }
+}
+function sspCastPlaying() { return !!playing; }
+function sspCastCurrentPath() {
+  var mi = getMediaItems();
+  var it = mi[cur];
+  return (it && it.path) ? String(it.path) : '';
+}
+function sspCastCurrentName() {
+  var mi = getMediaItems();
+  var it = mi[cur];
+  return (it && (it.name || it.path)) ? String(it.name || it.path) : '';
+}
+function sspCastPaths() {
+  return getMediaItems().map(function (it) {
+    return (it && it.path) ? String(it.path) : '';
+  }).filter(Boolean);
 }
 function tauriDialogOpen(opts) {
   if (!(window.__TAURI__ && window.__TAURI__.dialog && window.__TAURI__.dialog.open)) {
@@ -3914,6 +3942,58 @@ async function ensureReadPermission(handle) {
     return null;
   }
 }
+async function restoreTauriSession(entries) {
+  const core = window.SlideXCore;
+  const paths = [];
+  (entries || []).forEach(it => {
+    if (it && it.type !== 'folder' && it.path) paths.push(it.path);
+  });
+  let flags = [];
+  try { flags = await tauriInvoke('paths_exist', { paths }); }
+  catch (_) { flags = paths.map(() => false); }
+  const exists = new Map();
+  paths.forEach((p, i) => exists.set(p, !!flags[i]));
+  const plan = core.planSessionRestore(entries, p => exists.get(p) === true);
+  const foundPaths = paths.filter(p => exists.get(p));
+  const gen = bumpFolderIngestGen();
+  if (foundPaths.length) {
+    try { await tauriInvoke('register_allowed_paths', { paths: foundPaths }); } catch (_) {}
+  }
+  const byPath = new Map();
+  for (let i = 0; i < foundPaths.length; i++) {
+    if (gen !== folderIngestGen) { clearLoadStatus(); return; }
+    showLoadStatus(i + 1, foundPaths.length);
+    let loaded = [];
+    try { loaded = await itemsFromMediaPaths([foundPaths[i]]); }
+    catch (e) { console.warn(e); }
+    if (gen !== folderIngestGen) { clearLoadStatus(); return; }
+    const hit = loaded && loaded[0];
+    if (hit && hit.path && !byPath.has(hit.path)) byPath.set(hit.path, hit);
+    await yieldToMain();
+  }
+  if (gen !== folderIngestGen) { clearLoadStatus(); return; }
+  const next = plan.items.map(entry => {
+    if (!entry || entry.type === 'folder' || entry.missing || !entry.path) return entry;
+    const hit = byPath.get(entry.path);
+    if (!hit) return Object.assign({}, entry, { url: '', unavailable: true });
+    const fields = core.restoreItemFields(entry);
+    Object.assign(hit, {
+      id: fields.id || hit.id || makeItemId(),
+      name: fields.name || hit.name,
+      path: entry.path,
+      missing: false,
+      unavailable: false,
+      imageUpdates: entry.imageUpdates
+    });
+    return hit;
+  });
+  dz.style.display = 'none';
+  viewer.style.display = 'flex';
+  build(next);
+  clearLoadStatus();
+  if (typeof updateLocateButton === 'function') updateLocateButton();
+  if (plan.missing > 0) showToast(core.missingFilesNotice(plan.missing), 6000);
+}
 async function restoreFromSnapshot(snap) {
   snap = migrateSnapshot(snap);
   if (!snap?.items?.length) return;
@@ -3928,6 +4008,10 @@ async function restoreFromSnapshot(snap) {
   // Tauri has no IDB File System Access handles, so requiring 100% paths used to
   // fail the whole playlist when savePlaylist omitted path.
   const pathEntries = mediaEntries.filter(e => e.path && (/^(content:|file:|https?:)/i.test(e.path) || sspIsTauri() || sspIsAndroid()));
+  if (pathEntries.length && sspIsTauri() && window.SlideXCore && SlideXCore.planSessionRestore) {
+    await restoreTauriSession(entries);
+    return;
+  }
   if (pathEntries.length) {
     const paths = pathEntries.map(e => e.path);
     await openMediaPaths(paths, { append: false });
@@ -4455,6 +4539,7 @@ function finishAdd(newItems, opts) {
     if (mi.length) g('sc').textContent = (cur + 1) + '/' + mi.length;
     if (playlistChromeOpen()) renderPlaylist();
     autoSave();
+    try { sspCastHook('playlist'); } catch (_) {}
     return;
   }
   rebuildSlides(cur);
@@ -4510,6 +4595,13 @@ function makeVid(item) {
     const map = { 1: 'aborted', 2: 'network/read', 3: 'decode/codec', 4: 'format unsupported' };
     showToast('Video failed (' + (map[code] || 'unknown') + '): ' + (item.name || ''), 5000);
   });
+  // While a cast is active the local element must not drive the TV.
+  ['play', 'pause', 'ended'].forEach((ev) => {
+    v.addEventListener(ev, (e) => {
+      if (!window.__sspCastActive) return;
+      e.stopImmediatePropagation();
+    }, true);
+  });
   return v;
 }
 
@@ -4532,7 +4624,11 @@ function createSlideEl(item, i) {
   if (item.type === 'video') {
     const b = document.createElement('div'); b.className = 'vb'; b.textContent = '▶ video'; sl.appendChild(b);
     med.onended = () => {
-      if (playing && +sl.dataset.mi === cur) setTimeout(() => goTo(nextMI()), 300);
+      if (window.__sspCastActive) return;
+      if (playing && +sl.dataset.mi === cur) setTimeout(() => {
+        if (window.__sspCastActive) return;
+        goTo(nextMI(), 'timer');
+      }, 300);
     };
   }
   return sl;
@@ -4768,6 +4864,7 @@ function build(its) {
     return;
   }
   applySlideSettings(0);
+  try { sspCastHook('playlist'); } catch (_) {}
   showSlide(0); schedNext();
   autoSave();
   if (typeof scheduleCropHydrate === 'function') scheduleCropHydrate(its);
@@ -4793,6 +4890,7 @@ function rebuildSlides(newCur) {
   }
   playing = true; updPlayBtn();
   applySlideSettings(cur);
+  try { sspCastHook('playlist'); } catch (_) {}
   showSlide(cur); schedNext();
   if (playlistChromeOpen()) renderPlaylist();
 }
@@ -5426,6 +5524,7 @@ function loadPlaylistJSON(file) {
 /* ── Playback ── */
 function pauseVids() { sls.forEach(s => { const v = s.querySelector('video'); if (v) v.pause(); }); }
 async function playCurVid() {
+  if (window.__sspCastActive) return;
   if (!isV(cur)) return;
   const v = getSl(cur)?.querySelector('video');
   if (!v || !playing) return;
@@ -5437,8 +5536,10 @@ async function playCurVid() {
   v.volume = wantSound ? vol : 0;
   try {
     await v.play();
+    if (window.__sspCastActive) { try { v.pause(); } catch (_) {} return; }
     if (wantSound) { v.muted = false; v.volume = vol; }
   } catch (err) {
+    if (window.__sspCastActive) return;
     const msg = (err && err.message) ? err.message : String(err);
     showToast('Video play failed: ' + msg, 5000);
   }
@@ -5458,8 +5559,12 @@ function showSlide(i) {
   applySlideSettings(i);
   pauseVids();
   showMaxCompanion(i);
-  if (isV(i)) { staticT(); playCurVid(); startVProg(i); } else { startKB(i); startProg(); }
+  if (window.__sspCastActive) {
+    if (isV(i)) { staticT(); clearTimeout(tmr); } else { startKB(i); startProg(); }
+  } else if (isV(i)) { staticT(); playCurVid(); startVProg(i); }
+  else { startKB(i); startProg(); }
   updPlCur();
+  try { sspCastHook('slide', 'user'); } catch (_) {}
 }
 
 function startKB(i) {
@@ -5630,10 +5735,10 @@ function waitForVideoFrame(video) {
 
 function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
-  tmr = setTimeout(() => { goTo(nextMI()); schedNext(); }, getEDur(cur));
+  tmr = setTimeout(() => { goTo(nextMI(), 'timer'); schedNext(); }, getEDur(cur));
 }
 
-function goTo(i) {
+function goTo(i, source) {
   clearTimeout(tmr); clearInterval(ptmr);
   if (kbId) { cancelAnimationFrame(kbId); kbId = null; }
   if (compKbId) { cancelAnimationFrame(compKbId); compKbId = null; }
@@ -5682,7 +5787,11 @@ function goTo(i) {
 
   const outSl = getSl(prevCur);
   const inSl = getSl(next);
-  if (!inSl) return;
+  if (!inSl) {
+    cur = next;
+    try { sspCastHook('slide', source || 'user'); } catch (e) { console.warn(e); }
+    return;
+  }
 
   if (outSl && outSl !== inSl) {
     if (outgoingClass) {
@@ -5703,11 +5812,17 @@ function goTo(i) {
   g('fnov').textContent = getMediaItems()[cur]?.name || '';
   pauseVids();
   showMaxCompanion(cur);
-  if (isV(cur)) { staticT(); playCurVid(); startVProg(cur); }
-  else { startKB(cur); startProg(); if (playing) schedNext(); }
+  try {
+    if (window.__sspCastActive) {
+      if (isV(cur)) { staticT(); clearTimeout(tmr); }
+      else { startKB(cur); startProg(); if (playing) schedNext(); }
+    } else if (isV(cur)) { staticT(); playCurVid(); startVProg(cur); }
+    else { startKB(cur); startProg(); if (playing) schedNext(); }
+  } catch (e) { console.warn(e); }
   updPlCur();
   scheduleStagePrune(cur);
   try { notifyPlaylistSync(); } catch (_) {}
+  try { sspCastHook('slide', source || 'user'); } catch (_) {}
 }
 
 function updPlayBtn() {
@@ -5717,6 +5832,14 @@ function updPlayBtn() {
 }
 function togglePlay() {
   playing = !playing; updPlayBtn();
+  if (window.__sspCastActive) {
+    pauseVids();
+    if (isV(cur)) { clearTimeout(tmr); clearInterval(ptmr); }
+    else if (playing) { schedNext(); startProg(); }
+    else { clearTimeout(tmr); clearInterval(ptmr); }
+    try { sspCastHook('transport', window.__sspCastEcho ? 'remote' : 'user'); } catch (_) {}
+    return;
+  }
   if (isV(cur)) {
     const v = getSl(cur)?.querySelector('video');
     if (playing) {
@@ -5725,12 +5848,16 @@ function togglePlay() {
         v.muted = !!muted;
         v.volume = muted ? 0 : vol;
         v.play().then(() => {
+          if (window.__sspCastActive) { try { v.pause(); } catch (_) {} return; }
           if (!muted && vol > 0) { v.muted = false; v.volume = vol; }
         }).catch((err) => {
+          if (window.__sspCastActive) return;
           v.muted = true;
           v.play().then(() => {
+            if (window.__sspCastActive) { try { v.pause(); } catch (_) {} return; }
             if (!muted && vol > 0) { v.muted = false; v.volume = vol; }
           }).catch((err2) => {
+            if (window.__sspCastActive) return;
             const msg = (err2 && err2.message) ? err2.message : ((err && err.message) ? err.message : String(err2 || err));
             showToast('Video play failed: ' + msg, 5000);
           });
@@ -5741,6 +5868,7 @@ function togglePlay() {
   } else {
     if (playing) { schedNext(); startProg(); } else { clearTimeout(tmr); clearInterval(ptmr); }
   }
+  try { sspCastHook('transport', 'user'); } catch (_) {}
 }
 
 /* ── Screenshot + graded export ── */
@@ -7066,6 +7194,7 @@ async function locateMissingFolder() {
   rebuildSlides(cur);
   updateLocateButton();
   const still = items.filter(it => it && it.missing).length;
+  autoSave();
   if (namedPlaylistName && sspIsTauri()) {
     try {
       const doc = core.buildPlaylistDocument({ items: items, name: namedPlaylistName, savedAt: Date.now(), kb: playlistKbState() });
@@ -7133,129 +7262,370 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
 </script>
 <div id="toast"></div>
 
+<div id="castPanel" aria-label="Cast panel">
+  <h3>Cast to a Google TV</h3>
+  <p class="hint">Same Wi-Fi as this PC, including 2.4 and 5 GHz on one router. Not a screen mirror.</p>
+  <div class="row">
+    <button type="button" id="castRescan">Rescan</button>
+    <select id="castDevice" aria-label="TVs on this network"><option value="">(scanning…)</option></select>
+  </div>
+  <div class="row">
+    <input id="castHost" type="text" inputmode="decimal" placeholder="TV IP, if it is not listed" autocomplete="off" spellcheck="false">
+    <input id="castPort" type="number" min="1" max="65535" placeholder="8009" aria-label="Cast port">
+  </div>
+  <div class="row">
+    <button type="button" id="castStart">Cast slideshow</button>
+    <button type="button" id="castDisconnect">Disconnect</button>
+    <button type="button" id="castLog">Copy Cast log path</button>
+    <button type="button" id="castClose">Close</button>
+  </div>
+  <div id="castStatus">Open Cast to look for a TV. Play, pause, next, and previous on this PC follow on the TV.</div>
+  <div id="castFirewall"></div>
+</div>
 <script>
-
 /* Cast spike UI. #lbcast and #bcast stay disabled until the stacked Cast PR removes disabled. */
-(function initCastSpike(){
-  const panel = document.getElementById('castPanel');
-  const statusEl = document.getElementById('castStatus');
-  const sel = document.getElementById('castDevice');
+(function initCast() {
+  var panel = document.getElementById("castPanel");
+  var statusEl = document.getElementById("castStatus");
+  var firewallEl = document.getElementById("castFirewall");
+  var sel = document.getElementById("castDevice");
+  var hostEl = document.getElementById("castHost");
+  var portEl = document.getElementById("castPort");
   if (!panel || !statusEl || !sel) return;
-  let devices = [];
-  function setStatus(msg){ statusEl.textContent = msg; }
-  function selectedDevice(){
-    const i = sel.selectedIndex;
-    if (i < 0 || !devices[i]) return null;
-    return devices[i];
+
+  var devices = [];
+  var castActive = false;
+  var scanning = false;
+  var scanGen = 0;
+  var netFp = "";
+  var lastEmpty = false;
+  var skippedNotes = [];
+  var skipBurst = 0;
+  var chain = Promise.resolve();
+  var NO_TV = "No TV found on this network. Check that the PC and TV are on the same Wi-Fi, the firewall, or the router's client isolation.";
+  var PUBLIC_WIFI = "This Wi-Fi is set to Public in Windows. Set it to Private to cast.";
+
+  function setStatus(msg) { statusEl.textContent = msg || ""; }
+  function esc(s) {
+    return String(s).replace(/[&<>]/g, function (c) {
+      return c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;";
+    });
   }
-  function fillDevices(list){
+  function field(obj, name) {
+    if (!obj) return undefined;
+    if (obj[name] != null) return obj[name];
+    var camel = name.replace(/_([a-z])/g, function (_, c) { return c.toUpperCase(); });
+    return obj[camel];
+  }
+  function markCast(on) {
+    var b = document.getElementById("bcast");
+    if (b) b.classList.toggle("cast-on", !!on);
+  }
+  function stopLocalCast() {
+    castActive = false;
+    window.__sspCastActive = false;
+    window.__sspCastGen = (window.__sspCastGen || 0) + 1;
+    try { clearTimeout(tmr); tmr = null; } catch (e) {}
+    try { if (typeof pauseVids === "function") pauseVids(); } catch (e2) {}
+    markCast(false);
+  }
+  function enqueue(fn) {
+    chain = chain.then(fn, fn);
+    return chain;
+  }
+  function fillDevices(list, mode) {
     devices = list || [];
-    sel.innerHTML = '';
-    if (!devices.length){
-      const o = document.createElement('option');
-      o.value = ''; o.textContent = '(no devices)';
+    sel.innerHTML = "";
+    if (!devices.length) {
+      var o = document.createElement("option");
+      o.value = "";
+      o.textContent = mode === "scan" ? "(scanning…)" : "(no devices)";
       sel.appendChild(o);
       return;
     }
-    devices.forEach((d, idx) => {
-      const o = document.createElement('option');
+    devices.forEach(function (d, idx) {
+      var o = document.createElement("option");
       o.value = String(idx);
-      o.textContent = (d.name || 'Cast') + ' · ' + d.host + ':' + d.port + (d.model ? ' · ' + d.model : '');
+      var label = (d.name || "Chromecast") + " · " + d.host;
+      if (d.port) label += ":" + d.port;
+      if (d.model) label += " · " + d.model;
+      o.textContent = label;
       sel.appendChild(o);
     });
   }
-  async function call(cmd, args){
-    if (typeof invoke !== 'function') throw new Error('Tauri invoke unavailable (open in SlideX app)');
-    return invoke(cmd, args || {});
+  function selectedDevice() {
+    var i = sel.selectedIndex;
+    if (i < 0 || !devices[i]) return null;
+    return devices[i];
   }
-  function openCastPanel(ev) {
-    if (ev && ev.currentTarget && ev.currentTarget.disabled) return;
-    panel.classList.add('open');
-    setStatus('Ready. Discover on same Wi‑Fi (≤10s). Content cast only — not desktop mirror.');
+  function manualTarget() {
+    var host = (hostEl && hostEl.value || "").trim();
+    if (!host) return null;
+    var port = portEl && String(portEl.value || "").trim();
+    var n = port ? parseInt(port, 10) : null;
+    return { host: host, port: n && n > 0 ? n : null, name: "TV" };
   }
-  document.getElementById('lbcast')?.addEventListener('click', openCastPanel);
-  document.getElementById('bcast')?.addEventListener('click', openCastPanel);
-  document.getElementById('castClose')?.addEventListener('click', () => panel.classList.remove('open'));
-  document.getElementById('castDiscover')?.addEventListener('click', async () => {
-    setStatus('Discovering… (mDNS _googlecast._tcp, ≤10s)');
-    try {
-      const result = await call('cast_discover', { timeoutMs: 8000 });
-      const list = (result && result.devices) ? result.devices : (Array.isArray(result) ? result : []);
-      fillDevices(list);
-      const diag = (result && result.diagnostic) ? String(result.diagnostic) : '';
+  function openPanel() {
+    panel.classList.add("open");
+    refreshFirewall();
+    startScan("open");
+  }
+  function call(cmd, args) {
+    if (!sspIsTauri() || typeof tauriInvoke !== "function") {
+      return Promise.reject(new Error("Cast runs in the SlideX app."));
+    }
+    return tauriInvoke(cmd, args || {});
+  }
+  function startScan(reason) {
+    var gen = ++scanGen;
+    scanning = true;
+    devices = [];
+    fillDevices([], "scan");
+    setStatus(reason === "rescan" ? "Rescanning this network…" : "Looking for a TV on this Wi-Fi…");
+    var scan = call("cast_discover", { timeoutMs: 8000 }).then(function (result) {
+      if (gen !== scanGen) return;
+      var list = (result && field(result, "devices")) || [];
+      fillDevices(list, "done");
+      lastEmpty = !list.length;
+      if (lastEmpty) watchNetwork.nextEmpty = Date.now();
       if (list.length) {
-        setStatus('Found ' + list.length + ' device(s). Select + Cast still/video.' + (diag ? '\n' + diag : ''));
+        setStatus(field(result, "diagnostic") || ("Found " + list.length + " TV(s)."));
       } else {
-        setStatus(diag || 'No Cast devices found (Wi‑Fi isolation / firewall / VPN / Tailscale?).');
+        var notice = field(result, "error") || "";
+        if (notice === PUBLIC_WIFI) setStatus(notice);
+        else setStatus(field(result, "diagnostic") || notice || NO_TV);
       }
-    } catch (e) {
-      setStatus('Discover FAIL: ' + (e?.message || e));
+    }).catch(function (e) {
+      if (gen !== scanGen) return;
+      lastEmpty = true;
+      devices = [];
+      fillDevices([], "done");
+      var msg = (e && e.message) ? e.message : String(e);
+      setStatus(msg || NO_TV);
+    }).then(function () {
+      if (gen === scanGen) scanning = false;
+    });
+    return scan;
+  }
+  function refreshFirewall() {
+    if (!firewallEl) return;
+    call("cast_firewall_status").then(function (fw) {
+      firewallEl.textContent = (fw && (fw.detail || fw.state)) || "";
+    }).catch(function () {
+      firewallEl.textContent = "";
+    });
+  }
+  function watchNetwork() {
+    if (!sspIsTauri()) return;
+    call("cast_network_fingerprint").then(function (fp) {
+      fp = String(fp || "");
+      if (!netFp) {
+        netFp = fp;
+        return;
+      }
+      if (fp !== netFp) {
+        netFp = fp;
+        startScan("network");
+      } else if (panel.classList.contains("open") && lastEmpty && !scanning && !castActive) {
+        if (!watchNetwork.nextEmpty || Date.now() - watchNetwork.nextEmpty > 12000) {
+          watchNetwork.nextEmpty = Date.now();
+          startScan("rescan");
+        }
+      }
+    }).catch(function () {});
+  }
+  function currentSkipped() {
+    var name = sspCastCurrentName();
+    if (!name) return "";
+    for (var i = 0; i < skippedNotes.length; i++) {
+      if (skippedNotes[i].indexOf(name) !== -1) return skippedNotes[i];
     }
-  });
-  document.getElementById('castStill')?.addEventListener('click', async () => {
-    const d = selectedDevice();
-    if (!d) { setStatus('Select a device first.'); return; }
-    setStatus('Casting still…');
-    try {
-      const info = await call('cast_load_still', { host: d.host, port: d.port, name: d.name });
-      setStatus('Still casting → ' + (info.device_name||'') + ' (http :' + info.http_port + ')');
-    } catch (e) {
-      setStatus('Still FAIL: ' + (e?.message || e));
+    return "";
+  }
+  function noteSkip(msg) {
+    if (typeof showToast === "function") showToast(esc(msg), 4500);
+    setStatus(msg);
+  }
+  function pushPlaylist() {
+    if (!castActive) return Promise.resolve();
+    return call("cast_set_playlist", { paths: sspCastPaths() }).then(function (upd) {
+      skippedNotes = (upd && upd.skipped) || [];
+      if (skippedNotes.length) noteSkip(skippedNotes[0]);
+    });
+  }
+  function loadCurrent(source) {
+    var src = source || "user";
+    if (!castActive || !window.__sspCastActive) return Promise.resolve();
+    var path = sspCastCurrentPath();
+    if (!path) {
+      setStatus("Nothing in this playlist to cast.");
+      return Promise.resolve();
     }
-  });
-  document.getElementById('castVideo')?.addEventListener('click', async () => {
-    const d = selectedDevice();
-    if (!d) { setStatus('Select a device first.'); return; }
-    setStatus('Casting ~30s video…');
-    try {
-      const info = await call('cast_load_video', { host: d.host, port: d.port, name: d.name });
-      setStatus('Video casting → ' + (info.device_name||'') + ' (http :' + info.http_port + ')');
-    } catch (e) {
-      setStatus('Video FAIL: ' + (e?.message || e));
+    var skipped = currentSkipped();
+    if (skipped) {
+      noteSkip(skipped);
+      skipBurst++;
+      if (skipBurst >= Math.max(1, sspCastPaths().length)) {
+        setStatus("Nothing in this playlist can be cast. JPEG, PNG, and MP4 (H.264 + AAC) play.");
+        return Promise.resolve();
+      }
+      if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
+      return Promise.resolve();
     }
-  });
-  document.getElementById('castPause')?.addEventListener('click', async () => {
-    try { await call('cast_pause'); setStatus('Paused.'); }
-    catch (e) { setStatus('Pause FAIL: ' + (e?.message || e)); }
-  });
-  document.getElementById('castPlay')?.addEventListener('click', async () => {
-    try { await call('cast_play'); setStatus('Playing.'); }
-    catch (e) { setStatus('Play FAIL: ' + (e?.message || e)); }
-  });
-  document.getElementById('castNext')?.addEventListener('click', async () => {
-    try {
-      const info = await call('cast_next');
-      setStatus('Next → ' + (info.media_kind||'') + ' on ' + (info.device_name||''));
-    } catch (e) { setStatus('Next FAIL: ' + (e?.message || e)); }
-  });
-  document.getElementById('castDisconnect')?.addEventListener('click', async () => {
-    try { await call('cast_disconnect'); setStatus('Disconnected. LAN HTTP torn down.'); }
-    catch (e) { setStatus('Disconnect FAIL: ' + (e?.message || e)); }
-  });
-})();
+    return call("cast_load", { path: path, autoplay: !!sspCastPlaying(), source: src }).then(function () {
+      skipBurst = 0;
+      setStatus("Casting " + (sspCastCurrentName() || "the current slide") + ".");
+    }).catch(function (e) {
+      var msg = (e && e.message) ? e.message : String(e);
+      if (/unsupported|skipped/i.test(msg)) {
+        noteSkip(msg);
+        skipBurst++;
+        if (skipBurst >= Math.max(1, sspCastPaths().length)) {
+          setStatus("Nothing in this playlist can be cast. JPEG, PNG, and MP4 (H.264 + AAC) play.");
+          return;
+        }
+        if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
+        return;
+      }
+      setStatus(msg);
+    });
+  }
+  function syncTransport(source) {
+    var src = source || "user";
+    if (!castActive || !window.__sspCastActive) return Promise.resolve();
+    var cmd = sspCastPlaying() ? "cast_play" : "cast_pause";
+    return call(cmd, { source: src }).catch(function (e) {
+      var msg = (e && e.message) ? e.message : String(e);
+      setStatus(msg);
+    });
+  }
+  function poll() {
+    if (!castActive) return;
+    call("cast_status").then(function (st) {
+      if (!st || !castActive) return;
+      var ev = field(st, "remote_event");
+      if (ev === "load_failed") {
+        setStatus(field(st, "error") || "The TV could not load this slide.");
+      } else if (ev === "paused" && sspCastPlaying()) {
+        window.__sspCastEcho = true;
+        try { if (typeof togglePlay === "function") togglePlay(); } finally { window.__sspCastEcho = false; }
+        setStatus("Paused from the TV remote.");
+      } else if (ev === "playing" && !sspCastPlaying()) {
+        window.__sspCastEcho = true;
+        try { if (typeof togglePlay === "function") togglePlay(); } finally { window.__sspCastEcho = false; }
+      } else if (ev === "finished" && sspCastPlaying()) {
+        window.__sspCastEcho = true;
+        try {
+          var loaded = field(st, "item_index");
+          if (typeof goTo === "function" && loaded > 0 && loaded - 1 !== cur) goTo(loaded - 1, 'remote');
+        } finally { window.__sspCastEcho = false; }
+      }
+      if (!field(st, "connected")) {
+        stopLocalCast();
+        setStatus(field(st, "error") || "TV unreachable. It may be off or the Wi-Fi dropped. Cast again when it is back — you do not need to restart SlideX.");
+      }
+    }).catch(function (e) { console.warn(e); });
+  }
+  window.__sspCastGen = window.__sspCastGen || 0;
+  window.__sspCast = {
+    slide: function (source) {
+      var gen = window.__sspCastGen || 0;
+      var src = source || "user";
+      enqueue(function () {
+        if (gen !== (window.__sspCastGen || 0) || !castActive || !window.__sspCastActive) return Promise.resolve();
+        return loadCurrent(src);
+      });
+    },
+    transport: function (source) {
+      var gen = window.__sspCastGen || 0;
+      var src = source || "user";
+      enqueue(function () {
+        if (gen !== (window.__sspCastGen || 0) || !castActive || !window.__sspCastActive) return Promise.resolve();
+        return syncTransport(src);
+      });
+    },
+    playlist: function () { enqueue(function () { return pushPlaylist(); }); }
+  };
 
+  document.getElementById("lbcast") && document.getElementById("lbcast").addEventListener("click", openPanel);
+  document.getElementById("bcast") && document.getElementById("bcast").addEventListener("click", openPanel);
+  document.getElementById("castClose") && document.getElementById("castClose").addEventListener("click", function () {
+    panel.classList.remove("open");
+  });
+  document.getElementById("castRescan") && document.getElementById("castRescan").addEventListener("click", function () {
+    startScan("rescan");
+  });
+  document.getElementById("castStart") && document.getElementById("castStart").addEventListener("click", function () {
+    var manual = manualTarget();
+    var dev = manual || selectedDevice();
+    if (!dev || !dev.host) {
+      setStatus("Choose a TV, or type its IPv4 address.");
+      return;
+    }
+    setStatus("Connecting…");
+    var args = { host: dev.host, name: dev.name || null };
+    if (dev.port) args.port = dev.port;
+    enqueue(function () {
+      return call("cast_connect", args).then(function (info) {
+        castActive = true;
+        window.__sspCastActive = true;
+        window.__sspCastGen = (window.__sspCastGen || 0) + 1;
+        try { if (typeof pauseVids === "function") pauseVids(); } catch (e) {}
+        markCast(true);
+        skipBurst = 0;
+        var where = (info && (field(info, "device_name") || dev.name)) || dev.host;
+        setStatus("Connected to " + where + ". Starting the slideshow.");
+        return pushPlaylist();
+      }).then(function () {
+        return loadCurrent();
+      }).catch(function (e) {
+        stopLocalCast();
+        setStatus((e && e.message) ? e.message : String(e));
+      });
+    });
+  });
+  document.getElementById("castLog") && document.getElementById("castLog").addEventListener("click", function () {
+    call("cast_log_path").then(function (path) {
+      function showCopied() { setStatus("Cast log path copied."); }
+      function fallback(value) {
+        var ta = document.createElement("textarea");
+        ta.value = value;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = false;
+        try { ok = document.execCommand("copy"); } catch (err) { ok = false; }
+        ta.remove();
+        if (ok) showCopied();
+        else setStatus(value);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(String(path)).then(showCopied, function () { fallback(String(path)); });
+      } else {
+        fallback(String(path));
+      }
+    }).catch(function (e) {
+      setStatus((e && e.message) ? e.message : String(e));
+    });
+  });
+  document.getElementById("castDisconnect") && document.getElementById("castDisconnect").addEventListener("click", function () {
+    stopLocalCast();
+    enqueue(function () {
+      return call("cast_disconnect").then(function () {
+        setStatus("Cast stopped. The media server is closed. You can cast again without restarting SlideX.");
+      }).catch(function (e) {
+        setStatus((e && e.message) ? e.message : String(e));
+      });
+    });
+  });
+
+  setInterval(watchNetwork, 2000);
+  setInterval(poll, 400);
+  watchNetwork();
+})();
 </script>
-<div id="castPanel" aria-label="Cast spike panel">
-  <h3>Cast spike (LAN · content)</h3>
-  <div class="row">
-    <button type="button" id="castDiscover">Discover</button>
-    <select id="castDevice"><option value="">(no devices)</option></select>
-  </div>
-  <div class="row">
-    <button type="button" id="castStill">Cast still</button>
-    <button type="button" id="castVideo">Cast video</button>
-  </div>
-  <div class="row">
-    <button type="button" id="castPause">Pause</button>
-    <button type="button" id="castPlay">Play</button>
-    <button type="button" id="castNext">Next</button>
-    <button type="button" id="castDisconnect">Disconnect</button>
-  </div>
-  <div class="row">
-    <button type="button" id="castClose">Close</button>
-  </div>
-  <div id="castStatus">Stack: Rust Cast V2 + mDNS + LAN HTTP → Default Media Receiver. Not chrome.cast / not mirror.</div>
-</div>
 
 </body>
 </html>

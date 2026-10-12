@@ -3,8 +3,9 @@ mod cast;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::Serialize;
@@ -673,14 +674,261 @@ fn delete_named_playlist(app: AppHandle, name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// One offline UNC share must not stall Continue. Each root is probed once.
+const PATH_PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
+
+/// `\\?\C:\...` becomes `C:\...`. `\\?\UNC\server\share\...` becomes `\\server\share\...`.
+/// The saved session string is left unchanged; only probing uses this form.
+fn normalize_extended_path(path: &str) -> String {
+    let trimmed = path.trim().replace('/', "\\");
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") {
+        return format!(r"\\{}", &trimmed[8..]);
+    }
+    if lower.starts_with(r"\\?\") {
+        let rest = &trimmed[4..];
+        let mut chars = rest.chars();
+        if let (Some(drive), Some(':')) = (chars.next(), chars.next()) {
+            if drive.is_ascii_alphabetic() {
+                return rest.to_string();
+            }
+        }
+    }
+    trimmed
+}
+
+/// UNC `\\server\share` or a drive such as `D:\`. Other paths are their own root.
+/// Extended-length prefixes are stripped before the root is chosen.
+fn share_root(path: &str) -> String {
+    let normalized = normalize_extended_path(path);
+    if let Some(rest) = normalized.strip_prefix("\\\\") {
+        let mut parts = rest.split('\\').filter(|s| !s.is_empty());
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        if !server.is_empty() && !share.is_empty() {
+            return format!(
+                "\\\\{}\\{}",
+                server.to_ascii_lowercase(),
+                share.to_ascii_lowercase()
+            );
+        }
+        if !server.is_empty() {
+            return format!("\\\\{}", server.to_ascii_lowercase());
+        }
+    }
+    let mut chars = normalized.chars();
+    if let (Some(drive), Some(':')) = (chars.next(), chars.next()) {
+        if drive.is_ascii_alphabetic() {
+            return format!("{}:\\", drive.to_ascii_uppercase());
+        }
+    }
+    normalized
+}
+
+/// Probe each share root once, in parallel. A root that is unreachable or does not
+/// answer within `timeout` marks every path on that root missing, with no per-file stat.
+fn paths_exist_grouped<R, F>(paths: &[String], timeout: Duration, probe_root: R, probe_file: F) -> Vec<bool>
+where
+    R: Fn(&str) -> bool + Send + Sync + 'static,
+    F: Fn(&str) -> bool + Send + Sync + 'static,
+{
+    let mut out = vec![false; paths.len()];
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        if path.trim().is_empty() {
+            continue;
+        }
+        let probe_path = normalize_extended_path(path);
+        let root = share_root(&probe_path);
+        if let Some(group) = groups.iter_mut().find(|(name, _)| name == &root) {
+            group.1.push(index);
+        } else {
+            groups.push((root, vec![index]));
+        }
+    }
+    if groups.is_empty() {
+        return out;
+    }
+
+    let probe_root = Arc::new(probe_root);
+    let probe_file = Arc::new(probe_file);
+    let mut receivers = Vec::with_capacity(groups.len());
+    for (root, indexes) in groups {
+        let (tx, rx) = mpsc::channel::<Vec<(usize, bool)>>();
+        let root_probe = Arc::clone(&probe_root);
+        let file_probe = Arc::clone(&probe_file);
+        let owned: Vec<(usize, String)> = indexes
+            .iter()
+            .map(|i| (*i, normalize_extended_path(&paths[*i])))
+            .collect();
+        thread::spawn(move || {
+            if !root_probe(&root) {
+                let _ = tx.send(owned.into_iter().map(|(i, _)| (i, false)).collect());
+                return;
+            }
+            let flags = owned
+                .into_iter()
+                .map(|(i, path)| (i, file_probe(&path)))
+                .collect();
+            let _ = tx.send(flags);
+        });
+        receivers.push(rx);
+    }
+
+    let deadline = Instant::now() + timeout;
+    for rx in receivers {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if let Ok(flags) = rx.recv_timeout(remain) {
+            for (index, exists) in flags {
+                if index < out.len() {
+                    out[index] = exists;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn paths_exist_blocking(paths: Vec<String>) -> Vec<bool> {
+    paths_exist_grouped(
+        &paths,
+        PATH_PROBE_TIMEOUT,
+        |root| Path::new(root).exists(),
+        |path| Path::new(path).is_file(),
+    )
+}
+
 #[tauri::command]
-fn paths_exist(paths: Vec<String>) -> Result<Vec<bool>, String> {
-    Ok(paths.iter().map(|p| !p.is_empty() && Path::new(p).is_file()).collect())
+async fn paths_exist(paths: Vec<String>) -> Result<Vec<bool>, String> {
+    tauri::async_runtime::spawn_blocking(move || paths_exist_blocking(paths))
+        .await
+        .map_err(|e| format!("path check failed: {e}"))
 }
 
 #[cfg(test)]
 mod slidex_store_tests {
     use super::*;
+
+    #[test]
+    fn slow_share_root_times_out_and_is_missing_without_file_stats() {
+        let paths = vec![
+            r"\\AX03\share\a.jpg".to_string(),
+            r"\\AX03\share\b.jpg".to_string(),
+        ];
+        let file_stats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&file_stats);
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let flags = paths_exist_grouped(
+            &paths,
+            timeout,
+            |_| {
+                thread::sleep(Duration::from_millis(1500));
+                true
+            },
+            move |_| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            },
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(flags, vec![false, false]);
+        assert_eq!(file_stats.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "slow root held the check for {elapsed:?}"
+        );
+        assert!(PATH_PROBE_TIMEOUT <= Duration::from_millis(2500));
+        assert!(PATH_PROBE_TIMEOUT >= Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn fast_share_root_is_statted_and_an_unreachable_root_is_not() {
+        let paths = vec![
+            r"D:\keep.jpg".to_string(),
+            r"D:\gone.jpg".to_string(),
+            r"\\AX03\share\clip.mp4".to_string(),
+            r"\\AX03\share\still.jpg".to_string(),
+        ];
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_probe = Arc::clone(&seen);
+        let timeout = Duration::from_millis(400);
+        let started = Instant::now();
+        let flags = paths_exist_grouped(
+            &paths,
+            timeout,
+            |root| {
+                if root.to_ascii_lowercase().contains("ax03") {
+                    thread::sleep(Duration::from_millis(1500));
+                    return true;
+                }
+                true
+            },
+            move |path| {
+                seen_probe.lock().unwrap().push(path.to_string());
+                path.ends_with("keep.jpg")
+            },
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(flags, vec![true, false, false, false]);
+        let mut probed = seen.lock().unwrap().clone();
+        probed.sort();
+        assert_eq!(probed, vec![r"D:\gone.jpg".to_string(), r"D:\keep.jpg".to_string()]);
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "mixed roots held the check for {elapsed:?}"
+        );
+        assert_eq!(share_root(r"\\AX03\Share\a.jpg"), share_root(r"//ax03/share/b.jpg"));
+        assert_eq!(share_root(r"d:/photos/a.jpg"), r"D:\");
+    }
+
+    #[test]
+    fn extended_prefix_paths_probe_present_and_the_saved_strings_stay() {
+        assert_eq!(share_root(r"\\?\C:\Users\qa\Pictures\a.jpg"), r"C:\");
+        assert_eq!(share_root(r"C:\Users\qa\Pictures\a.jpg"), r"C:\");
+        assert_eq!(share_root(r"\\?\UNC\AX03\photos\b.jpg"), r"\\ax03\photos");
+        assert_eq!(share_root(r"\\AX03\photos\b.jpg"), r"\\ax03\photos");
+        assert_eq!(
+            normalize_extended_path(r"\\?\C:\Users\qa\Pictures\a.jpg"),
+            r"C:\Users\qa\Pictures\a.jpg"
+        );
+        assert_eq!(
+            normalize_extended_path(r"\\?\UNC\AX03\photos\b.jpg"),
+            r"\\AX03\photos\b.jpg"
+        );
+
+        let paths = vec![
+            r"\\?\C:\Users\qa\Pictures\lake.jpg".to_string(),
+            r"\\?\UNC\AX03\photos\dock.jpg".to_string(),
+            r"C:\Users\qa\Pictures\plain.jpg".to_string(),
+            r"\\AX03\photos\plain.jpg".to_string(),
+        ];
+        let saved = paths.clone();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_probe = Arc::clone(&seen);
+        let flags = paths_exist_grouped(
+            &paths,
+            Duration::from_millis(500),
+            |_| true,
+            move |path| {
+                seen_probe.lock().unwrap().push(path.to_string());
+                !path.starts_with(r"\\?\")
+            },
+        );
+        assert_eq!(flags, vec![true, true, true, true]);
+        assert_eq!(paths, saved);
+        let mut probed = seen.lock().unwrap().clone();
+        probed.sort();
+        assert_eq!(
+            probed,
+            vec![
+                r"C:\Users\qa\Pictures\lake.jpg".to_string(),
+                r"C:\Users\qa\Pictures\plain.jpg".to_string(),
+                r"\\AX03\photos\dock.jpg".to_string(),
+                r"\\AX03\photos\plain.jpg".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn fnv_is_stable_and_not_rust_hasher() {
@@ -872,50 +1120,47 @@ fn cast_discover(timeout_ms: Option<u64>) -> Result<cast::CastDiscoverResult, St
 }
 
 #[tauri::command]
-fn cast_load_still(
+fn cast_network_fingerprint() -> Result<String, String> {
+    Ok(cast::network_fingerprint())
+}
+
+#[tauri::command]
+fn cast_connect(
     state: State<'_, cast::CastState>,
     host: String,
-    port: u16,
+    port: Option<u16>,
     name: Option<String>,
-) -> Result<cast::CastSessionInfo, String> {
-    let device = cast::CastDeviceInfo {
-        name: name.unwrap_or_else(|| "Chromecast".into()),
-        host,
-        port,
-        model: None,
-    };
-    state.load_still(&device)
+) -> Result<cast::CastConnectInfo, String> {
+    state.connect(&host, port, name)
 }
 
 #[tauri::command]
-fn cast_load_video(
+fn cast_set_playlist(
     state: State<'_, cast::CastState>,
-    host: String,
-    port: u16,
-    name: Option<String>,
-) -> Result<cast::CastSessionInfo, String> {
-    let device = cast::CastDeviceInfo {
-        name: name.unwrap_or_else(|| "Chromecast".into()),
-        host,
-        port,
-        model: None,
-    };
-    state.load_video(&device)
+    paths: Vec<String>,
+) -> Result<cast::PlaylistUpdate, String> {
+    state.set_playlist(paths)
 }
 
 #[tauri::command]
-fn cast_pause(state: State<'_, cast::CastState>) -> Result<(), String> {
-    state.pause()
+fn cast_load(
+    state: State<'_, cast::CastState>,
+    path: String,
+    autoplay: Option<bool>,
+    source: Option<String>,
+) -> Result<(), String> {
+    let origin = cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?;
+    state.load(path, autoplay.unwrap_or(true), origin)
 }
 
 #[tauri::command]
-fn cast_play(state: State<'_, cast::CastState>) -> Result<(), String> {
-    state.play()
+fn cast_pause(state: State<'_, cast::CastState>, source: Option<String>) -> Result<(), String> {
+    state.pause(cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?)
 }
 
 #[tauri::command]
-fn cast_next(state: State<'_, cast::CastState>) -> Result<cast::CastSessionInfo, String> {
-    state.next()
+fn cast_play(state: State<'_, cast::CastState>, source: Option<String>) -> Result<(), String> {
+    state.play(cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?)
 }
 
 #[tauri::command]
@@ -924,8 +1169,18 @@ fn cast_disconnect(state: State<'_, cast::CastState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn cast_session(state: State<'_, cast::CastState>) -> Result<Option<cast::CastSessionInfo>, String> {
-    Ok(state.session_info().ok())
+fn cast_status(state: State<'_, cast::CastState>) -> Result<cast::CastLiveStatus, String> {
+    Ok(state.status())
+}
+
+#[tauri::command]
+fn cast_firewall_status() -> Result<cast::CastFirewallStatus, String> {
+    Ok(cast::firewall_status())
+}
+
+#[tauri::command]
+fn cast_log_path() -> Result<String, String> {
+    Ok(cast::cast_log_path().to_string_lossy().into_owned())
 }
 
 /// Ask the page to save, then exit. Never wait longer than this.
@@ -1046,13 +1301,16 @@ pub fn run() {
             delete_named_playlist,
             paths_exist,
             cast_discover,
-            cast_load_still,
-            cast_load_video,
+            cast_network_fingerprint,
+            cast_connect,
+            cast_set_playlist,
+            cast_load,
             cast_pause,
             cast_play,
-            cast_next,
             cast_disconnect,
-            cast_session,
+            cast_status,
+            cast_firewall_status,
+            cast_log_path,
             slidex_save_done
         ])
         .setup(|app| {
@@ -1106,6 +1364,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            if let tauri::RunEvent::Exit = &event {
+                if let Some(state) = app.try_state::<cast::CastState>() {
+                    state.shutdown();
+                }
+            }
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             if let tauri::RunEvent::Opened { urls } = &event {
                 let files: Vec<PathBuf> = urls

@@ -16,3 +16,65 @@ jobs:
         run: node scripts/check-html-scripts.mjs
       - name: Unit tests
         run: node --test slidex-core.test.mjs
+      - name: Check Cast firewall command quoting
+        run: node scripts/cast-firewall-commands.mjs --check
+
+  cast-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Sync the UI the Tauri build script reads
+        run: node scripts/sync-ui.mjs
+      - name: Cast unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib cast::tests
+      - name: Run the installer firewall commands
+        run: node scripts/cast-firewall-commands.mjs --apply
+
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Build the NSIS installer
+        run: npm ci && npm run build
+      - name: Hash the installer and assert the firewall script is inside
+        id: installer
+        shell: pwsh
+        run: |
+          $conf = Get-Content -Raw -LiteralPath src-tauri/tauri.conf.json | ConvertFrom-Json
+          $name = "SlideX_$($conf.version)_x64-setup.exe"
+          $dir = Join-Path src-tauri (Join-Path target (Join-Path release (Join-Path bundle nsis)))
+          $exe = Join-Path $dir $name
+          if (-not (Test-Path -LiteralPath $exe)) {
+            Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+            throw "installer not found: $exe"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLower()
+          $sha = "$exe.sha256.txt"
+          Set-Content -LiteralPath $sha -Encoding ascii -Value "$hash  $name"
+          $seven = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $seven)) { throw "7-Zip is not installed" }
+          $listing = & $seven l $exe
+          $listing | Out-Host
+          if (-not ($listing -match 'cast-fw-check\.ps1')) {
+            throw "cast-fw-check.ps1 is not inside $name"
+          }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "exe_name=$name" -Encoding utf8NoBOM
+      - name: Upload the installer and its SHA256
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.installer.outputs.exe_name }}
+          path: |
+            src-tauri/target/release/bundle/nsis/SlideX_*_x64-setup.exe
+            src-tauri/target/release/bundle/nsis/SlideX_*_x64-setup.exe.sha256.txt
+          if-no-files-found: error
