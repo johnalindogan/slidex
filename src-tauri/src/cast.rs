@@ -4265,8 +4265,16 @@ fn handle_cmd(
                 let sid = flags
                     .media_session
                     .ok_or_else(|| "Nothing is casting.".to_string())?;
-                // Photos and video both send PAUSE. The reply's playerState is
-                // not a remote event; stills ignore playerState entirely.
+                if flags.media_kind == "still" {
+                    // The receiver reports a still as PAUSED or BUFFERING and
+                    // does not answer PAUSE. Waiting out the media deadline
+                    // makes the panel say the TV never loaded the photo.
+                    let _ = (sid, origin);
+                    flags.player_state = "paused".into();
+                    flags.slideshow_playing = false;
+                    publish(status, |s| s.player_state = "paused".into());
+                    return Ok(());
+                }
                 link.pause(sid, origin)?;
                 flags.player_state = "paused".into();
                 flags.slideshow_playing = false;
@@ -4283,6 +4291,15 @@ fn handle_cmd(
                 let sid = flags
                     .media_session
                     .ok_or_else(|| "Nothing is casting.".to_string())?;
+                if flags.media_kind == "still" {
+                    // Same as 8fa45d8. A still loaded with autoplay does not
+                    // answer PLAY, so the 4s wait is the timeout after LOAD.
+                    let _ = (sid, origin);
+                    flags.player_state = "playing".into();
+                    flags.slideshow_playing = true;
+                    publish(status, |s| s.player_state = "playing".into());
+                    return Ok(());
+                }
                 link.play(sid, origin)?;
                 flags.player_state = "playing".into();
                 flags.slideshow_playing = true;
@@ -5632,6 +5649,10 @@ mod tests {
         /// When non-zero, `idle_after` waits this long after the LOAD instead of
         /// being sent inside the LOAD handler. Zero keeps the immediate send.
         idle_delay: Duration,
+        /// A still image. LOAD is answered with BUFFERING on the LOAD requestId.
+        /// Unsolicited requestId 0 statuses arrive before and after that reply.
+        /// PLAY and PAUSE are not answered.
+        still: bool,
     }
 
     impl Default for FakeScript {
@@ -5643,6 +5664,7 @@ mod tests {
                 follow_states: &[],
                 idle_after: &[],
                 idle_delay: Duration::ZERO,
+                still: false,
             }
         }
     }
@@ -5955,6 +5977,16 @@ mod tests {
                     fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
                     continue;
                 }
+                if script.still {
+                    // requestId 0, and a different mediaSessionId, must not satisfy LOAD.
+                    note_trace(traces, "media-status requestId=0");
+                    send_media_status(mm, 0, 1, "PAUSED");
+                    note_trace(traces, "media-status");
+                    send_media_status(mm, id, 7, "BUFFERING");
+                    note_trace(traces, "media-status requestId=0");
+                    send_media_status(mm, 0, 7, "PAUSED");
+                    continue;
+                }
                 note_trace(traces, "media-status");
                 send_media_status(mm, 999, 1, "PLAYING");
                 send_media_status(mm, id, 7, script.load_state);
@@ -6008,6 +6040,10 @@ mod tests {
                 );
                 if dest != "transport-1" || !transport_up {
                     note_trace(traces, &format!("media-refused {typ} {dest}"));
+                    continue;
+                }
+                if script.still && matches!(typ.as_str(), "PLAY" | "PAUSE") {
+                    note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
                     continue;
                 }
                 let state = match typ.as_str() {
@@ -6479,6 +6515,98 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn photo_play_does_not_wait_when_the_receiver_leaves_play_unanswered() {
+        let log = LogDir::new();
+        let photo = scratch("vacation-photo.jpg", &jpeg_bytes());
+        let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(std::slice::from_ref(&photo)).unwrap();
+        let fake = spawn_fake(FakeScript {
+            still: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let status = Mutex::new(CastLiveStatus {
+            connected: true,
+            player_state: "idle".into(),
+            remote_event: None,
+            error: None,
+            media_kind: String::new(),
+            http_port: http.port,
+            bind_ip: http.bind_ip.to_string(),
+            item_index: 0,
+        });
+        let (remote, mut flags) = session_after_load("still");
+        flags.media_kind.clear();
+        flags.media_session = None;
+        flags.player_state = "idle".into();
+        flags.item_index = 0;
+        let mut running = true;
+        let (load_tx, load_rx) = std::sync::mpsc::channel();
+        let kept = handle_cmd(
+            CastCmd::Load {
+                path: photo,
+                autoplay: true,
+                origin: CastOrigin::User,
+                reply: load_tx,
+            },
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+        );
+        assert!(kept);
+        assert!(load_rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        assert_eq!(flags.media_session, Some(7), "requestId 0 must not win the LOAD");
+        assert_eq!(flags.media_kind, "still");
+        let states = pump_player_states(&link, 1);
+        assert_eq!(states, vec![PlayerState::Paused]);
+        flags.note_state(PlayerState::Paused, false);
+        assert!(remote.lock().unwrap().is_none());
+        assert_eq!(flags.player_state, "playing");
+
+        let started = Instant::now();
+        let (play_tx, play_rx) = std::sync::mpsc::channel();
+        let kept = handle_cmd(
+            CastCmd::Play {
+                origin: CastOrigin::User,
+                reply: play_tx,
+            },
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+        );
+        let played = play_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "photo PLAY waited {:?}; a still must not sit out the 4s media deadline",
+            started.elapsed()
+        );
+        assert!(played.is_ok(), "{played:?}");
+        assert!(kept);
+        let live = status.lock().unwrap().clone();
+        assert_eq!(live.player_state, "playing");
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert!(live.connected);
+        assert!(flags.slideshow_playing);
+        let text = fake.trace_text();
+        assert!(text.contains("load transport-1"), "{text}");
+        assert!(
+            !text.lines().any(|line| line.starts_with("PLAY ")),
+            "a still must not be sent PLAY: {text}"
+        );
+        let written = log.text();
+        assert!(
+            !written.contains("timeout") && !written.contains("didn't answer"),
+            "{written}"
+        );
     }
 
     #[test]
