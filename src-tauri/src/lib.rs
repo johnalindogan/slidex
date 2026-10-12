@@ -1148,9 +1148,10 @@ fn cast_load(
     path: String,
     autoplay: Option<bool>,
     source: Option<String>,
+    duration_ms: Option<u64>,
 ) -> Result<(), String> {
     let origin = cast::CastOrigin::parse(source.as_deref().unwrap_or("user"))?;
-    state.load(path, autoplay.unwrap_or(true), origin)
+    state.load(path, autoplay.unwrap_or(true), origin, duration_ms)
 }
 
 #[tauri::command]

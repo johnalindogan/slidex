@@ -46,6 +46,8 @@ const READ_SLICE: Duration = Duration::from_millis(400);
 /// Cold TVs often take 5–10s to answer LAUNCH. Give up at 15s.
 const LAUNCH_DEADLINE: Duration = Duration::from_secs(15);
 const LOAD_DEADLINE: Duration = Duration::from_secs(15);
+/// Photo hold when the page does not send a duration. A positive session value replaces this.
+const DEFAULT_PHOTO_TIMER_MS: u64 = 10_000;
 /// Our heartbeat. The TV is treated as gone after `LINK_DEAD_AFTER` of silence.
 const PING_EVERY: Duration = Duration::from_secs(5);
 const LINK_DEAD_AFTER: Duration = Duration::from_secs(15);
@@ -81,6 +83,24 @@ impl CastOrigin {
             Self::Remote => "remote",
         }
     }
+}
+
+/// Milliseconds a photo stays up. The page's duration is used as sent.
+/// Missing or zero is the 10s default, which is what a cast log showed
+/// when the session duration never reached the timer.
+fn photo_timer_ms(session_ms: Option<u64>) -> u64 {
+    match session_ms {
+        Some(ms) if ms > 0 => ms,
+        _ => DEFAULT_PHOTO_TIMER_MS,
+    }
+}
+
+fn with_timer_dur(detail: String, origin: CastOrigin, session_ms: Option<u64>) -> String {
+    if origin != CastOrigin::Timer {
+        return detail;
+    }
+    let ms = photo_timer_ms(session_ms);
+    detail.replacen("source=timer", &format!("source=timer dur_ms={ms}"), 1)
 }
 
 fn connect_fail(detail: String) -> String {
@@ -2365,6 +2385,8 @@ struct CastLink {
     cancel: Arc<AtomicBool>,
     /// Shared with the caller so a dead link still produces exactly one line.
     disconnect_logged: Arc<AtomicBool>,
+    /// Duration the page timer used for this LOAD. Read only for `source=timer`.
+    photo_timer_ms: Cell<Option<u64>>,
 }
 
 impl CastLink {
@@ -2429,6 +2451,7 @@ impl CastLink {
             logged_pong: Cell::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             disconnect_logged: Arc::new(AtomicBool::new(false)),
+            photo_timer_ms: Cell::new(None),
         })
     }
 
@@ -2509,6 +2532,35 @@ impl CastLink {
         Ok(())
     }
 
+    fn log_load(
+        &self,
+        host: &str,
+        request_id: u32,
+        origin: CastOrigin,
+        item: u32,
+        media_type: &str,
+        url: &str,
+        content_type: &str,
+        tail: &str,
+    ) {
+        let detail = load_log_detail(
+            host,
+            request_id,
+            origin.as_str(),
+            item,
+            media_type,
+            url,
+            content_type,
+            tail,
+        );
+        let session_ms = if origin == CastOrigin::Timer {
+            self.photo_timer_ms.get()
+        } else {
+            None
+        };
+        cast_log("load", &with_timer_dur(detail, origin, session_ms));
+    }
+
     fn load_url(
         &self,
         url: &str,
@@ -2524,57 +2576,48 @@ impl CastLink {
         let request_id = self.mm.generate_request_id().get();
         let payload = load_payload(request_id, &self.session_id, url, content_type, autoplay);
         let host = media_url_host(url).unwrap_or_else(|| "host-unknown".into());
-        let source = origin.as_str();
         let media_type = media_type_label(media_type);
         if let Err(e) = self.send_json(NS_MEDIA, &self.transport_id, &payload) {
             let err = map_load_error(&e.to_string());
-            cast_log(
-                "load",
-                &load_log_detail(
-                    &host,
-                    request_id,
-                    source,
-                    item,
-                    media_type,
-                    url,
-                    content_type,
-                    &format!("error={err}"),
-                ),
+            self.log_load(
+                &host,
+                request_id,
+                origin,
+                item,
+                media_type,
+                url,
+                content_type,
+                &format!("error={err}"),
             );
             return Err(err);
         }
         match self.wait_load(request_id) {
             Ok(reply) => {
                 let sid = reply.session_id;
-                cast_log(
-                    "load",
-                    &load_log_detail(
-                        &host,
-                        request_id,
-                        source,
-                        item,
-                        media_type,
-                        url,
-                        content_type,
-                        &reply.log_tail(),
-                    ),
+                let tail = reply.log_tail();
+                self.log_load(
+                    &host,
+                    request_id,
+                    origin,
+                    item,
+                    media_type,
+                    url,
+                    content_type,
+                    &tail,
                 );
                 Ok(sid)
             }
             Err(fail) if fail.user == CAST_CANCELLED => Err(fail.user),
             Err(fail) => {
-                cast_log(
-                    "load",
-                    &load_log_detail(
-                        &host,
-                        request_id,
-                        source,
-                        item,
-                        media_type,
-                        url,
-                        content_type,
-                        &fail.log_tail,
-                    ),
+                self.log_load(
+                    &host,
+                    request_id,
+                    origin,
+                    item,
+                    media_type,
+                    url,
+                    content_type,
+                    &fail.log_tail,
                 );
                 Err(fail.user)
             }
@@ -3639,55 +3682,6 @@ fn on_media_idle(
     }
 }
 
-/// Slideshow timer for the photo now on the TV. A video, or a paused slideshow,
-/// does not step. No finished event: the page already moved.
-/// Test stand-in for the page timer. Production advances photos from `schedNext`.
-#[cfg(test)]
-fn on_photo_timer(
-    link: &CastLink,
-    flags: &mut SessionFlags,
-    next: Successor,
-) -> Result<bool, String> {
-    if !flags.slideshow_playing || flags.media_kind != "still" {
-        return Ok(false);
-    }
-    match link.load_url(
-        &next.url,
-        &next.content_type,
-        true,
-        CastOrigin::Timer,
-        next.item,
-        next.media_type,
-    ) {
-        Ok(sid) => {
-            flags.media_session = Some(sid);
-            flags.advanced_session = None;
-            flags.failed_session = None;
-            flags.ignored_photo = None;
-            flags.item_index = next.item;
-            flags.media_kind = if next.media_type == "video" {
-                "video"
-            } else {
-                "still"
-            }
-            .into();
-            flags.player_state = "playing".into();
-            flags.error = None;
-            flags.local_cmd = Some("play");
-            flags.local_cmd_at = Instant::now();
-            Ok(true)
-        }
-        Err(err) if err == CAST_CANCELLED => {
-            cast_log(
-                "load_skipped",
-                &format!("item={} reason=cast stopped", item_log_token(next.item)),
-            );
-            Err(err)
-        }
-        Err(err) => Err(err),
-    }
-}
-
 enum CastCmd {
     SetPlaylist {
         paths: Vec<PathBuf>,
@@ -3697,6 +3691,8 @@ enum CastCmd {
         path: PathBuf,
         autoplay: bool,
         origin: CastOrigin,
+        /// Photo hold from the page timer. Ignored unless `origin` is timer.
+        duration_ms: Option<u64>,
         reply: Sender<Result<(), String>>,
     },
     Pause {
@@ -3846,13 +3842,20 @@ impl CastState {
         })
     }
 
-    pub fn load(&self, path: String, autoplay: bool, origin: CastOrigin) -> Result<(), String> {
+    pub fn load(
+        &self,
+        path: String,
+        autoplay: bool,
+        origin: CastOrigin,
+        duration_ms: Option<u64>,
+    ) -> Result<(), String> {
         self.roundtrip(|tx| {
             let (reply_tx, reply_rx) = mpsc::channel();
             tx.send(CastCmd::Load {
                 path: PathBuf::from(path),
                 autoplay,
                 origin,
+                duration_ms,
                 reply: reply_tx,
             })
             .map_err(|_| "Cast is not connected.".to_string())?;
@@ -4293,6 +4296,7 @@ fn handle_cmd(
             path,
             autoplay,
             origin,
+            duration_ms,
             reply,
         } => {
             let result = (|| {
@@ -4303,6 +4307,11 @@ fn handle_cmd(
                 let kind = http.kind_of(&path)?;
                 let item = http.index_of(&path).unwrap_or(0);
                 let play = if kind == "still" { true } else { autoplay };
+                link.photo_timer_ms.set(if origin == CastOrigin::Timer {
+                    duration_ms
+                } else {
+                    None
+                });
                 let sid = link.load_url(&url, &ctype, play, origin, item, &kind)?;
                 flags.media_session = Some(sid);
                 flags.advanced_session = None;
@@ -6707,6 +6716,7 @@ mod tests {
                     path,
                     autoplay,
                     origin: CastOrigin::User,
+                    duration_ms: None,
                     reply: tx,
                 },
                 &mut http,
@@ -7535,7 +7545,7 @@ mod tests {
     }
 
     #[test]
-    fn photo_finished_at_10s_loads_the_next_item_only_at_15s() {
+    fn photo_finished_does_not_load_the_next_item() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
             idle_after: &[(1, "FINISHED", 7)],
@@ -7560,10 +7570,9 @@ mod tests {
         flags.ignored_photo = None;
         let mut saw_finished = false;
         let mut finished_at = Duration::ZERO;
-        let mut timer_at = None;
         let mut next_ping = Instant::now();
         let deadline = started + Duration::from_secs(20);
-        while Instant::now() < deadline {
+        while Instant::now() < deadline && !saw_finished {
             if Instant::now() >= next_ping {
                 link.ping().expect("ping");
                 next_ping = Instant::now() + PING_EVERY;
@@ -7602,29 +7611,6 @@ mod tests {
                 Ok(None) => {}
                 Err(e) => panic!("pump: {e}"),
             }
-            if timer_at.is_none() && started.elapsed() >= Duration::from_secs(15) {
-                assert_eq!(
-                    socket_loads(&fake),
-                    ["load transport-1 item=photo-1"],
-                    "the slideshow timer is the only photo advance"
-                );
-                let did = on_photo_timer(
-                    &link,
-                    &mut flags,
-                    Successor {
-                        url: photo2.to_string(),
-                        content_type: "image/jpeg".into(),
-                        item: 2,
-                        media_type: "photo",
-                    },
-                )
-                .unwrap();
-                assert!(did, "the 15s timer must load the next photo");
-                timer_at = Some(started.elapsed());
-            }
-            if timer_at.is_some() && saw_finished && started.elapsed() >= Duration::from_secs(18) {
-                break;
-            }
         }
         assert!(saw_finished, "the fake TV never sent FINISHED");
         assert!(
@@ -7632,18 +7618,10 @@ mod tests {
                 && finished_at <= Duration::from_millis(12500),
             "FINISHED arrived at {finished_at:?}"
         );
-        let timer_at = timer_at.expect("the slideshow timer did not fire");
-        assert!(
-            timer_at >= Duration::from_secs(14) && timer_at <= Duration::from_secs(17),
-            "next LOAD went out at {timer_at:?}"
-        );
         assert_eq!(
             socket_loads(&fake),
-            [
-                "load transport-1 item=photo-1",
-                "load transport-1 item=photo-2",
-            ],
-            "the next photo is loaded once"
+            ["load transport-1 item=photo-1"],
+            "a photo FINISHED does not load the next item"
         );
         let written = log.text();
         let ignored: Vec<_> = written
@@ -7652,12 +7630,7 @@ mod tests {
             .collect();
         assert_eq!(ignored.len(), 1, "{written}");
         assert!(ignored[0].contains("item=1"), "{}", ignored[0]);
-        let timer_loads: Vec<_> = written
-            .lines()
-            .filter(|line| line.contains(" load ") && line.contains("source=timer"))
-            .collect();
-        assert_eq!(timer_loads.len(), 1, "{written}");
-        assert!(timer_loads[0].contains("item=2 type=photo"), "{}", timer_loads[0]);
+        assert!(!written.contains("source=timer"), "{written}");
         assert!(!written.contains(" advance "), "{written}");
         assert!(!written.contains("source=remote"), "{written}");
         assert!(!written.contains("load_failed"), "{written}");
@@ -7738,7 +7711,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_slideshow_does_not_advance_on_a_photo_timer_or_a_video_finished() {
+    fn paused_slideshow_does_not_advance_on_photo_or_video_finished() {
         let log = LogDir::new();
         let fake = spawn_fake(FakeScript {
             idle_after: &[(1, "FINISHED", 7), (2, "FINISHED", 7)],
@@ -7793,18 +7766,6 @@ mod tests {
             }
         }
         assert!(saw_photo, "the photo FINISHED never arrived");
-        let stepped = on_photo_timer(
-            &link,
-            &mut flags,
-            Successor {
-                url: next_photo.url.clone(),
-                content_type: next_photo.content_type.clone(),
-                item: next_photo.item,
-                media_type: next_photo.media_type,
-            },
-        )
-        .unwrap();
-        assert!(!stepped, "a paused slideshow must not step on the photo timer");
         assert_eq!(flags.item_index, 1);
         assert_eq!(socket_loads(&fake), ["load transport-1 item=photo-1"]);
 
@@ -7860,6 +7821,105 @@ mod tests {
         assert!(!written.contains(" advance "), "{written}");
         assert!(!written.contains("source=remote"), "{written}");
         assert!(!written.contains("load_failed"), "{written}");
+    }
+
+    #[test]
+    fn a_20s_timer_load_logs_that_duration_and_the_next_photo_can_change_it() {
+        assert_eq!(photo_timer_ms(Some(20_000)), 20_000);
+        assert_eq!(photo_timer_ms(None), 10_000);
+        assert_eq!(photo_timer_ms(Some(0)), 10_000);
+        assert_eq!(DEFAULT_PHOTO_TIMER_MS, 10_000);
+
+        let log = LogDir::new();
+        let path = scratch("hold.jpg", &jpeg_bytes());
+        let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(std::slice::from_ref(&path)).unwrap();
+        let fake = spawn_fake(FakeScript {
+            still: true,
+            ..FakeScript::default()
+        });
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let status = Mutex::new(CastLiveStatus {
+            connected: true,
+            player_state: "idle".into(),
+            remote_event: None,
+            error: None,
+            media_kind: String::new(),
+            http_port: http.port,
+            bind_ip: http.bind_ip.to_string(),
+            item_index: 0,
+        });
+        let (_remote, mut flags) = session_after_load("still");
+        flags.media_kind.clear();
+        flags.media_session = None;
+        flags.slideshow_playing = true;
+        let mut running = true;
+
+        let load_at = |http: &mut MediaHttp,
+                       link: &CastLink,
+                       flags: &mut SessionFlags,
+                       status: &Mutex<CastLiveStatus>,
+                       running: &mut bool,
+                       duration_ms: Option<u64>| {
+            let (tx, rx) = mpsc::channel();
+            let kept = handle_cmd(
+                CastCmd::Load {
+                    path: path.clone(),
+                    autoplay: true,
+                    origin: CastOrigin::Timer,
+                    duration_ms,
+                    reply: tx,
+                },
+                http,
+                link,
+                flags,
+                status,
+                running,
+            );
+            assert!(kept);
+            assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());
+        };
+        load_at(
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+            Some(20_000),
+        );
+        load_at(
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+            Some(8_000),
+        );
+
+        let written = log.text();
+        let timer_loads: Vec<_> = written
+            .lines()
+            .filter(|line| line.contains(" load ") && line.contains("source=timer"))
+            .collect();
+        assert_eq!(timer_loads.len(), 2, "{written}");
+        assert!(
+            timer_loads[0].contains("dur_ms=20000"),
+            "first timer used the 20s session duration: {}",
+            timer_loads[0]
+        );
+        assert!(
+            !timer_loads[0].contains("dur_ms=10000"),
+            "the 10s default must not replace 20s: {}",
+            timer_loads[0]
+        );
+        assert!(
+            timer_loads[1].contains("dur_ms=8000"),
+            "the next photo uses the duration changed while casting: {}",
+            timer_loads[1]
+        );
+        assert!(!written.contains(" play "), "{written}");
     }
 
     #[test]

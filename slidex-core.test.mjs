@@ -481,17 +481,156 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
-test('0.1.9 versions match and the welcome screen reads getVersion()', () => {
+test('a 20s cast photo uses that duration, and a change waits for the next photo', () => {
+  assert.equal(C.savedImageDuration('20000'), 20000);
+  assert.equal(C.castPhotoHoldMs(null, 20000), 20000);
+  assert.equal(C.castPhotoHoldMs({ customDur: 20000 }, 10000), 20000);
+  assert.equal(C.castPhotoHoldMs({ imageUpdates: { customDur: 20000 } }, 10000), 20000);
+  assert.equal(C.castPhotoHoldMs(null, 10000), 10000);
+  assert.equal(C.castPhotoHoldMs(null, 999), 10000);
+  assert.equal(C.resolveImageDuration(undefined, 20000), 20000);
+
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /value="20000">20s/);
+  assert.doesNotMatch(html, /__sspCastHoldMs/);
+  const durFns = html.slice(html.indexOf('const getDur = () =>'), html.indexOf('/* ── Zoom / Pan ── */'));
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  const onchange = html.slice(html.indexOf("g('dsel').onchange"), html.indexOf('(function initDefaultImageDuration'));
+  const hook = html.slice(html.indexOf('function sspCastHook('), html.indexOf('function sspCastPlaying'));
+  assert.match(onchange, /__sspCastActive/);
+  assert.ok(onchange.indexOf('return') < onchange.indexOf('clearTimeout(tmr)'));
+  const castBranch = onchange.slice(onchange.indexOf('__sspCastActive'), onchange.indexOf('clearTimeout(tmr)'));
+  assert.match(castBranch, /startKB\(cur\)/);
+  assert.match(castBranch, /startProg\(\)/);
+  assert.doesNotMatch(castBranch, /schedNext/);
+  assert.match(sched, /goTo\(nextMI\(\), 'timer'\)/);
+  assert.doesNotMatch(sched, /__sspCastHoldMs/);
+  assert.match(hook, /getEDur\(\)/);
+  const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
+  assert.match(load, /src === ['"]timer['"]/);
+  assert.match(load, /durationMs/);
+  assert.doesNotMatch(load, /__sspCastHoldMs/);
+  const slideStart = html.indexOf('slide: function (source, holdMs)');
+  const slideFn = html.slice(slideStart, html.indexOf('transport: function', slideStart)).replace(/,\s*$/, '');
+  assert.doesNotMatch(slideFn, /getEDur|__sspCastHoldMs/);
+  assert.ok(slideFn.indexOf('holdMs') < slideFn.indexOf('enqueue'), 'the loaded duration is captured before the load is queued');
+
+  const timers = [];
+  const loads = [];
+  let seq = 1;
+  let kb = 0;
+  let prog = 0;
+  const sandbox = {
+    console,
+    SlideXCore: C,
+    cur: 0,
+    playing: true,
+    tmr: null,
+    ptmr: null,
+    spd: 100,
+    dsel: '20000',
+    dselEl: { value: '20000' },
+    items: [
+      { name: 'one.jpg' },
+      { name: 'two.jpg', customDur: 12000 },
+      { name: 'three.jpg' },
+    ],
+    castActive: true,
+    getMediaItems() { return sandbox.items; },
+    getSpd() { return sandbox.spd / 100; },
+    isV() { return false; },
+    nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
+    g(id) {
+      if (id === 'dsel') {
+        sandbox.dselEl.value = sandbox.dsel;
+        return sandbox.dselEl;
+      }
+      return {};
+    },
+    localStorage: { setItem(k, v) { this[k] = v; } },
+    startKB() { kb += 1; },
+    startProg() { prog += 1; },
+    clearInterval() {},
+    enqueue(fn) { fn(); },
+    loadCurrent(source, holdMs) { loads.push({ source, holdMs }); },
+    setTimeout(fn, ms) {
+      const id = seq++;
+      timers.push({ id, fn, ms });
+      return id;
+    },
+    clearTimeout(id) {
+      const i = timers.findIndex(t => t.id === id);
+      if (i >= 0) timers.splice(i, 1);
+    },
+    goTo(i, source) {
+      sandbox.cur = i;
+      sandbox.sspCastHook('slide', source);
+    },
+    window: { SlideXCore: C, __sspCastActive: true, __sspCastGen: 1 },
+  };
+  sandbox.window.window = sandbox.window;
+  vm.runInNewContext(`
+    ${durFns}
+    ${sched}
+    ${hook}
+    ${onchange}
+    window.__sspCast = { ${slideFn} };
+  `, sandbox);
+  sandbox.schedNext();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 20000);
+  sandbox.dsel = '8000';
+  sandbox.dselEl.onchange();
+  assert.equal(kb, 1, 'a duration change while casting restarts Ken Burns');
+  assert.equal(prog, 1, 'a duration change while casting restarts the progress bar');
+  assert.equal(timers.length, 1, 'changing duration while casting must not restart this photo');
+  assert.equal(timers[0].ms, 20000);
+  sandbox.playing = false;
+  kb = 0;
+  prog = 0;
+  sandbox.dselEl.onchange();
+  assert.equal(kb, 1, 'a paused cast still restarts Ken Burns');
+  assert.equal(prog, 1, 'a paused cast still restarts the progress bar');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 20000, 'a paused cast does not restart the photo timer');
+  sandbox.playing = true;
+  const fired = timers[0];
+  timers.splice(0, 1);
+  fired.fn();
+  assert.equal(sandbox.cur, 1);
+  assert.deepEqual(loads, [{ source: 'timer', holdMs: 12000 }], 'dur_ms is the loaded item, not the 20s hold that just ended');
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 12000, 'the loaded photo keeps its own duration');
+  const firedNext = timers[0];
+  timers.splice(0, 1);
+  firedNext.fn();
+  assert.equal(sandbox.cur, 2);
+  assert.deepEqual(loads[1], { source: 'timer', holdMs: 8000 });
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 8000, 'a photo without its own duration uses the setting changed during the previous one');
+  sandbox.window.__sspCastActive = false;
+  sandbox.cur = 0;
+  sandbox.dsel = '6000';
+  kb = 0;
+  prog = 0;
+  sandbox.dselEl.onchange();
+  assert.equal(kb, 1);
+  assert.equal(prog, 1);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
+});
+
+test('0.1.10 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.9');
-  assert.equal(tauri.version, '0.1.9');
+  assert.equal(pkg.version, '0.1.10');
+  assert.equal(tauri.version, '0.1.10');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.9"/m);
-  assert.match(lock, /"version": "0\.1\.9"/);
+  assert.match(cargo, /^version = "0\.1\.10"/m);
+  assert.match(lock, /"version": "0\.1\.10"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
