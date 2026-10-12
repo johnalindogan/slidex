@@ -1285,7 +1285,14 @@ function sspCastHook(name, source) {
   try {
     if (window.__sspCastEcho) return;
     var fn = window.__sspCast && window.__sspCast[name];
-    if (typeof fn === 'function') fn(source || 'user');
+    if (typeof fn !== 'function') return;
+    if (name === 'slide') {
+      var src = source || 'user';
+      // Timer loads log this slide's hold. cur already points at the item being loaded.
+      fn(src, src === 'timer' && typeof getEDur === 'function' ? Math.round(getEDur()) : 0);
+      return;
+    }
+    fn(source || 'user');
   } catch (e) {
     console.warn('cast hook', name, e);
   }
@@ -5739,7 +5746,6 @@ function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
   const ms = getEDur(cur);
   tmr = setTimeout(() => {
-    window.__sspCastHoldMs = ms;
     goTo(nextMI(), 'timer');
     schedNext();
   }, ms);
@@ -7484,7 +7490,6 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var args = { path: path, autoplay: !!sspCastPlaying(), source: src };
     if (src === "timer") {
       var used = holdMs;
-      if (!(used > 0)) used = window.__sspCastHoldMs;
       if (!(used > 0)) used = (window.SlideXCore && SlideXCore.DEFAULT_IMAGE_DURATION_MS) || 10000;
       args.durationMs = Math.round(used);
     }
@@ -7544,13 +7549,13 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   }
   window.__sspCastGen = window.__sspCastGen || 0;
   window.__sspCast = {
-    slide: function (source) {
+    slide: function (source, holdMs) {
       var gen = window.__sspCastGen || 0;
       var src = source || "user";
-      var hold = window.__sspCastHoldMs;
+      var dur = src === "timer" ? holdMs : 0;
       enqueue(function () {
         if (gen !== (window.__sspCastGen || 0) || !castActive || !window.__sspCastActive) return Promise.resolve();
-        return loadCurrent(src, hold);
+        return loadCurrent(src, dur);
       });
     },
     transport: function (source) {

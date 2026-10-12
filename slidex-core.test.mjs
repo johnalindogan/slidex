@@ -492,17 +492,27 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
 
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   assert.match(html, /value="20000">20s/);
+  assert.doesNotMatch(html, /__sspCastHoldMs/);
   const durFns = html.slice(html.indexOf('const getDur = () =>'), html.indexOf('/* ── Zoom / Pan ── */'));
   const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
   const onchange = html.slice(html.indexOf("g('dsel').onchange"), html.indexOf('(function initDefaultImageDuration'));
+  const hook = html.slice(html.indexOf('function sspCastHook('), html.indexOf('function sspCastPlaying'));
   assert.match(onchange, /__sspCastActive/);
   assert.ok(onchange.indexOf('return') < onchange.indexOf('clearTimeout(tmr)'));
-  assert.match(sched, /__sspCastHoldMs/);
+  assert.match(sched, /goTo\(nextMI\(\), 'timer'\)/);
+  assert.doesNotMatch(sched, /__sspCastHoldMs/);
+  assert.match(hook, /getEDur\(\)/);
   const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
   assert.match(load, /src === ['"]timer['"]/);
   assert.match(load, /durationMs/);
+  assert.doesNotMatch(load, /__sspCastHoldMs/);
+  const slideStart = html.indexOf('slide: function (source, holdMs)');
+  const slideFn = html.slice(slideStart, html.indexOf('transport: function', slideStart)).replace(/,\s*$/, '');
+  assert.doesNotMatch(slideFn, /getEDur|__sspCastHoldMs/);
+  assert.ok(slideFn.indexOf('holdMs') < slideFn.indexOf('enqueue'), 'the loaded duration is captured before the load is queued');
 
   const timers = [];
+  const loads = [];
   let seq = 1;
   const sandbox = {
     console,
@@ -514,7 +524,12 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
     spd: 100,
     dsel: '20000',
     dselEl: { value: '20000' },
-    items: [{ name: 'one.jpg' }, { name: 'two.jpg' }],
+    items: [
+      { name: 'one.jpg' },
+      { name: 'two.jpg', customDur: 12000 },
+      { name: 'three.jpg' },
+    ],
+    castActive: true,
     getMediaItems() { return sandbox.items; },
     getSpd() { return sandbox.spd / 100; },
     isV() { return false; },
@@ -530,6 +545,8 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
     startKB() {},
     startProg() {},
     clearInterval() {},
+    enqueue(fn) { fn(); },
+    loadCurrent(source, holdMs) { loads.push({ source, holdMs }); },
     setTimeout(fn, ms) {
       const id = seq++;
       timers.push({ id, fn, ms });
@@ -539,16 +556,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
       const i = timers.findIndex(t => t.id === id);
       if (i >= 0) timers.splice(i, 1);
     },
-    goTo(i) {
+    goTo(i, source) {
       sandbox.cur = i;
+      sandbox.sspCastHook('slide', source);
     },
-    window: { SlideXCore: C, __sspCastActive: true, __sspCastHoldMs: 0 },
+    window: { SlideXCore: C, __sspCastActive: true, __sspCastGen: 1 },
   };
   sandbox.window.window = sandbox.window;
   vm.runInNewContext(`
     ${durFns}
     ${sched}
+    ${hook}
     ${onchange}
+    window.__sspCast = { ${slideFn} };
   `, sandbox);
   sandbox.schedNext();
   assert.equal(timers.length, 1);
@@ -561,9 +581,16 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   timers.splice(0, 1);
   fired.fn();
   assert.equal(sandbox.cur, 1);
-  assert.equal(sandbox.window.__sspCastHoldMs, 20000);
+  assert.deepEqual(loads, [{ source: 'timer', holdMs: 12000 }], 'dur_ms is the loaded item, not the 20s hold that just ended');
   assert.equal(timers.length, 1);
-  assert.equal(timers[0].ms, 8000, 'the next photo uses the duration set during the previous one');
+  assert.equal(timers[0].ms, 12000, 'the loaded photo keeps its own duration');
+  const firedNext = timers[0];
+  timers.splice(0, 1);
+  firedNext.fn();
+  assert.equal(sandbox.cur, 2);
+  assert.deepEqual(loads[1], { source: 'timer', holdMs: 8000 });
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 8000, 'a photo without its own duration uses the setting changed during the previous one');
 });
 
 test('0.1.10 versions match and the welcome screen reads getVersion()', () => {
