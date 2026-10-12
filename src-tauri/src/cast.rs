@@ -1455,7 +1455,7 @@ fn http_loop(
                     // Dropping a socket that still holds the request makes Linux send RST
                     // and the client never sees the 503.
                     let _ = discard_unread(&mut sock);
-                    log_media_req(&sock, "unknown", "redacted", 503, 0);
+                    log_media_req(&sock, "unknown", "redacted", 503, 0, "none");
                     let _ = write_empty(&mut sock, 503);
                     let _ = sock.shutdown(Shutdown::Write);
                     continue;
@@ -1521,23 +1521,32 @@ struct MediaReqLog {
     path: String,
     status: u16,
     bytes: u64,
+    ctype: String,
 }
 
 impl MediaReqLog {
-    fn begin(sock: &TcpStream, method: &str) -> Self {
+    fn begin(sock: &TcpStream, method: &str, url: &str) -> Self {
         Self {
             from: peer_ipv4(sock),
             method: http_method_token(method),
-            path: "redacted".into(),
+            path: masked_media_path(url),
             status: 0,
             bytes: 0,
+            ctype: "none".into(),
         }
     }
 }
 
 impl Drop for MediaReqLog {
     fn drop(&mut self) {
-        log_media_req_fields(&self.from, &self.method, &self.path, self.status, self.bytes);
+        log_media_req_fields(
+            &self.from,
+            &self.method,
+            &self.path,
+            self.status,
+            self.bytes,
+            &self.ctype,
+        );
     }
 }
 
@@ -1562,23 +1571,85 @@ fn http_method_token(method: &str) -> String {
     }
 }
 
-/// Page index only. A missing or unknown index is the word `redacted`, never a file path.
-fn media_req_path_label(page_index: u32) -> String {
-    if page_index == 0 {
-        "redacted".into()
+/// `/m/<token>/<key>` becomes `/m/<key>?t=***`. The token is never copied into the log.
+fn masked_media_path(url_or_path: &str) -> String {
+    let bare = url_or_path.split(['?', '#']).next().unwrap_or(url_or_path);
+    let path = if let Some(rest) = bare
+        .strip_prefix("http://")
+        .or_else(|| bare.strip_prefix("https://"))
+    {
+        match rest.find('/') {
+            Some(i) => &rest[i..],
+            None => return "redacted".into(),
+        }
     } else {
-        page_index.to_string()
+        bare
+    };
+    let mut parts = path.split('/').filter(|s| !s.is_empty());
+    if parts.next() != Some("m") {
+        return "redacted".into();
+    }
+    let Some(token) = parts.next() else {
+        return "redacted".into();
+    };
+    let Some(key) = parts.next() else {
+        return "redacted".into();
+    };
+    if parts.next().is_some() || token.is_empty() || !log_key_ok(key) {
+        return "redacted".into();
+    }
+    format!("/m/{key}?t=***")
+}
+
+fn log_key_ok(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 80
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn log_ctype(ctype: &str) -> String {
+    match ctype {
+        "image/jpeg" | "image/png" | "video/mp4" => ctype.to_string(),
+        _ => "none".into(),
     }
 }
 
-fn log_media_req(sock: &TcpStream, method: &str, path: &str, status: u16, bytes: u64) {
-    log_media_req_fields(&peer_ipv4(sock), &http_method_token(method), path, status, bytes);
+fn mask_load_url(url: &str) -> String {
+    let host = media_url_host(url).unwrap_or_else(|| "host-unknown".into());
+    let path = masked_media_path(url);
+    if path == "redacted" {
+        "redacted".into()
+    } else {
+        format!("http://{host}{path}")
+    }
 }
 
-fn log_media_req_fields(from: &str, method: &str, path: &str, status: u16, bytes: u64) {
+fn log_media_req(sock: &TcpStream, method: &str, path: &str, status: u16, bytes: u64, ctype: &str) {
+    log_media_req_fields(
+        &peer_ipv4(sock),
+        &http_method_token(method),
+        path,
+        status,
+        bytes,
+        ctype,
+    );
+}
+
+fn log_media_req_fields(
+    from: &str,
+    method: &str,
+    path: &str,
+    status: u16,
+    bytes: u64,
+    ctype: &str,
+) {
     cast_log(
         "media_req",
-        &format!("from={from} method={method} path={path} status={status} bytes={bytes}"),
+        &format!(
+            "from={from} method={method} path={path} status={status} bytes={bytes} ctype={ctype}"
+        ),
     );
 }
 
@@ -1596,7 +1667,7 @@ fn serve_client(
     let mut parts = request.split_whitespace();
     let method = parts.next().unwrap_or("");
     let url = parts.next().unwrap_or("/").to_string();
-    let mut rec = MediaReqLog::begin(sock, method);
+    let mut rec = MediaReqLog::begin(sock, method, &url);
     if method != "GET" && method != "HEAD" {
         rec.status = 405;
         return write_empty(sock, 405);
@@ -1626,7 +1697,7 @@ fn serve_client(
             }
         }
     };
-    rec.path = media_req_path_label(entry.page_index);
+    rec.ctype = log_ctype(&entry.content_type);
     let prepared = match transform_media(&entry) {
         Ok(body) => body,
         Err(_) => {
@@ -2459,7 +2530,16 @@ impl CastLink {
             let err = map_load_error(&e.to_string());
             cast_log(
                 "load",
-                &load_log_detail(&host, request_id, source, item, media_type, &format!("error={err}")),
+                &load_log_detail(
+                    &host,
+                    request_id,
+                    source,
+                    item,
+                    media_type,
+                    url,
+                    content_type,
+                    &format!("error={err}"),
+                ),
             );
             return Err(err);
         }
@@ -2468,7 +2548,16 @@ impl CastLink {
                 let sid = reply.session_id;
                 cast_log(
                     "load",
-                    &load_log_detail(&host, request_id, source, item, media_type, &reply.log_tail()),
+                    &load_log_detail(
+                        &host,
+                        request_id,
+                        source,
+                        item,
+                        media_type,
+                        url,
+                        content_type,
+                        &reply.log_tail(),
+                    ),
                 );
                 Ok(sid)
             }
@@ -2476,7 +2565,16 @@ impl CastLink {
             Err(fail) => {
                 cast_log(
                     "load",
-                    &load_log_detail(&host, request_id, source, item, media_type, &fail.log_tail),
+                    &load_log_detail(
+                        &host,
+                        request_id,
+                        source,
+                        item,
+                        media_type,
+                        url,
+                        content_type,
+                        &fail.log_tail,
+                    ),
                 );
                 Err(fail.user)
             }
@@ -3024,10 +3122,16 @@ fn load_log_detail(
     source: &str,
     item: u32,
     media_type: &str,
+    url: &str,
+    content_type: &str,
     tail: &str,
 ) -> String {
     let item = item_log_token(item);
-    format!("{host} requestId={request_id} source={source} item={item} type={media_type} {tail}")
+    format!(
+        "{host} requestId={request_id} source={source} item={item} type={media_type} url={} contentType={} {tail}",
+        mask_load_url(url),
+        log_ctype(content_type)
+    )
 }
 
 /// The next playlist item a FINISHED status should LOAD.
@@ -3123,12 +3227,56 @@ fn sanitize_cast_log_detail(detail: &str) -> String {
     let flat: String = detail
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .take(180)
+        .take(360)
         .collect();
-    if flat.contains('\\') || flat.contains('/') || flat.contains("/m/") {
+    if flat.contains('\\') || unmasked_media_token(&flat) {
+        return "redacted".to_string();
+    }
+    let stripped = strip_allowed_log_slashes(&flat);
+    if stripped.contains('/') {
         return "redacted".to_string();
     }
     flat
+}
+
+/// `/m/<token>/<key>` still has the token. `/m/<key>?t=***` does not.
+fn unmasked_media_token(detail: &str) -> bool {
+    let mut rest = detail;
+    while let Some(at) = rest.find("/m/") {
+        let after = &rest[at + 3..];
+        let end = after.find([' ', '\t']).unwrap_or(after.len());
+        let token = &after[..end];
+        if let Some(slash) = token.find('/') {
+            if !token[..slash].contains('?') {
+                return true;
+            }
+        }
+        if after.len() <= 1 {
+            break;
+        }
+        rest = &after[1..];
+    }
+    false
+}
+
+fn strip_allowed_log_slashes(detail: &str) -> String {
+    let mut out = detail.replace("https://", "https:").replace("http://", "http:");
+    while let Some(start) = out.find("/m/") {
+        let after = start + 3;
+        let Some(mark) = out[after..].find("?t=***") else {
+            return out;
+        };
+        let key = &out[after..after + mark];
+        if !log_key_ok(key) {
+            return out;
+        }
+        let end = after + mark + "?t=***".len();
+        out.replace_range(start..end, "");
+    }
+    for ctype in ["image/jpeg", "image/png", "video/mp4"] {
+        out = out.replace(ctype, "ctype");
+    }
+    out
 }
 
 fn unix_now_secs() -> u64 {
@@ -3306,6 +3454,9 @@ impl SessionFlags {
         let item = item_log_token(self.item_index);
         cast_log("load_failed", &format!("item={item} reason=ERROR"));
         self.error = Some(cast_panel_message(CastPanelCause::LoadError));
+        if self.player_state == "playing" {
+            self.player_state = "idle".into();
+        }
         if let Ok(mut ev) = self.remote_event.lock() {
             *ev = Some("load_failed".to_string());
         }
@@ -3404,6 +3555,9 @@ fn on_media_idle(
         Err(err) => {
             if !err.contains("unreachable") {
                 flags.error = Some(err.clone());
+                if flags.player_state == "playing" {
+                    flags.player_state = "idle".into();
+                }
             }
             Err(err)
         }
@@ -3781,6 +3935,55 @@ fn publish(status: &Mutex<CastLiveStatus>, edit: impl FnOnce(&mut CastLiveStatus
     }
 }
 
+/// A media-command timeout or load error is visible on `cast_status`.
+/// `player_state` is not left at `playing`. `connected` stays true unless this
+/// failure is what tore the session down.
+fn publish_media_failure(
+    flags: &mut SessionFlags,
+    status: &Mutex<CastLiveStatus>,
+    err: &str,
+    torn_down: bool,
+) {
+    flags.error = Some(err.to_string());
+    if flags.player_state == "playing" {
+        flags.player_state = "idle".into();
+    }
+    if torn_down {
+        flags.connected = false;
+    }
+    let player = flags.player_state.clone();
+    let connected = flags.connected;
+    let error = flags.error.clone();
+    publish(status, |s| {
+        s.error = error;
+        s.player_state = player;
+        s.connected = connected;
+    });
+}
+
+fn finish_media_cmd(
+    result: Result<(), String>,
+    reply: Sender<Result<(), String>>,
+    flags: &mut SessionFlags,
+    status: &Mutex<CastLiveStatus>,
+) -> bool {
+    let torn = result.as_ref().err().is_some_and(|err| {
+        err != CAST_CANCELLED && err.contains("TV unreachable")
+    });
+    if let Err(err) = result.as_ref() {
+        if err != CAST_CANCELLED {
+            let shown = if torn {
+                link_down_message()
+            } else {
+                err.clone()
+            };
+            publish_media_failure(flags, status, &shown, torn);
+        }
+    }
+    let _ = reply.send(result);
+    !torn
+}
+
 fn run_session(
     host: Ipv4Addr,
     port: u16,
@@ -4053,20 +4256,7 @@ fn handle_cmd(
                 eprintln!("[cast] loaded {}", flags.media_kind);
                 Ok(())
             })();
-            let link_dead = result
-                .as_ref()
-                .err()
-                .is_some_and(|e: &String| e.contains("TV unreachable"));
-            let _ = reply.send(result);
-            if link_dead {
-                flags.connected = false;
-                publish(status, |s| {
-                    s.connected = false;
-                    s.error = Some(link_down_message());
-                });
-                return false;
-            }
-            true
+            finish_media_cmd(result, reply, flags, status)
         }
         CastCmd::Pause { origin, reply } => {
             flags.local_cmd = Some("pause");
@@ -4084,8 +4274,7 @@ fn handle_cmd(
                 publish(status, |s| s.player_state = "paused".into());
                 Ok(())
             })();
-            let _ = reply.send(result);
-            true
+            finish_media_cmd(result, reply, flags, status)
         }
         CastCmd::Play { origin, reply } => {
             flags.local_cmd = Some("play");
@@ -4101,8 +4290,7 @@ fn handle_cmd(
                 publish(status, |s| s.player_state = "playing".into());
                 Ok(())
             })();
-            let _ = reply.send(result);
-            true
+            finish_media_cmd(result, reply, flags, status)
         }
         CastCmd::Disconnect { origin, reply } => {
             *running = false;
@@ -4832,6 +5020,78 @@ mod tests {
         assert_eq!(parse_net_category(""), NetCategory::Unknown);
     }
 
+    fn fetch_load_url(http_ip: Ipv4Addr, http_port: u16, frame_url: &str, method: &str, range: Option<&str>) -> HttpResp {
+        let path = url_path(frame_url);
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {http_ip}:{http_port}\r\nConnection: close\r\n");
+        if let Some(range) = range {
+            req.push_str(&format!("Range: {range}\r\n"));
+        }
+        req.push_str("\r\n");
+        http_exchange_full(http_ip, http_port, &req)
+    }
+
+    #[test]
+    fn load_frame_url_is_served_by_the_media_server() {
+        let photo = scratch("vacation-photo.jpg", &jpeg_bytes());
+        let video = scratch("clip.mp4", &mp4_with(&[b"avc1", b"mp4a"]));
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        let update = http.set_playlist(&[photo.clone(), video.clone()]).unwrap();
+        assert_eq!(update.registered, 2);
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+
+        let (photo_url, photo_type) = http.media_url(&photo).unwrap();
+        assert!(photo_type.starts_with("image/"), "{photo_type}");
+        link.load_url(&photo_url, &photo_type, true, CastOrigin::User, 1, "photo")
+            .unwrap();
+        let photo_frame = fake.content_ids().last().cloned().unwrap_or_default();
+        assert_eq!(photo_frame, photo_url, "LOAD contentId must be the registered media URL");
+        assert!(!photo_frame.contains("vacation-photo"), "{photo_frame}");
+        let got = fetch_load_url(http.bind_ip, http.port, &photo_frame, "GET", None);
+        assert_eq!(got.status, 200, "photo GET headers:\n{}", got.headers);
+        assert!(
+            got.header("content-type").starts_with("image/"),
+            "{}",
+            got.header("content-type")
+        );
+        assert_eq!(got.body, jpeg_bytes());
+        let head = fetch_load_url(http.bind_ip, http.port, &photo_frame, "HEAD", None);
+        assert_eq!(head.status, 200, "photo HEAD headers:\n{}", head.headers);
+        assert!(head.header("content-type").starts_with("image/"));
+        assert!(head.body.is_empty(), "HEAD must not carry a body");
+
+        let (video_url, video_type) = http.media_url(&video).unwrap();
+        assert_eq!(video_type, "video/mp4");
+        link.load_url(&video_url, &video_type, true, CastOrigin::User, 2, "video")
+            .unwrap();
+        let video_frame = fake.content_ids().last().cloned().unwrap_or_default();
+        assert_eq!(video_frame, video_url, "LOAD contentId must be the registered media URL");
+        assert_ne!(video_frame, photo_frame);
+        let got = fetch_load_url(http.bind_ip, http.port, &video_frame, "GET", None);
+        assert_eq!(got.status, 200, "video GET headers:\n{}", got.headers);
+        assert_eq!(got.header("content-type"), "video/mp4");
+        assert!(got.header("accept-ranges").eq_ignore_ascii_case("bytes"));
+        assert!(!got.body.is_empty());
+        let head = fetch_load_url(http.bind_ip, http.port, &video_frame, "HEAD", None);
+        assert_eq!(head.status, 200, "video HEAD headers:\n{}", head.headers);
+        assert_eq!(head.header("content-type"), "video/mp4");
+        assert!(head.body.is_empty());
+        let range = fetch_load_url(
+            http.bind_ip,
+            http.port,
+            &video_frame,
+            "GET",
+            Some("bytes=0-3"),
+        );
+        assert_eq!(range.status, 206, "video range headers:\n{}", range.headers);
+        assert_eq!(range.header("content-type"), "video/mp4");
+        assert!(range.header("accept-ranges").eq_ignore_ascii_case("bytes"));
+        assert!(range.header("content-range").starts_with("bytes 0-3/"));
+        assert_eq!(range.body.len(), 4);
+    }
+
     #[test]
     fn panel_message_keeps_unreachable_for_connect_failures_only() {
         let fetch = cast_panel_message(CastPanelCause::MediaCommandTimeout);
@@ -4874,6 +5134,11 @@ mod tests {
         assert!(MediaHttp::start_lan(Ipv4Addr::UNSPECIFIED).is_err());
         http.set_playlist(std::slice::from_ref(&jpg)).unwrap();
         let (url, _) = http.media_url(&jpg).unwrap();
+        let token = {
+            let book = http.book.lock().unwrap();
+            book.token.clone()
+        };
+        let key = url.rsplit('/').next().unwrap().to_string();
         let host = media_url_host(&url).unwrap();
         assert_eq!(host, format!("127.0.0.1:{}", http.port));
         assert!(url.starts_with(&format!("http://{}:{}/", http.bind_ip, http.port)));
@@ -4909,17 +5174,22 @@ mod tests {
         let ok = reqs.iter().find(|l| l.contains("status=200")).unwrap();
         assert!(ok.contains("from=127.0.0.1"), "{ok}");
         assert!(ok.contains("method=GET"), "{ok}");
-        assert!(ok.contains("path=1"), "{ok}");
+        assert!(ok.contains(&format!("path=/m/{key}?t=***")), "{ok}");
+        assert!(ok.contains("ctype=image/jpeg"), "{ok}");
         assert!(ok.contains(&format!("bytes={}", body.len())), "{ok}");
+        assert!(!ok.contains(&token), "{ok}");
         assert!(!ok.contains("secret"), "{ok}");
         assert!(!ok.contains("vacation"), "{ok}");
-        assert!(!ok.contains('/') && !ok.contains('\\'), "{ok}");
+        assert!(!ok.contains('\\'), "{ok}");
         let denied = reqs.iter().find(|l| l.contains("status=404")).unwrap();
         assert!(denied.contains("path=redacted"), "{denied}");
+        assert!(denied.contains("ctype=none"), "{denied}");
         assert!(denied.contains("bytes=0"), "{denied}");
         assert!(!denied.contains("secret"), "{denied}");
         assert!(!denied.contains("jpg"), "{denied}");
+        assert!(!denied.contains("not-a-token"), "{denied}");
         assert!(!written.contains("secret-vacation"), "{written}");
+        assert!(!written.contains(&token), "{written}");
     }
 
     fn big_jpeg(len: usize) -> Vec<u8> {
@@ -5295,7 +5565,31 @@ mod tests {
         )
     }
 
+    struct HttpResp {
+        status: u16,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    impl HttpResp {
+        fn header(&self, name: &str) -> String {
+            for line in self.headers.split("\r\n") {
+                if let Some((n, v)) = line.split_once(':') {
+                    if n.eq_ignore_ascii_case(name) {
+                        return v.trim().to_string();
+                    }
+                }
+            }
+            String::new()
+        }
+    }
+
     fn http_exchange(ip: Ipv4Addr, port: u16, req: &str) -> (u16, Vec<u8>) {
+        let resp = http_exchange_full(ip, port, req);
+        (resp.status, resp.body)
+    }
+
+    fn http_exchange_full(ip: Ipv4Addr, port: u16, req: &str) -> HttpResp {
         let mut sock =
             TcpStream::connect_timeout(&SocketAddr::from((ip, port)), Duration::from_secs(2))
                 .unwrap();
@@ -5303,19 +5597,23 @@ mod tests {
         sock.write_all(req.as_bytes()).unwrap();
         let mut buf = Vec::new();
         sock.read_to_end(&mut buf).unwrap();
-        let text = String::from_utf8_lossy(&buf);
-        let status: u16 = text
+        let split = buf.windows(4).position(|w| w == b"\r\n\r\n");
+        let (header_bytes, body) = match split {
+            Some(i) => (buf[..i].to_vec(), buf[i + 4..].to_vec()),
+            None => (buf.clone(), Vec::new()),
+        };
+        let headers = String::from_utf8_lossy(&header_bytes).into_owned();
+        let status: u16 = headers
             .split_whitespace()
             .nth(1)
             .unwrap_or("0")
             .parse()
             .unwrap_or(0);
-        let body = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|i| buf[i + 4..].to_vec())
-            .unwrap_or_default();
-        (status, body)
+        HttpResp {
+            status,
+            headers,
+            body,
+        }
     }
 
     const NS_HEARTBEAT: &str = "urn:x-cast:com.google.cast.tp.heartbeat";
@@ -5353,6 +5651,8 @@ mod tests {
         addr: SocketAddr,
         stop: Arc<AtomicBool>,
         traces: Arc<Mutex<Vec<String>>>,
+        /// contentId strings taken from LOAD frames, in order.
+        content_ids: Arc<Mutex<Vec<String>>>,
         join: Option<JoinHandle<()>>,
     }
 
@@ -5369,6 +5669,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .join("\n")
+        }
+
+        fn content_ids(&self) -> Vec<String> {
+            self.content_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
     }
 
@@ -5544,6 +5851,7 @@ mod tests {
         mm: &MessageManager<S>,
         script: FakeScript,
         traces: &Mutex<Vec<String>>,
+        content_ids: &Mutex<Vec<String>>,
         stop: &AtomicBool,
     ) {
         let mut receiver_up = false;
@@ -5628,11 +5936,15 @@ mod tests {
                     continue;
                 }
                 loads += 1;
-                let item = value
+                let content_id = value
                     .pointer("/media/contentId")
                     .and_then(|v| v.as_str())
-                    .and_then(|url| url.rsplit('/').next())
-                    .unwrap_or("");
+                    .unwrap_or("")
+                    .to_string();
+                if let Ok(mut ids) = content_ids.lock() {
+                    ids.push(content_id.clone());
+                }
+                let item = content_id.rsplit('/').next().unwrap_or("");
                 note_trace(traces, &format!("load {dest} item={item}"));
                 if script.load_failed {
                     let body = serde_json::json!({
@@ -5716,8 +6028,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let traces = Arc::new(Mutex::new(Vec::new()));
+        let content_ids = Arc::new(Mutex::new(Vec::new()));
         let stop_t = Arc::clone(&stop);
         let traces_t = Arc::clone(&traces);
+        let content_ids_t = Arc::clone(&content_ids);
         let config = fake_server_config();
         let join = thread::spawn(move || {
             while !stop_t.load(Ordering::SeqCst) {
@@ -5735,7 +6049,7 @@ mod tests {
                         let plain =
                             CastPlain::new(StreamOwned::new(conn, IdleSocket { inner: tcp }), pace);
                         let mm = MessageManager::new(plain);
-                        fake_session(&mm, script, traces_t.as_ref(), &stop_t);
+                        fake_session(&mm, script, traces_t.as_ref(), content_ids_t.as_ref(), &stop_t);
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(15));
@@ -5748,6 +6062,7 @@ mod tests {
             addr,
             stop,
             traces,
+            content_ids,
             join: Some(join),
         }
     }
@@ -6118,7 +6433,13 @@ mod tests {
         assert!(written.contains("reply=LOAD_FAILED"), "{written}");
         assert!(written.contains("playerState=none"), "{written}");
         assert!(written.contains("idleReason=none"), "{written}");
-        assert!(!written.contains('/') && !written.contains('\\'), "{written}");
+        assert!(
+            written.contains("url=http://192.168.1.52:47201/m/3?t=***"),
+            "{written}"
+        );
+        assert!(written.contains("contentType=image/jpeg"), "{written}");
+        assert!(!written.contains("tokentokentokentokentokentoken"), "{written}");
+        assert!(!written.contains('\\'), "{written}");
     }
 
     fn session_after_load(kind: &str) -> (Arc<Mutex<Option<String>>>, SessionFlags) {
@@ -7060,8 +7381,50 @@ mod tests {
             Err(err) => assert_eq!(err, "current item unknown"),
             Ok(_) => panic!("item 0 is not a playlist index"),
         }
-        let unknown = load_log_detail("192.168.1.52:47200", 2, "user", 0, "photo", "reply=7");
+        let unknown = load_log_detail(
+            "192.168.1.52:47200",
+            2,
+            "user",
+            0,
+            "photo",
+            "http://192.168.1.52:47200/m/0123456789abcdef0123456789abcdef/9",
+            "image/jpeg",
+            "reply=7",
+        );
         assert!(unknown.contains("item=?"), "{unknown}");
-        assert!(!unknown.contains('/') && !unknown.contains('\\'), "{unknown}");
+        assert!(
+            unknown.contains("url=http://192.168.1.52:47200/m/9?t=***"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("contentType=image/jpeg"), "{unknown}");
+        assert!(!unknown.contains("0123456789abcdef0123456789abcdef"), "{unknown}");
+        assert!(!unknown.contains('\\'), "{unknown}");
+    }
+
+    #[test]
+    fn media_failure_is_visible_on_cast_status_without_pretending_to_play() {
+        let status = Mutex::new(CastLiveStatus {
+            connected: true,
+            player_state: "playing".into(),
+            remote_event: None,
+            error: None,
+            media_kind: "still".into(),
+            http_port: 47200,
+            bind_ip: "192.168.1.49".into(),
+            item_index: 1,
+        });
+        let (_remote, mut flags) = session_after_load("still");
+        flags.player_state = "playing".into();
+        flags.connected = true;
+        publish_media_failure(&mut flags, &status, MEDIA_FETCH_MESSAGE, false);
+        let live = status.lock().unwrap().clone();
+        assert_eq!(live.error.as_deref(), Some(MEDIA_FETCH_MESSAGE));
+        assert_ne!(live.player_state, "playing");
+        assert!(live.connected, "a media timeout does not tear the session down");
+        publish_media_failure(&mut flags, &status, &link_down_message(), true);
+        let live = status.lock().unwrap().clone();
+        assert!(!live.connected);
+        assert!(live.error.as_deref().unwrap_or("").contains("TV unreachable"));
+        assert_ne!(live.player_state, "playing");
     }
 }
