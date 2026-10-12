@@ -4353,6 +4353,8 @@ fn unmasked_media_token(detail: &str) -> bool {
 
 fn strip_allowed_log_slashes(detail: &str) -> String {
     let mut out = detail.replace("https://", "https:").replace("http://", "http:");
+    // `245 Mbit/s` is a limit, not a path. Hide that slash before the check.
+    out = out.replace("Mbit/s", "Mbit_s");
     while let Some(start) = out.find("/m/") {
         let after = start + 3;
         let Some(mark) = out[after..].find("?t=***") else {
@@ -6784,6 +6786,39 @@ mod tests {
             "{written}"
         );
         assert!(!written.contains("level_derived="), "{written}");
+    }
+
+    #[test]
+    fn video_skipped_log_keeps_the_bitrate_limit() {
+        let (log, _fake, result, _live) = drive_load(
+            "over-rate.mp4",
+            &h264_clip(2560, 2560, 90, 1, Some(51), Some(245_000_000)),
+        );
+        let err = result.expect_err("over the frame rate, size, and bitrate");
+        assert_eq!(
+            err,
+            "90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"
+        );
+        let written = log.text();
+        assert!(
+            written.contains(
+                "video_skipped item=1 reasons=90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"
+            ),
+            "{written}"
+        );
+        assert!(!written.contains("video_skipped redacted"), "{written}");
+        assert_eq!(
+            sanitize_cast_log_detail(r"item=1 reasons=C:\slides\secret.mp4 245 Mbit/s"),
+            "redacted"
+        );
+        assert_eq!(
+            sanitize_cast_log_detail("item=1 reasons=/tmp/secret.mp4 20 Mbit/s"),
+            "redacted"
+        );
+        assert_eq!(
+            sanitize_cast_log_detail("item=1 reasons=/m/tokensecret/ab 20 Mbit/s"),
+            "redacted"
+        );
     }
 
     #[test]
