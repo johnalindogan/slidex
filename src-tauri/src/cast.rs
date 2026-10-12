@@ -32,6 +32,9 @@ use rustls::{
 use serde::Serialize;
 use uuid::Uuid;
 
+#[path = "tv_copy.rs"]
+mod tv_copy;
+
 const CAST_SERVICE: &str = "_googlecast._tcp.local.";
 const DISCOVER_DEFAULT_MS: u64 = 8000;
 const DISCOVER_MAX_MS: u64 = 10_000;
@@ -1327,11 +1330,11 @@ struct Mp4Box {
     end: u64,
 }
 
-/// SlideX does not ship ffmpeg. Limits come from the MP4 boxes (`avcC` /
-/// `hvcC`, `tkhd`, `mdhd`, `stts`, `btrt`). A value a readable MP4 or MOV
-/// does not carry is not a failure, so a stub sample entry still loads.
-/// Anything that cannot be read — another container, a truncated box, or an
-/// I/O error — is skipped.
+/// Limits come from the MP4 boxes (`avcC` / `hvcC`, `tkhd`, `mdhd`, `stts`,
+/// `btrt`). This check does not run ffmpeg. A skip elsewhere starts a TV copy.
+/// A value a readable MP4 or MOV does not carry is not a failure, so a stub
+/// sample entry still loads. Anything that cannot be read — another container,
+/// a truncated box, or an I/O error — is skipped.
 fn decide_cast_video(path: &Path) -> CastVideoDecision {
     decide_cast_video_logged(path, true)
 }
@@ -2359,21 +2362,30 @@ impl MediaHttp {
             if !seen.insert(*page) {
                 break;
             }
+            let mut serve_type = content_type.clone();
             if kind == "video" {
-                let decision = decide_cast_video(path);
-                if let Some(level) = decision.derived.as_deref() {
-                    cast_log(
-                        "level_derived",
-                        &format!("item={} level_derived={level}", item_log_token(*page)),
-                    );
-                }
-                if let Some(reasons) = decision.skip {
-                    cast_log(
-                        "video_skipped",
-                        &format!("item={} reasons={reasons}", item_log_token(*page)),
-                    );
-                    skipped.push(reasons);
-                    continue;
+                match tv_copy::for_cast(path, *page) {
+                    tv_copy::ForCast::Original { derived } => {
+                        log_level_derived(*page, derived.as_deref());
+                    }
+                    tv_copy::ForCast::Copy { derived } => {
+                        log_level_derived(*page, derived.as_deref());
+                        serve_type = "video/mp4".to_string();
+                    }
+                    tv_copy::ForCast::Preparing { derived, .. } => {
+                        log_level_derived(*page, derived.as_deref());
+                        skipped.push(tv_copy::PREPARING_TV.to_string());
+                        continue;
+                    }
+                    tv_copy::ForCast::Skip { derived, reasons } => {
+                        log_level_derived(*page, derived.as_deref());
+                        cast_log(
+                            "video_skipped",
+                            &format!("item={} reasons={reasons}", item_log_token(*page)),
+                        );
+                        skipped.push(reasons);
+                        continue;
+                    }
                 }
             }
             let url = format!("http://{}:{}/m/{}/{}", self.bind_ip, self.port, token, key);
@@ -2381,7 +2393,7 @@ impl MediaHttp {
             return (
                 Ok(Successor {
                     url,
-                    content_type: content_type.clone(),
+                    content_type: serve_type,
                     item: *page,
                     media_type: media_type_label(kind),
                 }),
@@ -2682,7 +2694,6 @@ fn serve_client(
             }
         }
     };
-    rec.ctype = log_ctype(&entry.content_type);
     let prepared = match transform_media(&entry) {
         Ok(body) => body,
         Err(_) => {
@@ -2692,6 +2703,7 @@ fn serve_client(
     };
     let len = prepared.len;
     let ctype = prepared.content_type;
+    rec.ctype = log_ctype(&ctype);
     let file = prepared.file;
     let head = method == "HEAD";
     let result = if let Some(spec) = range {
@@ -2835,9 +2847,9 @@ fn transfer_aborted(stop: &AtomicBool, book: &Mutex<AllowBook>, token: &str, key
 
 /// Bytes to send after the playlist token check.
 ///
-/// This is the identity transform: the allowlisted file itself. A later slideshow
-/// crop sidecar can replace a still here (new bytes and content type) without
-/// changing the token check, the path check, or the socket loop.
+/// A video that failed the cast check is served from the TV-copy cache when
+/// that copy is ready. The rejected original is not sent. A still, and a video
+/// the TV can already play, is the allowlisted file itself.
 struct PreparedMedia {
     file: File,
     len: u64,
@@ -2845,7 +2857,22 @@ struct PreparedMedia {
 }
 
 fn transform_media(entry: &AllowEntry) -> std::io::Result<PreparedMedia> {
-    let file = File::open(&entry.path)?;
+    if entry.kind == "video" {
+        if let Some(copy) = tv_copy::servable_copy(&entry.path) {
+            return open_prepared(copy, "video/mp4");
+        }
+        if tv_copy::original_needs_copy(&entry.path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "tv copy is not ready",
+            ));
+        }
+    }
+    open_prepared(&entry.path, &entry.content_type)
+}
+
+fn open_prepared(path: impl AsRef<Path>, content_type: &str) -> std::io::Result<PreparedMedia> {
+    let file = File::open(path.as_ref())?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -2855,7 +2882,7 @@ fn transform_media(entry: &AllowEntry) -> std::io::Result<PreparedMedia> {
     }
     Ok(PreparedMedia {
         len: meta.len(),
-        content_type: entry.content_type.clone(),
+        content_type: content_type.to_string(),
         file,
     })
 }
@@ -4263,10 +4290,44 @@ fn apply_cast_log_dir(dir: Option<PathBuf>) {
     }
 }
 
+pub(crate) struct CastLogGuard {
+    prev: Option<PathBuf>,
+}
+
+impl Drop for CastLogGuard {
+    fn drop(&mut self) {
+        CAST_LOG_OVERRIDE.with(|slot| *slot.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Point `cast.log` at `dir` until the guard is dropped. The previous directory
+/// is restored, including when a test had not set one.
+pub(crate) fn push_cast_log_dir(dir: PathBuf) -> CastLogGuard {
+    let prev = CAST_LOG_OVERRIDE.with(|slot| slot.borrow_mut().replace(dir));
+    CastLogGuard { prev }
+}
+
+fn log_level_derived(item: u32, level: Option<&str>) {
+    if let Some(level) = level {
+        cast_log(
+            "level_derived",
+            &format!("item={} level_derived={level}", item_log_token(item)),
+        );
+    }
+}
+
 static CAST_LOG_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn cast_log_path() -> PathBuf {
     cast_log_dir().join("cast.log")
+}
+
+pub fn tv_encoder_name() -> String {
+    tv_copy::encoder_name()
+}
+
+pub fn set_tv_encoder(name: &str) -> Result<(), String> {
+    tv_copy::set_encoder_name(name)
 }
 
 fn cast_log_dir() -> PathBuf {
@@ -4487,6 +4548,15 @@ struct SessionFlags {
     slideshow_playing: bool,
     /// mediaSessionId whose photo FINISHED we already logged.
     ignored_photo: Option<i32>,
+    /// The slide whose TV copy is building, when that slide is still current.
+    pending_tv: Option<PendingTv>,
+}
+
+#[derive(Clone)]
+struct PendingTv {
+    path: PathBuf,
+    item: u32,
+    reasons: String,
 }
 
 impl SessionFlags {
@@ -5175,6 +5245,7 @@ fn run_session(
         failed_session: None,
         slideshow_playing: true,
         ignored_photo: None,
+        pending_tv: None,
     };
     let mut last_ping = Instant::now();
     let mut running = true;
@@ -5205,7 +5276,9 @@ fn run_session(
                 continue;
             }
             Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Empty) => {
+                promote_pending_tv(&http, &link, &mut flags, &status);
+            }
         }
 
         if last_ping.elapsed() >= PING_EVERY {
@@ -5297,6 +5370,73 @@ fn run_session(
     eprintln!("[cast] session ended");
 }
 
+/// When the current slide's TV copy finishes, LOAD it. A failed copy shows the
+/// original skip reason. A different LOAD clears `pending_tv`, so advancing
+/// away does not pull the TV back.
+fn promote_pending_tv(
+    http: &MediaHttp,
+    link: &CastLink,
+    flags: &mut SessionFlags,
+    status: &Mutex<CastLiveStatus>,
+) {
+    let Some(pending) = flags.pending_tv.clone() else {
+        return;
+    };
+    match tv_copy::poll_copy(&pending.path) {
+        tv_copy::CopyPoll::Running | tv_copy::CopyPoll::Absent => {}
+        tv_copy::CopyPoll::Failed => {
+            flags.pending_tv = None;
+            publish_media_failure(flags, status, &pending.reasons, false);
+        }
+        tv_copy::CopyPoll::Ready => {
+            flags.pending_tv = None;
+            let loaded = (|| {
+                let (url, _) = http.media_url(&pending.path)?;
+                let sid = link.load_url(
+                    &url,
+                    "video/mp4",
+                    true,
+                    CastOrigin::Remote,
+                    pending.item,
+                    "video",
+                )?;
+                flags.media_session = Some(sid);
+                flags.advanced_session = None;
+                flags.failed_session = None;
+                flags.ignored_photo = None;
+                flags.slideshow_playing = true;
+                flags.item_index = pending.item;
+                flags.error = None;
+                flags.media_kind = "video".into();
+                flags.player_state = "playing".into();
+                flags.local_cmd = Some("play");
+                flags.local_cmd_at = Instant::now();
+                flags.last_rx = Instant::now();
+                publish(status, |s| {
+                    s.connected = true;
+                    s.media_kind = "video".into();
+                    s.player_state = flags.player_state.clone();
+                    s.error = None;
+                    s.item_index = flags.item_index;
+                });
+                Ok::<(), String>(())
+            })();
+            if let Err(err) = loaded {
+                if err.contains("TV unreachable") {
+                    flags.connected = false;
+                    flags.error = Some(link_down_message());
+                    publish(status, |s| {
+                        s.connected = false;
+                        s.error = Some(link_down_message());
+                    });
+                } else if err != CAST_CANCELLED {
+                    publish_media_failure(flags, status, &err, false);
+                }
+            }
+        }
+    }
+}
+
 fn fail_pending(cmd_rx: &Receiver<CastCmd>, err: &str, link: &CastLink) {
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
@@ -5341,23 +5481,45 @@ fn handle_cmd(
                 if link.cancelled() {
                     return Err(CAST_CANCELLED.to_string());
                 }
-                let (url, ctype) = http.media_url(&path)?;
+                let (url, mut ctype) = http.media_url(&path)?;
                 let kind = http.kind_of(&path)?;
                 let item = http.index_of(&path).unwrap_or(0);
+                let same_pending = flags
+                    .pending_tv
+                    .as_ref()
+                    .is_some_and(|pending| pending.path == path);
+                if !same_pending {
+                    flags.pending_tv = None;
+                }
                 if kind == "video" {
-                    let decision = decide_cast_video(&path);
-                    if let Some(level) = decision.derived.as_deref() {
-                        cast_log(
-                            "level_derived",
-                            &format!("item={} level_derived={level}", item_log_token(item)),
-                        );
-                    }
-                    if let Some(reasons) = decision.skip {
-                        cast_log(
-                            "video_skipped",
-                            &format!("item={} reasons={reasons}", item_log_token(item)),
-                        );
-                        return Err(reasons);
+                    match tv_copy::for_cast(&path, item) {
+                        tv_copy::ForCast::Original { derived } => {
+                            log_level_derived(item, derived.as_deref());
+                            flags.pending_tv = None;
+                        }
+                        tv_copy::ForCast::Copy { derived } => {
+                            log_level_derived(item, derived.as_deref());
+                            ctype = "video/mp4".to_string();
+                            flags.pending_tv = None;
+                        }
+                        tv_copy::ForCast::Preparing { derived, reasons } => {
+                            log_level_derived(item, derived.as_deref());
+                            flags.pending_tv = Some(PendingTv {
+                                path: path.clone(),
+                                item,
+                                reasons,
+                            });
+                            return Err(tv_copy::PREPARING_TV.to_string());
+                        }
+                        tv_copy::ForCast::Skip { derived, reasons } => {
+                            log_level_derived(item, derived.as_deref());
+                            cast_log(
+                                "video_skipped",
+                                &format!("item={} reasons={reasons}", item_log_token(item)),
+                            );
+                            flags.pending_tv = None;
+                            return Err(reasons);
+                        }
                     }
                 }
                 let play = if kind == "still" { true } else { autoplay };
@@ -6690,6 +6852,233 @@ mod tests {
         assert!(none.is_none());
         let written = log.text();
         assert!(written.contains("level_derived=4.0"), "{written}");
+    }
+
+    fn tv_cache_scope(encoder: tv_copy::TestEncoder) -> tv_copy::TestScope {
+        let cache = std::env::temp_dir().join(format!(
+            "slidex-tv-{}-{}",
+            std::process::id(),
+            new_token()
+        ));
+        tv_copy::TestScope::new(cache, encoder)
+    }
+
+    #[test]
+    fn preparing_for_tv_skips_then_casts_the_copy_on_the_next_pass() {
+        let log = LogDir::new();
+        let clip = h264_clip(1280, 720, 30, 1, Some(40), Some(4_000_000));
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Write {
+            bytes: clip.clone(),
+            delay: Duration::from_millis(150),
+        });
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let bad = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        let after = scratch("three.jpg", &jpeg_bytes());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[photo, bad.clone(), after]).unwrap();
+        let started = Instant::now();
+        let (succ, note) = http.next_castable(1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "building a TV copy must not stall the slideshow: {:?}",
+            started.elapsed()
+        );
+        let succ = succ.expect("the next photo");
+        assert_eq!(succ.item, 3);
+        assert_eq!(succ.media_type, "photo");
+        assert_eq!(note.as_deref(), Some(tv_copy::PREPARING_TV));
+        let written = log.text();
+        assert!(
+            written.contains(
+                "tv_copy start item=2 reasons=can't verify this video for the TV (MKV)"
+            ),
+            "{written}"
+        );
+        assert!(
+            tv_copy::wait_until_settled(Duration::from_secs(5)),
+            "the TV copy did not finish"
+        );
+        let written = log.text();
+        assert!(written.contains("tv_copy done item=2"), "{written}");
+        assert!(written.contains("bytes="), "{written}");
+        let (again, note) = http.next_castable(1);
+        let again = again.expect("the cached copy");
+        assert_eq!(again.item, 2);
+        assert_eq!(again.media_type, "video");
+        assert_eq!(again.content_type, "video/mp4");
+        assert!(note.is_none(), "{note:?}");
+        let written = log.text();
+        assert!(written.contains("tv_copy cache_hit item=2"), "{written}");
+        let copy = tv_copy::servable_copy(&bad).expect("servable copy");
+        assert!(
+            decide_cast_video(&copy).skip.is_none(),
+            "the copy must pass the cast check"
+        );
+        assert_ne!(copy.parent(), bad.parent());
+        let (status, body) = http_get(http.bind_ip, http.port, &url_path(&again.url));
+        assert_eq!(status, 200, "{body:?}");
+        assert_eq!(body, clip);
+    }
+
+    #[test]
+    fn missing_ffmpeg_fails_closed_without_loading() {
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Missing);
+        let (log, fake, result, live) = drive_load(
+            "level53.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
+        );
+        let err = result.expect_err("a missing encoder does not load the original");
+        assert_eq!(err, "H.264 level 5.3 may not play on this TV");
+        assert_ne!(err, tv_copy::PREPARING_TV);
+        assert_eq!(live.error.as_deref(), Some(err.as_str()));
+        let text = fake.trace_text();
+        assert!(
+            !text.lines().any(|line| line.starts_with("load ")),
+            "no LOAD is sent: {text}"
+        );
+        let written = log.text();
+        assert!(
+            written.contains("tv_copy fail item=1 err=ffmpeg missing"),
+            "{written}"
+        );
+        assert!(written.contains("video_skipped"), "{written}");
+    }
+
+    #[test]
+    fn a_failed_tv_copy_is_not_cast() {
+        let log = LogDir::new();
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Fail(
+            "encoder rejected the settings".into(),
+        ));
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let bad = scratch(
+            "skip.mp4",
+            &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
+        );
+        let after = scratch("three.jpg", &jpeg_bytes());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[photo, bad, after]).unwrap();
+        let (succ, note) = http.next_castable(1);
+        assert_eq!(succ.expect("photo").item, 3);
+        assert_eq!(note.as_deref(), Some(tv_copy::PREPARING_TV));
+        assert!(tv_copy::wait_until_settled(Duration::from_secs(5)));
+        let written = log.text();
+        assert!(
+            written.contains("tv_copy fail item=2 err=encoder rejected the settings"),
+            "{written}"
+        );
+        assert_eq!(written.matches("tv_copy start").count(), 1, "{written}");
+        let (again, note) = http.next_castable(1);
+        assert_eq!(again.expect("still the photo").item, 3);
+        assert_eq!(
+            note.as_deref(),
+            Some("H.264 level 5.3 may not play on this TV")
+        );
+        let written = log.text();
+        assert_eq!(written.matches("tv_copy start").count(), 1, "{written}");
+    }
+
+    #[test]
+    fn a_copy_that_fails_the_cast_check_is_skipped() {
+        let log = LogDir::new();
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Write {
+            bytes: b"not a video".to_vec(),
+            delay: Duration::from_millis(30),
+        });
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let bad = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        let after = scratch("three.jpg", &jpeg_bytes());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[photo, bad.clone(), after]).unwrap();
+        let (succ, note) = http.next_castable(1);
+        assert_eq!(succ.expect("photo").item, 3);
+        assert_eq!(note.as_deref(), Some(tv_copy::PREPARING_TV));
+        assert!(tv_copy::wait_until_settled(Duration::from_secs(5)));
+        let written = log.text();
+        assert!(
+            written.contains("tv_copy fail item=2 err=copy failed the cast check"),
+            "{written}"
+        );
+        assert!(tv_copy::servable_copy(&bad).is_none());
+        let (again, note) = http.next_castable(1);
+        let again = again.expect("photo");
+        assert_eq!(again.item, 3);
+        assert_eq!(
+            note.as_deref(),
+            Some("can't verify this video for the TV (MKV)")
+        );
+        assert_ne!(again.item, 2);
+    }
+
+    #[test]
+    fn a_ready_copy_is_cast_while_that_item_is_still_current() {
+        let log = LogDir::new();
+        let clip = h264_clip(1280, 720, 30, 1, Some(40), Some(4_000_000));
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Write {
+            bytes: clip,
+            delay: Duration::from_millis(80),
+        });
+        let path = scratch("only.mkv", b"\x1a\x45\xdf\xa3");
+        let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(std::slice::from_ref(&path)).unwrap();
+        let fake = spawn_fake(FakeScript::default());
+        let (ip, port) = fake.host_port();
+        let mut link = CastLink::connect(ip, port).unwrap();
+        link.launch_receiver().unwrap();
+        let status = Mutex::new(CastLiveStatus {
+            connected: true,
+            player_state: "idle".into(),
+            remote_event: None,
+            error: None,
+            media_kind: String::new(),
+            http_port: http.port,
+            bind_ip: http.bind_ip.to_string(),
+            item_index: 0,
+        });
+        let (_remote, mut flags) = session_after_load("still");
+        flags.media_kind.clear();
+        flags.media_session = None;
+        flags.player_state = "idle".into();
+        flags.item_index = 0;
+        let mut running = true;
+        let (tx, rx) = mpsc::channel();
+        let kept = handle_cmd(
+            CastCmd::Load {
+                path: path.clone(),
+                autoplay: true,
+                origin: CastOrigin::User,
+                duration_ms: None,
+                reply: tx,
+            },
+            &mut http,
+            &link,
+            &mut flags,
+            &status,
+            &mut running,
+        );
+        assert!(kept);
+        let err = rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap_err();
+        assert_eq!(err, tv_copy::PREPARING_TV);
+        assert!(flags.pending_tv.is_some());
+        assert!(
+            !fake.trace_text().lines().any(|line| line.starts_with("load ")),
+            "{}",
+            fake.trace_text()
+        );
+        assert!(tv_copy::wait_until_settled(Duration::from_secs(5)));
+        promote_pending_tv(&http, &link, &mut flags, &status);
+        assert!(flags.pending_tv.is_none());
+        assert_eq!(flags.item_index, 1);
+        assert_eq!(flags.media_kind, "video");
+        assert!(
+            fake.trace_text().lines().any(|line| line.starts_with("load ")),
+            "{}",
+            fake.trace_text()
+        );
+        let written = log.text();
+        assert!(written.contains("tv_copy done item=1"), "{written}");
+        let _ = link;
+        let _ = http;
     }
 
     fn drive_load(
@@ -8638,6 +9027,7 @@ mod tests {
             failed_session: None,
             slideshow_playing: true,
             ignored_photo: None,
+            pending_tv: None,
         };
         (remote, flags)
     }

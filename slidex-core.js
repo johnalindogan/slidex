@@ -361,7 +361,8 @@
 
   function isCastSkipMessage(msg) {
     var s = String(msg || '');
-    return /unsupported|skipped/i.test(s)
+    return s === 'Preparing for TV…'
+      || /unsupported|skipped/i.test(s)
       || /aren't supported by the TV/i.test(s)
       || /isn't supported by the TV/i.test(s)
       || /may not play on this TV/i.test(s)

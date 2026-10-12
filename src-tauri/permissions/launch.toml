@@ -154,6 +154,16 @@ description = "Allow logging a saved image duration that is not a listed choice"
 commands.allow = ["cast_log_dur_fallback"]
 
 [[permission]]
+identifier = "allow-cast-get-tv-encoder"
+description = "Allow reading the TV-copy video encoder"
+commands.allow = ["cast_get_tv_encoder"]
+
+[[permission]]
+identifier = "allow-cast-set-tv-encoder"
+description = "Allow storing the TV-copy video encoder"
+commands.allow = ["cast_set_tv_encoder"]
+
+[[permission]]
 identifier = "allow-slidex-save-done"
 description = "Allow the page to ack a save before the window exits"
 commands.allow = ["slidex_save_done"]

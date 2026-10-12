@@ -1190,6 +1190,16 @@ fn cast_log_dur_fallback(from_ms: u64, to_ms: u64) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn cast_get_tv_encoder() -> Result<String, String> {
+    Ok(cast::tv_encoder_name())
+}
+
+#[tauri::command]
+fn cast_set_tv_encoder(name: String) -> Result<(), String> {
+    cast::set_tv_encoder(&name)
+}
+
 /// Ask the page to save, then exit. Never wait longer than this.
 const SAVE_BEFORE_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SAVE_BEFORE_EXIT_EVENT: &str = "slidex://save-before-exit";
@@ -1319,6 +1329,8 @@ pub fn run() {
             cast_firewall_status,
             cast_log_path,
             cast_log_dur_fallback,
+            cast_get_tv_encoder,
+            cast_set_tv_encoder,
             slidex_save_done
         ])
         .setup(|app| {

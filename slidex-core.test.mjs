@@ -745,17 +745,17 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.10 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.11 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.10');
-  assert.equal(tauri.version, '0.1.10');
+  assert.equal(pkg.version, '0.1.11');
+  assert.equal(tauri.version, '0.1.11');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.10"/m);
-  assert.match(lock, /"version": "0\.1\.10"/);
+  assert.match(cargo, /^version = "0\.1\.11"/m);
+  assert.match(lock, /"version": "0\.1\.11"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -1181,6 +1181,7 @@ test('the Cast panel can copy the Cast log path', () => {
 });
 
 test('a cast skip message names TV limits and a level the TV may not play', () => {
+  assert.equal(C.isCastSkipMessage('Preparing for TV…'), true);
   assert.equal(C.isCastSkipMessage("90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"), true);
   assert.equal(C.isCastSkipMessage("10-bit isn't supported by the TV"), true);
   assert.equal(C.isCastSkipMessage('H.264 level 5.2 may not play on this TV'), true);
@@ -1261,6 +1262,83 @@ test('a cast skip during loadCurrent moves straight to the next slide', async ()
   assert.equal(sandbox.window.__sspCastBadPaths['C:/slides/bad.mp4'], true);
   assert.equal(sandbox.skipBurst, 1);
   assert.equal(sandbox.cur, 0);
+});
+
+test('Preparing for TV moves on without marking the item bad', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('function currentSkipped'), html.indexOf('function syncTransport'));
+  const caps = fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8');
+  const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  const nsi = fs.readFileSync(new URL('./src-tauri/windows/installer.nsi', import.meta.url), 'utf8');
+  const pin = JSON.parse(fs.readFileSync(new URL('./src-tauri/ffmpeg.pin.json', import.meta.url), 'utf8'));
+  const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  assert.equal(pin.version, '9.0.2');
+  assert.equal(pin.archive_sha256, 'f0e46253c70dfe902bac915dfb4224f0cf1b7c6eeab9da2ccc9a5581f9a71b13');
+  assert.equal(pin.exe_sha256, '589e50b766d251afdf181dd664d40bd94407e200b019989fd7468c7d118a28d0');
+  assert.equal(tauri.bundle.resources['resources/ffmpeg/ffmpeg.exe'], 'ffmpeg.exe');
+  assert.equal(tauri.bundle.resources['resources/ffmpeg/LICENSE'], 'ffmpeg-license.txt');
+  assert.match(html, /id="castEncoder"/);
+  assert.match(html, /value="libx264"/);
+  assert.match(html, /value="h264_mf"/);
+  assert.match(html, /value="h264_nvenc"/);
+  assert.match(html, /value="h264_qsv"/);
+  assert.match(html, /cast_get_tv_encoder/);
+  assert.match(html, /cast_set_tv_encoder/);
+  assert.match(caps, /allow-cast-get-tv-encoder/);
+  assert.match(caps, /allow-cast-set-tv-encoder/);
+  assert.match(perms, /cast_get_tv_encoder/);
+  assert.match(perms, /cast_set_tv_encoder/);
+  assert.doesNotMatch(nsi, /ffmpeg\.exe/);
+  assert.equal(
+    C.castBannerText({ player_state: 'playing', error: 'Preparing for TV…' }, 'clip.mkv'),
+    'Preparing for TV…'
+  );
+  function runLoad(paths, rejectMessage) {
+    const moves = [];
+    const statuses = [];
+    const core = {
+      isCastSkipMessage: C.isCastSkipMessage,
+      DEFAULT_IMAGE_DURATION_MS: C.DEFAULT_IMAGE_DURATION_MS
+    };
+    const sandbox = {
+      Promise,
+      String,
+      Number,
+      Math,
+      Object,
+      window: { __sspCastActive: true, SlideXCore: core },
+      SlideXCore: core,
+      castActive: true,
+      skipBurst: 0,
+      skippedNotes: [],
+      cur: 0,
+      setTimeout() { return 0; },
+      setStatus(msg) { statuses.push(msg); },
+      showToast() {},
+      esc(s) { return String(s); },
+      sspCastCurrentPath() { return paths[0]; },
+      sspCastCurrentName() { return 'clip.mkv'; },
+      sspCastPaths() { return paths; },
+      sspCastPlaying() { return true; },
+      nextMI() { return 1; },
+      goTo(index, source) { moves.push([index, source]); },
+      call() { return Promise.reject(new Error(rejectMessage)); }
+    };
+    return vm.runInNewContext(src + '\nloadCurrent("user");', sandbox).then(() => ({ moves, statuses, sandbox }));
+  }
+  const moved = await runLoad(
+    ['C:/slides/clip.mkv', 'C:/slides/next.jpg'],
+    'Preparing for TV…'
+  );
+  assert.deepEqual(moved.moves, [[1, 'user']]);
+  assert.equal(moved.sandbox.window.__sspCastBadPaths, undefined);
+  assert.equal(moved.statuses[0], 'Preparing for TV…');
+  assert.equal(moved.sandbox.skipBurst, 1);
+  const stayed = await runLoad(['C:/slides/clip.mkv'], 'Preparing for TV…');
+  assert.deepEqual(stayed.moves, []);
+  assert.equal(stayed.sandbox.window.__sspCastBadPaths, undefined);
+  assert.equal(stayed.statuses[0], 'Preparing for TV…');
+  assert.equal(stayed.sandbox.skipBurst, 0);
 });
 
 test('a cast ignores local video events and tags the command source', () => {

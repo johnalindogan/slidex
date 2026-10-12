@@ -50,7 +50,15 @@ The status line also names the adapters that were browsed and, when the PC has n
 - Nothing is logged that contains a token, a device UUID, or a full path.
 - After the token check, `transform_media` opens the allowlisted file. That is the identity transform. A later slideshow-only crop sidecar can return a generated still from that function without changing auth or the socket loop. Crop is not implemented in this release.
 
-JPEG, PNG, and MP4 (H.264 + AAC) are registered. Anything else is skipped with a note and the slideshow moves on.
+JPEG, PNG, and MP4 (H.264 + AAC) are registered. A video the TV-limit check rejects, and a container that check cannot read (MKV, WebM, AVI, or an unreadable MP4), stays in the playlist so Cast can build a TV copy. Anything else is skipped with a note and the slideshow moves on.
+
+## TV copy
+
+When a video fails the cast check, or the check cannot read it, SlideX starts a background encode and the banner says `Preparing for TV…`. The slideshow moves to the next item. The copy is cast the next time that item comes round, or immediately if that item is still the current one when the copy is ready.
+
+Copies live in `%LOCALAPPDATA%\com.johnalindogan.slideshowpro\tv-cache`, keyed by path, size, and mtime. The cache stops at 20 GB and deletes the least recently used copy first. Nothing is written next to the original. The encoder is one setting, `libx264` by default, with `h264_mf`, `h264_nvenc`, and `h264_qsv` as alternatives. The pinned ffmpeg.exe is installed beside `slideshowpro.exe`, not on PATH.
+
+`cast.log` records `tv_copy start`, `tv_copy done`, `tv_copy fail`, `tv_copy cache_hit`, and `tv_copy evict`. Those lines do not include a file path. A copy that does not itself pass the cast check is deleted and not sent.
 
 ## Receiver handshake
 

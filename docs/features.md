@@ -114,7 +114,7 @@ SlideX is a single-file slideshow viewer and playlist tool. The current app incl
 ## Export and Capture
 
 - Save a screenshot of the current view with grades baked (including lowlights/highlights/gamma/sharpness), auto-saving to a Screenshots folder when supported.
-- **Export Graded** (toolbar or `E`): for images, write a JPEG with the full color suite baked via the native save dialog (Tauri) or browser download. For video, best-effort canvas/MediaRecorder WebM bake for short clips (≤45s); otherwise export a `.sspgrade.json` sidecar documenting the grade (ffmpeg is not bundled). Playlist save still keeps grades on the item. A crop is included in that same canvas path.
+- **Export Graded** (toolbar or `E`): for images, write a JPEG with the full color suite baked via the native save dialog (Tauri) or browser download. For video, best-effort canvas/MediaRecorder WebM bake for short clips (≤45s); otherwise export a `.sspgrade.json` sidecar documenting the grade. Graded export does not re-encode with ffmpeg. Cast TV copies use the ffmpeg build installed beside the app. Playlist save still keeps grades on the item. A crop is included in that same canvas path.
 - **Export cropped**: writes a new file only (`name_crop.jpg`, or `name_crop (2).jpg` when that name is taken). JPEG quality 95, PNG when the source is PNG and the grade is still default, HEIC as JPEG. Size is the crop times the oriented resolution. Date-taken metadata is copied. A graded photo reuses the graded JPEG path. A video export is the current frame at the video's native resolution. The original is never overwritten.
 
 ## QA checklist
