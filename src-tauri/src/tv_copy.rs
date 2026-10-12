@@ -71,6 +71,8 @@ pub(crate) struct TvPlan {
     /// True when the source was over 60 fps and the copy forces 60.
     pub fps_capped: bool,
     pub tone_map: bool,
+    /// Input transfer for the tone-map. Untagged 10-bit uses bt709.
+    pub transfer_in: &'static str,
     pub encoder: TvEncoder,
     pub audio: AudioIn,
 }
@@ -98,6 +100,7 @@ pub(crate) fn plan_tv(
         fps,
         fps_capped,
         tone_map,
+        transfer_in: "bt709",
         encoder,
         audio,
     }
@@ -189,11 +192,12 @@ fn video_filter(plan: &TvPlan) -> String {
         parts.push("fps=60".to_string());
     }
     if plan.tone_map {
-        // HDR and 10-bit both land in SDR 8-bit before the scale.
-        parts.push(
-            "zscale=transfer=linear,tonemap=hable,zscale=transfer=bt709:matrix=bt709:primaries=bt709"
-                .to_string(),
-        );
+        // Float RGB between the two zscale calls. Without it, zscale reports
+        // "no path between colorspaces" on 10-bit sources.
+        parts.push(format!(
+            "zscale=transferin={}:transfer=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=transfer=bt709:matrix=bt709:primaries=bt709:range=tv",
+            plan.transfer_in
+        ));
     }
     parts.push(format!(
         "scale={}:{}:flags=lanczos",
@@ -524,7 +528,7 @@ impl JobSpec {
 
 fn run_ffmpeg(ffmpeg: &Path, input: &Path, output: &Path, encoder: TvEncoder) -> Result<(), String> {
     let probed = probe_source(ffmpeg, input)?;
-    let plan = plan_tv(
+    let mut plan = plan_tv(
         probed.width,
         probed.height,
         probed.fps,
@@ -532,6 +536,7 @@ fn run_ffmpeg(ffmpeg: &Path, input: &Path, output: &Path, encoder: TvEncoder) ->
         probed.audio,
         encoder,
     );
+    plan.transfer_in = probed.transfer_in;
     let args = ffmpeg_arguments(&plan, input, output);
     let mut cmd = Command::new(ffmpeg);
     cmd.args(&args).stdin(Stdio::null());
@@ -556,6 +561,7 @@ struct Probe {
     height: u32,
     fps: f64,
     hdr_or_10bit: bool,
+    transfer_in: &'static str,
     audio: AudioIn,
 }
 
@@ -577,7 +583,7 @@ fn probe_source(ffmpeg: &Path, input: &Path) -> Result<Probe, String> {
 }
 
 fn parse_probe(text: &str) -> Option<Probe> {
-    let mut video: Option<(u32, u32, f64, bool)> = None;
+    let mut video: Option<(u32, u32, f64, bool, &'static str)> = None;
     let mut audio: Option<AudioIn> = None;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -591,17 +597,18 @@ fn parse_probe(text: &str) -> Option<Probe> {
             });
         }
     }
-    let (width, height, fps, hdr_or_10bit) = video?;
+    let (width, height, fps, hdr_or_10bit, transfer_in) = video?;
     Some(Probe {
         width,
         height,
         fps,
         hdr_or_10bit,
+        transfer_in,
         audio: audio.unwrap_or(AudioIn::None),
     })
 }
 
-fn parse_video_line(line: &str) -> Option<(u32, u32, f64, bool)> {
+fn parse_video_line(line: &str) -> Option<(u32, u32, f64, bool, &'static str)> {
     let (width, height) = first_dimensions(line)?;
     let fps = first_fps(line).unwrap_or(0.0);
     let lower = line.to_ascii_lowercase();
@@ -611,10 +618,17 @@ fn parse_video_line(line: &str) -> Option<(u32, u32, f64, bool)> {
         || lower.contains("10be")
         || lower.contains("12le")
         || lower.contains("p010");
-    let hdr = lower.contains("smpte2084")
-        || lower.contains("arib-std-b67")
-        || lower.contains("bt2020");
-    Some((width, height, fps, ten_bit || hdr))
+    let transfer_in = if lower.contains("smpte2084") {
+        "smpte2084"
+    } else if lower.contains("arib-std-b67") {
+        "arib-std-b67"
+    } else if lower.contains("bt2020") {
+        "bt2020-10"
+    } else {
+        "bt709"
+    };
+    let hdr = transfer_in != "bt709";
+    Some((width, height, fps, ten_bit || hdr, transfer_in))
 }
 
 fn first_dimensions(line: &str) -> Option<(u32, u32)> {
@@ -1105,6 +1119,8 @@ mod tests {
         let args = ffmpeg_arguments(&hdr, Path::new("in.mov"), Path::new("out.mp4"));
         let vf = arg_value(&args, "-vf");
         assert!(vf.contains("tonemap=hable"), "{vf}");
+        assert!(vf.contains("format=gbrpf32le"), "{vf}");
+        assert!(vf.contains("transferin=bt709"), "{vf}");
         assert!(vf.contains("format=yuv420p"), "{vf}");
         assert!(has_pair(&args, "-c:v", "h264_nvenc"));
         assert!(has_pair(&args, "-c:a", "aac"));
@@ -1134,14 +1150,16 @@ mod tests {
     #[test]
     fn probe_line_reads_size_fps_and_hdr() {
         let line = "Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv, bt2020nc/bt2020/smpte2084), 3840x2160, 90 fps, 90 tbr";
-        let (w, h, fps, hdr) = parse_video_line(line).unwrap();
+        let (w, h, fps, hdr, transfer) = parse_video_line(line).unwrap();
         assert_eq!((w, h), (3840, 2160));
         assert_eq!(fps, 90.0);
         assert!(hdr);
+        assert_eq!(transfer, "smpte2084");
         let sdr = "Stream #0:0: Video: h264 (High), yuv420p(tv, bt709), 1920x1080 [SAR 1:1 DAR 16:9], 30 fps, 30 tbr";
-        let (w, h, fps, hdr) = parse_video_line(sdr).unwrap();
+        let (w, h, fps, hdr, transfer) = parse_video_line(sdr).unwrap();
         assert_eq!((w, h, hdr), (1920, 1080, false));
         assert_eq!(fps, 30.0);
+        assert_eq!(transfer, "bt709");
     }
 
     #[test]
