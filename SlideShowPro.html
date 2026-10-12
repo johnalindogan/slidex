@@ -7487,11 +7487,6 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
         return;
       }
-      if (/unreachable|restart SlideX|not connected/i.test(msg)) {
-        stopLocalCast();
-        setStatus(msg);
-        return;
-      }
       setStatus(msg);
     });
   }
@@ -7501,7 +7496,6 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var cmd = sspCastPlaying() ? "cast_play" : "cast_pause";
     return call(cmd, { source: src }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
-      if (/unreachable|restart SlideX/i.test(msg)) stopLocalCast();
       setStatus(msg);
     });
   }

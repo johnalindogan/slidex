@@ -2729,7 +2729,15 @@ impl CastLink {
                                 kind: "INVALID_PLAYER_STATE",
                             });
                         }
-                        _ => continue,
+                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id) => {
+                            return Ok(Waited::LoadRejected { kind: "ERROR" });
+                        }
+                        _ => {
+                            if let Some(kind) = media_error_reply(&msg, id) {
+                                return Ok(Waited::LoadRejected { kind });
+                            }
+                            continue;
+                        }
                     }
                 }
                 WaitExpect::Media(id) => {
@@ -2753,7 +2761,21 @@ impl CastLink {
                                 "The TV refused the media command (invalid player state).".into()
                             );
                         }
-                        _ => continue,
+                        Ok(MediaResponse::LoadFailed(err)) if err.request_id == id => {
+                            let _ = err;
+                            return Err("The TV refused the media command (LOAD_FAILED).".into());
+                        }
+                        Ok(MediaResponse::Error(_)) if parsed_error_matches(&msg, id) => {
+                            return Err("The TV refused the media command (ERROR).".into());
+                        }
+                        _ => {
+                            if let Some(kind) = media_error_reply(&msg, id) {
+                                return Err(format!(
+                                    "The TV refused the media command ({kind})."
+                                ));
+                            }
+                            continue;
+                        }
                     }
                 }
             }
@@ -2807,6 +2829,16 @@ impl CastLink {
                 let err = cast_panel_message(CastPanelCause::MediaCommandTimeout);
                 cast_log(&step, &format!("{ids} error={err}"));
                 Err(err)
+            }
+            Err(err) if (typ == "PLAY" || typ == "PAUSE") && media_cmd_unanswered(&err) => {
+                // The TV often never replies to PLAY or PAUSE for a still, and a
+                // missed reply must not become "TV unreachable".
+                cast_log(&step, &format!("{ids} warning=unanswered"));
+                Ok(if typ == "PAUSE" {
+                    PlayerState::Paused
+                } else {
+                    PlayerState::Playing
+                })
             }
             Err(err) => {
                 cast_log(&step, &format!("{ids} error={err}"));
@@ -3031,6 +3063,49 @@ fn load_reject_user(kind: &str) -> String {
     } else {
         cast_panel_message(CastPanelCause::LoadError)
     }
+}
+
+/// `(requestId, type)` from a media payload. `requestId` is `None` when the
+/// field is absent. An explicit `0` is unsolicited and must not satisfy a wait.
+fn media_reply_type(msg: &CastMessage) -> Option<(Option<u32>, String)> {
+    let CastMessagePayload::String(text) = &msg.payload else {
+        return None;
+    };
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let typ = value.get("type")?.as_str()?.to_string();
+    let id = value.get("requestId").and_then(|v| v.as_u64()).map(|n| n as u32);
+    Some((id, typ))
+}
+
+/// ERROR, LOAD_FAILED, and INVALID_REQUEST for this requestId.
+/// rust_cast rejects an ERROR that has no detailedErrorCode, so this reads
+/// the raw payload. requestId 0 does not match.
+fn media_error_reply(msg: &CastMessage, id: u32) -> Option<&'static str> {
+    let (rid, typ) = media_reply_type(msg)?;
+    if id == 0 || rid != Some(id) {
+        return None;
+    }
+    match typ.as_str() {
+        "ERROR" => Some("ERROR"),
+        "LOAD_FAILED" => Some("LOAD_FAILED"),
+        "INVALID_REQUEST" => Some("INVALID_REQUEST"),
+        _ => None,
+    }
+}
+
+/// A parsed ERROR carries no request id in rust_cast. Accept it when the
+/// payload does not name a different request. requestId 0 stays ignored.
+fn parsed_error_matches(msg: &CastMessage, id: u32) -> bool {
+    match media_reply_type(msg) {
+        Some((None, typ)) if typ == "ERROR" => true,
+        Some((Some(rid), _)) => rid == id && id != 0,
+        _ => false,
+    }
+}
+
+/// The TV left PLAY or PAUSE unanswered. That is a warning, not a dead link.
+fn media_cmd_unanswered(err: &str) -> bool {
+    err == MEDIA_FETCH_MESSAGE || err.contains("didn't answer the media command")
 }
 
 fn idle_reason_token(reason: Option<IdleReason>) -> &'static str {
@@ -4291,9 +4366,9 @@ fn handle_cmd(
                 let sid = flags
                     .media_session
                     .ok_or_else(|| "Nothing is casting.".to_string())?;
-                if flags.media_kind == "still" {
-                    // Same as 8fa45d8. A still loaded with autoplay does not
-                    // answer PLAY, so the 4s wait is the timeout after LOAD.
+                // LOAD already carries autoplay. PLAY is only a resume from
+                // pause, and never for a photo: the TV does not answer it.
+                if flags.media_kind == "still" || flags.player_state != "paused" {
                     let _ = (sid, origin);
                     flags.player_state = "playing".into();
                     flags.slideshow_playing = true;
@@ -5653,6 +5728,11 @@ mod tests {
         /// Unsolicited requestId 0 statuses arrive before and after that reply.
         /// PLAY and PAUSE are not answered.
         still: bool,
+        /// PLAY is left unanswered. PAUSE still gets a status.
+        silence_play: bool,
+        /// PLAY is answered with this type instead of MEDIA_STATUS.
+        /// `ERROR` is a raw reply with no detailedErrorCode.
+        play_reply: Option<&'static str>,
     }
 
     impl Default for FakeScript {
@@ -5665,6 +5745,8 @@ mod tests {
                 idle_after: &[],
                 idle_delay: Duration::ZERO,
                 still: false,
+                silence_play: false,
+                play_reply: None,
             }
         }
     }
@@ -5882,6 +5964,7 @@ mod tests {
         let mut launch_id = 0u32;
         let mut loads = 0u32;
         let mut due: Vec<DueIdle> = Vec::new();
+        let mut image_session = false;
         while !stop.load(Ordering::SeqCst) {
             flush_due_idles(mm, traces, &mut due);
             let msg = match mm.receive() {
@@ -5967,7 +6050,25 @@ mod tests {
                     ids.push(content_id.clone());
                 }
                 let item = content_id.rsplit('/').next().unwrap_or("");
+                let ctype = value
+                    .pointer("/media/contentType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if ctype.starts_with("image/") {
+                    image_session = true;
+                } else if ctype.starts_with("video/") {
+                    image_session = false;
+                }
+                let autoplay = value.get("autoplay").and_then(|v| v.as_bool()).unwrap_or(false);
                 note_trace(traces, &format!("load {dest} item={item}"));
+                note_trace(
+                    traces,
+                    if autoplay {
+                        "autoplay=true"
+                    } else {
+                        "autoplay=false"
+                    },
+                );
                 if script.load_failed {
                     let body = serde_json::json!({
                         "requestId": id,
@@ -6045,6 +6146,38 @@ mod tests {
                 if script.still && matches!(typ.as_str(), "PLAY" | "PAUSE") {
                     note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
                     continue;
+                }
+                // A photo LOAD is answered with MEDIA_STATUS. PLAY for that image is not.
+                if image_session && typ == "PLAY" {
+                    note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
+                    continue;
+                }
+                if script.silence_play && typ == "PLAY" {
+                    note_trace(traces, &format!("{typ} {dest} session={sid} requestId={id} unanswered"));
+                    continue;
+                }
+                if typ == "PLAY" {
+                    if let Some(kind) = script.play_reply {
+                        let body = match kind {
+                            "ERROR" => serde_json::json!({
+                                "requestId": id,
+                                "type": "ERROR",
+                                "reason": "INVALID_MEDIA",
+                            }),
+                            "INVALID_REQUEST" => serde_json::json!({
+                                "requestId": id,
+                                "type": "INVALID_REQUEST",
+                                "reason": "INVALID_MEDIA",
+                            }),
+                            _ => serde_json::json!({
+                                "requestId": id,
+                                "type": kind,
+                            }),
+                        };
+                        note_trace(traces, &format!("play-reply {kind}"));
+                        fake_send(mm, NS_MEDIA, "transport-1", &body.to_string());
+                        continue;
+                    }
                 }
                 let state = match typ.as_str() {
                     "PAUSE" => "PAUSED",
@@ -6517,96 +6650,243 @@ mod tests {
         out
     }
 
+    struct Driven {
+        log: LogDir,
+        fake: FakeTv,
+        http: MediaHttp,
+        link: CastLink,
+        status: Mutex<CastLiveStatus>,
+        flags: SessionFlags,
+        running: bool,
+    }
+
+    impl Driven {
+        fn load(script: FakeScript, name: &str, bytes: &[u8], autoplay: bool) -> Self {
+            let log = LogDir::new();
+            let path = scratch(name, bytes);
+            let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+            http.set_playlist(std::slice::from_ref(&path)).unwrap();
+            let fake = spawn_fake(script);
+            let (ip, port) = fake.host_port();
+            let mut link = CastLink::connect(ip, port).unwrap();
+            link.launch_receiver().unwrap();
+            let status = Mutex::new(CastLiveStatus {
+                connected: true,
+                player_state: "idle".into(),
+                remote_event: None,
+                error: None,
+                media_kind: String::new(),
+                http_port: http.port,
+                bind_ip: http.bind_ip.to_string(),
+                item_index: 0,
+            });
+            let (_remote, mut flags) = session_after_load("still");
+            flags.media_kind.clear();
+            flags.media_session = None;
+            flags.player_state = "idle".into();
+            flags.item_index = 0;
+            let mut running = true;
+            let (tx, rx) = mpsc::channel();
+            let kept = handle_cmd(
+                CastCmd::Load {
+                    path,
+                    autoplay,
+                    origin: CastOrigin::User,
+                    reply: tx,
+                },
+                &mut http,
+                &link,
+                &mut flags,
+                &status,
+                &mut running,
+            );
+            assert!(kept);
+            assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());
+            Self {
+                log,
+                fake,
+                http,
+                link,
+                status,
+                flags,
+                running,
+            }
+        }
+
+        fn command(&mut self, play: bool) -> (Duration, Result<(), String>) {
+            let started = Instant::now();
+            let (tx, rx) = mpsc::channel();
+            let cmd = if play {
+                CastCmd::Play {
+                    origin: CastOrigin::User,
+                    reply: tx,
+                }
+            } else {
+                CastCmd::Pause {
+                    origin: CastOrigin::User,
+                    reply: tx,
+                }
+            };
+            let kept = handle_cmd(
+                cmd,
+                &mut self.http,
+                &self.link,
+                &mut self.flags,
+                &self.status,
+                &mut self.running,
+            );
+            assert!(kept);
+            let result = rx.recv_timeout(Duration::from_secs(6)).unwrap();
+            (started.elapsed(), result)
+        }
+    }
+
     #[test]
     fn photo_play_does_not_wait_when_the_receiver_leaves_play_unanswered() {
-        let log = LogDir::new();
-        let photo = scratch("vacation-photo.jpg", &jpeg_bytes());
-        let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
-        http.set_playlist(std::slice::from_ref(&photo)).unwrap();
-        let fake = spawn_fake(FakeScript {
-            still: true,
-            ..FakeScript::default()
-        });
-        let (ip, port) = fake.host_port();
-        let mut link = CastLink::connect(ip, port).unwrap();
-        link.launch_receiver().unwrap();
-        let status = Mutex::new(CastLiveStatus {
-            connected: true,
-            player_state: "idle".into(),
-            remote_event: None,
-            error: None,
-            media_kind: String::new(),
-            http_port: http.port,
-            bind_ip: http.bind_ip.to_string(),
-            item_index: 0,
-        });
-        let (remote, mut flags) = session_after_load("still");
-        flags.media_kind.clear();
-        flags.media_session = None;
-        flags.player_state = "idle".into();
-        flags.item_index = 0;
-        let mut running = true;
-        let (load_tx, load_rx) = std::sync::mpsc::channel();
-        let kept = handle_cmd(
-            CastCmd::Load {
-                path: photo,
-                autoplay: true,
-                origin: CastOrigin::User,
-                reply: load_tx,
-            },
-            &mut http,
-            &link,
-            &mut flags,
-            &status,
-            &mut running,
+        // c5542f0 loaded the photo, then sent PLAY and timed out at 4s because
+        // the TV never answers PLAY for an image. LOAD with autoplay is enough.
+        let mut cast = Driven::load(
+            FakeScript::default(),
+            "vacation-photo.jpg",
+            &jpeg_bytes(),
+            true,
         );
-        assert!(kept);
-        assert!(load_rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
-        assert_eq!(flags.media_session, Some(7), "requestId 0 must not win the LOAD");
-        assert_eq!(flags.media_kind, "still");
-        let states = pump_player_states(&link, 1);
-        assert_eq!(states, vec![PlayerState::Paused]);
-        flags.note_state(PlayerState::Paused, false);
-        assert!(remote.lock().unwrap().is_none());
-        assert_eq!(flags.player_state, "playing");
-
-        let started = Instant::now();
-        let (play_tx, play_rx) = std::sync::mpsc::channel();
-        let kept = handle_cmd(
-            CastCmd::Play {
-                origin: CastOrigin::User,
-                reply: play_tx,
-            },
-            &mut http,
-            &link,
-            &mut flags,
-            &status,
-            &mut running,
-        );
-        let played = play_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+        assert_eq!(cast.flags.media_session, Some(7));
+        assert_eq!(cast.flags.media_kind, "still");
+        assert_eq!(cast.flags.player_state, "playing");
+        let (elapsed, played) = cast.command(true);
         assert!(
-            started.elapsed() < Duration::from_millis(1500),
-            "photo PLAY waited {:?}; a still must not sit out the 4s media deadline",
-            started.elapsed()
+            elapsed < Duration::from_millis(1500),
+            "photo PLAY waited {elapsed:?}; LOAD then PLAY on a photo must not time out"
         );
         assert!(played.is_ok(), "{played:?}");
-        assert!(kept);
-        let live = status.lock().unwrap().clone();
+        let live = cast.status.lock().unwrap().clone();
         assert_eq!(live.player_state, "playing");
         assert!(live.error.is_none(), "{:?}", live.error);
         assert!(live.connected);
-        assert!(flags.slideshow_playing);
-        let text = fake.trace_text();
+        assert!(cast.flags.slideshow_playing);
+        let text = cast.fake.trace_text();
         assert!(text.contains("load transport-1"), "{text}");
+        assert!(text.contains("autoplay=true"), "{text}");
+        assert!(text.contains("media-status"), "{text}");
         assert!(
             !text.lines().any(|line| line.starts_with("PLAY ")),
             "a still must not be sent PLAY: {text}"
         );
-        let written = log.text();
+        let written = cast.log.text();
+        assert!(written.contains("reply=MEDIA_STATUS"), "{written}");
+        assert!(written.contains("playerState=PLAYING"), "{written}");
         assert!(
-            !written.contains("timeout") && !written.contains("didn't answer"),
+            !written.contains("timeout")
+                && !written.contains("didn't answer")
+                && !written.contains("TV unreachable"),
             "{written}"
         );
+    }
+
+    #[test]
+    fn video_play_is_sent_only_to_resume_from_pause() {
+        let mut cast = Driven::load(
+            FakeScript::default(),
+            "clip.mp4",
+            &mp4_with(&[b"avc1", b"mp4a"]),
+            true,
+        );
+        assert_eq!(cast.flags.media_kind, "video");
+        assert_eq!(cast.flags.player_state, "playing");
+        let (elapsed, played) = cast.command(true);
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert!(played.is_ok(), "{played:?}");
+        assert!(
+            !cast.fake.trace_text().lines().any(|line| line.starts_with("PLAY ")),
+            "{}",
+            cast.fake.trace_text()
+        );
+        let (elapsed, paused) = cast.command(false);
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert!(paused.is_ok(), "{paused:?}");
+        assert_eq!(cast.flags.player_state, "paused");
+        assert!(
+            cast.fake.trace_text().contains("PAUSE transport-1"),
+            "{}",
+            cast.fake.trace_text()
+        );
+        let (elapsed, played) = cast.command(true);
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert!(played.is_ok(), "{played:?}");
+        assert!(
+            cast.fake.trace_text().lines().any(|line| line.starts_with("PLAY ")),
+            "{}",
+            cast.fake.trace_text()
+        );
+        assert_eq!(cast.flags.player_state, "playing");
+    }
+
+    #[test]
+    fn unanswered_video_play_warns_without_marking_the_tv_unreachable() {
+        let mut cast = Driven::load(
+            FakeScript {
+                silence_play: true,
+                ..FakeScript::default()
+            },
+            "clip.mp4",
+            &mp4_with(&[b"avc1", b"mp4a"]),
+            true,
+        );
+        cast.flags.player_state = "paused".into();
+        let (elapsed, played) = cast.command(true);
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(6),
+            "unanswered PLAY should wait out the media deadline, not the link, got {elapsed:?}"
+        );
+        assert!(played.is_ok(), "{played:?}");
+        let live = cast.status.lock().unwrap().clone();
+        assert!(live.connected);
+        assert!(live.error.is_none(), "{:?}", live.error);
+        assert_eq!(live.player_state, "playing");
+        let written = cast.log.text();
+        assert!(written.contains("warning=unanswered"), "{written}");
+        assert!(!written.contains("TV unreachable"), "{written}");
+    }
+
+    #[test]
+    fn play_error_replies_match_the_request_and_stay_connected() {
+        for kind in ["ERROR", "LOAD_FAILED", "INVALID_REQUEST"] {
+            let mut cast = Driven::load(
+                FakeScript {
+                    play_reply: Some(kind),
+                    ..FakeScript::default()
+                },
+                "clip.mp4",
+                &mp4_with(&[b"avc1", b"mp4a"]),
+                true,
+            );
+            cast.flags.player_state = "paused".into();
+            let (elapsed, played) = cast.command(true);
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "{kind} waited {elapsed:?}"
+            );
+            let err = played.expect_err(kind);
+            assert!(err.contains("refused"), "{kind} {err}");
+            assert!(!err.contains("unreachable"), "{kind} {err}");
+            assert!(!err.to_ascii_lowercase().contains("timed out"), "{kind} {err}");
+            match kind {
+                "ERROR" => assert!(err.contains("ERROR"), "{err}"),
+                "LOAD_FAILED" => assert!(err.contains("LOAD_FAILED"), "{err}"),
+                _ => assert!(
+                    err.contains("INVALID_REQUEST") || err.contains("INVALID_MEDIA"),
+                    "{err}"
+                ),
+            }
+            let live = cast.status.lock().unwrap().clone();
+            assert!(live.connected, "{kind}");
+            assert_ne!(live.player_state, "playing", "{kind} {}", live.player_state);
+            let shown = live.error.expect(kind);
+            assert_eq!(shown, err);
+            assert!(!shown.contains("unreachable"), "{shown}");
+            assert!(!shown.contains("TV unreachable"), "{shown}");
+        }
     }
 
     #[test]
