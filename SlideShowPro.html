@@ -461,16 +461,27 @@ body.ssp-playlist-window #dock-toggle-btn {
   width: 64px;
   height: 40px;
 }
+.tw.dragging {
+  opacity: .35;
+}
+.tw.dragover-before {
+  box-shadow: inset 3px 0 0 #fff;
+}
+.tw.dragover-after {
+  box-shadow: inset -3px 0 0 #fff;
+}
 .th {
   width: 64px;
   height: 40px;
   object-fit: cover;
   border-radius: 4px;
-  cursor: pointer;
+  cursor: grab;
   border: 2px solid transparent;
   opacity: .5;
   transition: opacity .2s, border-color .2s;
   display: block;
+  touch-action: none;
+  -webkit-user-drag: none;
 }
 .th.at {
   border-color: #fff;
@@ -628,6 +639,10 @@ body.ssp-playlist-window #dock-toggle-btn {
   font-size: 15px;
   flex-shrink: 0;
   line-height: 1;
+  touch-action: none;
+}
+.pldrag:active {
+  cursor: grabbing;
 }
 .plthumb {
   width: 50px;
@@ -2287,7 +2302,9 @@ let maxPreset = 2; // 1=SameSide2, 2=KBLeft, 3=KBRight, 4=SameSide3
 let screenshotDirHandle = null;
 const MAX_PRESET_LABELS = ['Same Side 2', 'KB Left', 'KB Right', 'Same Side 3'];
 let dragSrcItemsIdx = null;
-let plDragOverRowIdx = -1; // visual plRows index for drop indicator during list-level DnD
+let plDragOverRowIdx = -1; // visual plRows index for the pointer-reorder indicator
+let reorderGesture = null;
+let reorderSwallowClick = false;
 let sharedImageUpdates = null;
 
 let transitionType = localStorage.getItem('ssp_transition') || 'fade';
@@ -4761,7 +4778,12 @@ function createStripThumb(item, i) {
   const ti = document.createElement('img');
   ti.className = 'th' + (i === cur ? ' at' : '');
   ti.decoding = 'async';
+  ti.draggable = false;
   ti.onclick = () => goTo(i);
+  tw.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    startPointerReorder(e, { kind: 'strip', mediaIndex: i, el: tw });
+  });
   if (item.type === 'video') {
     ti.dataset.thumbId = item.id;
     // Placeholder unless thumbnail already cached — avoid decoding every video on scrub.
@@ -4800,8 +4822,12 @@ function remountStripWindow(forceCenter) {
     const target = stripLeftForIndex(forceCenter) + STRIP_THUMB_W / 2 - viewW / 2;
     scrollL = Math.max(0, Math.min(target, Math.max(0, stripTotalWidth(mi.length) - viewW)));
   }
-  const first = Math.max(0, Math.floor((scrollL - STRIP_PAD_X) / STRIP_CELL) - STRIP_OVERSCAN);
-  const last = Math.min(mi.length - 1, Math.ceil((scrollL + viewW - STRIP_PAD_X) / STRIP_CELL) + STRIP_OVERSCAN);
+  let first = Math.max(0, Math.floor((scrollL - STRIP_PAD_X) / STRIP_CELL) - STRIP_OVERSCAN);
+  let last = Math.min(mi.length - 1, Math.ceil((scrollL + viewW - STRIP_PAD_X) / STRIP_CELL) + STRIP_OVERSCAN);
+  if (reorderGesture && reorderGesture.kind === 'strip' && reorderGesture.mediaIndex != null) {
+    first = Math.min(first, reorderGesture.mediaIndex);
+    last = Math.max(last, Math.min(mi.length - 1, reorderGesture.mediaIndex));
+  }
   stripMounted.forEach((_, i) => {
     if (i < first || i > last) unmountStripThumb(i);
   });
@@ -4986,12 +5012,6 @@ function ensurePlTrack() {
         });
       }, { passive: true });
     }
-    if (!list._sspPlDnDBound) {
-      list._sspPlDnDBound = true;
-      list.addEventListener('dragover', onPlListDragOver);
-      list.addEventListener('drop', onPlListDrop);
-      list.addEventListener('dragleave', onPlListDragLeave);
-    }
   }
   return track;
 }
@@ -5083,7 +5103,7 @@ function createPlFolderRow(row) {
   const isOpen = row.isOpen;
   const div = document.createElement('div');
   div.className = 'plfolder';
-  div.draggable = true;
+  div.draggable = false;
   div.dataset.plIdx = String(row.itemsIdx);
   div.style.height = (PL_FOLDER_H - 4) + 'px';
   let toggleTimer = null;
@@ -5128,8 +5148,11 @@ function createPlFolderRow(row) {
   };
   div.appendChild(arr); div.appendChild(icon); div.appendChild(name); div.appendChild(del);
 
-  div.addEventListener('dragstart', e => { plDragStart(e, itemsIdx, div); });
-  div.addEventListener('dragend', e => { plDragEnd(e); });
+  div.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    if (e.target.closest && e.target.closest('button,input,select,a')) return;
+    startPointerReorder(e, { kind: 'handle', itemsIdx, el: div });
+  });
   return div;
 }
 
@@ -5142,12 +5165,13 @@ function createPlMediaRow(row) {
   div.className = 'pli' + (thisMI === cur ? ' plcur' : '') + (selectedItems.has(thisMI) ? ' plsel' : '') + (row.indent ? ' plindent' : '');
   div.dataset.mi = String(thisMI);
   div.dataset.plIdx = String(row.itemsIdx);
-  div.draggable = true;
+  div.draggable = false;
   div.style.height = (row.height - 4) + 'px';
 
-  const drag = document.createElement('span'); drag.className = 'pldrag'; drag.textContent = '⠿';
+  const drag = document.createElement('span'); drag.className = 'pldrag'; drag.textContent = '⠿'; drag.draggable = false;
   const thumb = document.createElement('img');
   thumb.className = 'plthumb';
+  thumb.draggable = false;
   if (item.type === 'video') {
     thumb.dataset.thumbId = item.id;
     thumb.src = item.thumbnailUrl || VIDEO_PLACEHOLDER;
@@ -5205,17 +5229,10 @@ function createPlMediaRow(row) {
   };
   div.appendChild(drag); div.appendChild(thumb); div.appendChild(info); div.appendChild(del);
 
-  div.addEventListener('dragstart', e => {
-    plDragStart(e, itemsIdx, div);
-    setTimeout(() => {
-      list.querySelectorAll('.pli[data-mi]').forEach(el => {
-        const mi2 = parseInt(el.dataset.mi, 10);
-        if (selectedItems.has(thisMI) && selectedItems.size > 1 && selectedItems.has(mi2)) el.classList.add('dragging');
-        else if (mi2 === thisMI && (!selectedItems.has(thisMI) || selectedItems.size <= 1)) el.classList.add('dragging');
-      });
-    }, 0);
+  drag.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    startPointerReorder(e, { kind: 'handle', itemsIdx, el: div });
   });
-  div.addEventListener('dragend', e => { plDragEnd(e); });
   return div;
 }
 
@@ -5323,23 +5340,133 @@ function clearPlDragIndicators() {
   list.querySelectorAll('.pli,.plfolder').forEach(el => el.classList.remove('dragover-top', 'dragover-bot', 'dragging'));
 }
 
-function plDragStart(e, itemsIdx, el) {
-  dragSrcItemsIdx = itemsIdx;
-  try {
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/ssp-pl-idx', String(itemsIdx));
-    e.dataTransfer.setData('text/plain', String(itemsIdx));
-  } catch (_) {}
-  if (el) setTimeout(() => el.classList.add('dragging'), 0);
+function clearStripDragIndicators() {
+  const strip = g('tstrip');
+  if (!strip) return;
+  strip.querySelectorAll('.tw').forEach(el => el.classList.remove('dragging', 'dragover-before', 'dragover-after'));
 }
 
-function plDragEnd() {
-  // Defer clear so drop handlers (which may run after dragend on some WebViews) still see the source index.
-  const src = dragSrcItemsIdx;
+/*
+ * Reorder with pointer events. Tauri's Windows file-drop target
+ * (dragDropEnabled, on by default) replaces WebView2's drop target, so
+ * HTML5 dragstart never fires for the Media Manager handle or the strip.
+ * Explorer drops stay on tauri://drag-drop and keep their paths.
+ * No ancestor of #pllist or #tstrip calls preventDefault on mousedown;
+ * stage pan does, and it does not cover the dock.
+ */
+function bindPointerReorder() {
+  if (document.documentElement._sspReorderBound) return;
+  document.documentElement._sspReorderBound = true;
+  document.addEventListener('pointermove', onReorderPointerMove);
+  document.addEventListener('pointerup', onReorderPointerEnd);
+  document.addEventListener('pointercancel', onReorderPointerEnd);
+  document.addEventListener('click', e => {
+    if (!reorderSwallowClick) return;
+    reorderSwallowClick = false;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+}
+
+function startPointerReorder(e, spec) {
+  bindPointerReorder();
+  reorderGesture = {
+    kind: spec.kind,
+    pointerId: e.pointerId,
+    x: e.clientX,
+    y: e.clientY,
+    itemsIdx: spec.itemsIdx,
+    mediaIndex: spec.mediaIndex,
+    el: spec.el || e.currentTarget,
+    active: false,
+    hit: null
+  };
+  if (spec.kind === 'handle') dragSrcItemsIdx = spec.itemsIdx;
+  try { (spec.el || e.currentTarget).setPointerCapture(e.pointerId); } catch (_) {}
+}
+
+function onReorderPointerMove(e) {
+  const gesture = reorderGesture;
+  if (!gesture || e.pointerId !== gesture.pointerId) return;
+  const core = window.SlideXCore;
+  const passed = core && core.pointerPassedReorderThreshold
+    ? core.pointerPassedReorderThreshold(e.clientX - gesture.x, e.clientY - gesture.y)
+    : Math.hypot(e.clientX - gesture.x, e.clientY - gesture.y) >= 4;
+  if (!gesture.active && !passed) return;
+  if (!gesture.active) {
+    gesture.active = true;
+    reorderSwallowClick = true;
+    if (gesture.el) gesture.el.classList.add('dragging');
+  }
+  if (gesture.kind === 'handle') {
+    const hit = plHitTest(e.clientY);
+    gesture.hit = hit;
+    updatePlDragIndicator(hit);
+  } else {
+    maybeAutoScrollStrip(e.clientX);
+    const hit = stripHitTest(e.clientX);
+    gesture.hit = hit;
+    updateStripDragIndicator(hit, gesture.mediaIndex);
+  }
+}
+
+function onReorderPointerEnd(e) {
+  const gesture = reorderGesture;
+  if (!gesture || e.pointerId !== gesture.pointerId) return;
+  reorderGesture = null;
+  dragSrcItemsIdx = null;
+  const active = gesture.active && e.type !== 'pointercancel';
+  const hit = gesture.hit;
   clearPlDragIndicators();
-  queueMicrotask(() => {
-    if (dragSrcItemsIdx === src) dragSrcItemsIdx = null;
-  });
+  clearStripDragIndicators();
+  if (active) {
+    reorderSwallowClick = true;
+    setTimeout(() => { reorderSwallowClick = false; }, 0);
+  } else {
+    reorderSwallowClick = false;
+  }
+  if (!active || !hit) return;
+  const core = window.SlideXCore;
+  if (!core) return;
+  const selected = [];
+  selectedItems.forEach(n => selected.push(n));
+  let result = null;
+  if (gesture.kind === 'handle') {
+    const list = g('pllist');
+    const rect = list ? list.getBoundingClientRect() : { top: 0 };
+    result = core.reorderByHandle({
+      items,
+      rows: plRows,
+      fromItemsIdx: gesture.itemsIdx,
+      clientY: e.clientY,
+      listTop: rect.top,
+      scrollTop: list ? list.scrollTop : 0,
+      selected
+    });
+  } else {
+    const strip = g('tstrip');
+    const rect = strip ? strip.getBoundingClientRect() : { left: 0 };
+    result = core.reorderByStrip({
+      items,
+      fromMediaIndex: gesture.mediaIndex,
+      clientX: e.clientX,
+      stripLeft: rect.left,
+      scrollLeft: strip ? strip.scrollLeft : 0,
+      metrics: { thumbW: STRIP_THUMB_W, gap: STRIP_GAP, padX: STRIP_PAD_X },
+      selected
+    });
+  }
+  applyReorderResult(result);
+}
+
+function applyReorderResult(result) {
+  if (!result || !result.moved) return;
+  items = result.items;
+  if (result.clearedSelection) selectedItems.clear();
+  rebuildSlides(cur);
+  if (!playlistChromeOpen()) buildPlRows();
+  schedAutoSave();
+  try { notifyPlaylistSync(); } catch (_) {}
 }
 
 /** Map pointer Y inside #pllist to a model row (itemsIdx) + before/after half. */
@@ -5347,16 +5474,10 @@ function plHitTest(clientY) {
   const list = g('pllist');
   if (!list || !plRows.length) return null;
   const rect = list.getBoundingClientRect();
-  const y = clientY - rect.top + list.scrollTop;
-  for (let i = 0; i < plRows.length; i++) {
-    const row = plRows[i];
-    if (y < row.top + row.height) {
-      const after = y >= row.top + row.height / 2;
-      return { rowIdx: i, itemsIdx: row.itemsIdx, after };
-    }
+  if (window.SlideXCore && SlideXCore.listReorderHit) {
+    return SlideXCore.listReorderHit(plRows, clientY, rect.top, list.scrollTop);
   }
-  const last = plRows[plRows.length - 1];
-  return { rowIdx: plRows.length - 1, itemsIdx: last.itemsIdx, after: true };
+  return null;
 }
 
 function updatePlDragIndicator(hit) {
@@ -5369,88 +5490,33 @@ function updatePlDragIndicator(hit) {
   if (el) el.classList.add(hit.after ? 'dragover-bot' : 'dragover-top');
 }
 
-function resolvePlDragSrc(e) {
-  if (dragSrcItemsIdx != null && Number.isFinite(dragSrcItemsIdx)) return dragSrcItemsIdx;
-  try {
-    const raw = (e && e.dataTransfer && (e.dataTransfer.getData('text/ssp-pl-idx') || e.dataTransfer.getData('text/plain'))) || '';
-    if (raw !== '') {
-      const n = parseInt(raw, 10);
-      if (Number.isFinite(n)) return n;
-    }
-  } catch (_) {}
-  return null;
+function stripHitTest(clientX) {
+  const strip = g('tstrip');
+  const media = getMediaItems();
+  if (!strip || !media.length || !window.SlideXCore || !SlideXCore.stripReorderHit) return null;
+  const rect = strip.getBoundingClientRect();
+  return SlideXCore.stripReorderHit(clientX, rect.left, strip.scrollLeft, media.length, {
+    thumbW: STRIP_THUMB_W, gap: STRIP_GAP, padX: STRIP_PAD_X
+  });
 }
 
-function onPlListDragOver(e) {
-  if (dragSrcItemsIdx == null && !(e.dataTransfer && e.dataTransfer.types && [...e.dataTransfer.types].some(t => t === 'text/ssp-pl-idx' || t === 'text/plain'))) return;
-  // Ignore external file drags (Tauri/OS) — those are handled by stage/landing ingest.
-  if (e.dataTransfer && e.dataTransfer.types && [...e.dataTransfer.types].includes('Files') && dragSrcItemsIdx == null) return;
-  e.preventDefault();
-  e.stopPropagation();
-  try { e.dataTransfer.dropEffect = 'move'; } catch (_) {}
-  const hit = plHitTest(e.clientY);
-  updatePlDragIndicator(hit);
+function updateStripDragIndicator(hit, srcMediaIndex) {
+  const strip = g('tstrip');
+  if (!strip) return;
+  strip.querySelectorAll('.tw').forEach(el => el.classList.remove('dragover-before', 'dragover-after'));
+  if (!hit) return;
+  const el = stripMounted.get(hit.mediaIndex);
+  if (!el || hit.mediaIndex === srcMediaIndex) return;
+  el.classList.add(hit.after ? 'dragover-after' : 'dragover-before');
 }
 
-function onPlListDragLeave(e) {
-  const list = g('pllist');
-  if (!list) return;
-  if (e.relatedTarget && list.contains(e.relatedTarget)) return;
-  list.querySelectorAll('.pli,.plfolder').forEach(el => el.classList.remove('dragover-top', 'dragover-bot'));
-  plDragOverRowIdx = -1;
-}
-
-function onPlListDrop(e) {
-  const srcIdx = resolvePlDragSrc(e);
-  if (srcIdx == null) return; // not an internal playlist reorder
-  e.preventDefault();
-  e.stopPropagation();
-  const hit = plHitTest(e.clientY);
-  clearPlDragIndicators();
-  dragSrcItemsIdx = null;
-  if (!hit || srcIdx === hit.itemsIdx) return;
-  dropItemsAt(srcIdx, hit.itemsIdx, hit.after);
-}
-
-function dropItemsAt(srcIdx, tgtIdx, after) {
-  if (srcIdx == null || tgtIdx == null || srcIdx < 0 || tgtIdx < 0) return;
-  if (srcIdx >= items.length || tgtIdx >= items.length) return;
-  const srcItem = items[srcIdx];
-  if (!srcItem) return;
-  if (srcItem.type !== 'folder' && selectedItems.size > 1) {
-    const selIdxs = new Set();
-    let mc = 0;
-    items.forEach((it, idx) => { if (it.type !== 'folder') { if (selectedItems.has(mc)) selIdxs.add(idx); mc++; } });
-    // If the drag source is not part of the multi-selection, fall back to single move.
-    if (!selIdxs.has(srcIdx)) {
-      const tgtItem = items[tgtIdx];
-      const moved = items.splice(srcIdx, 1)[0];
-      let tgt = items.indexOf(tgtItem);
-      if (tgt < 0) tgt = Math.min(tgtIdx, items.length);
-      items.splice(after ? tgt + 1 : tgt, 0, moved);
-    } else {
-      const tgtItem = items[tgtIdx];
-      const moved = items.filter((_, idx) => selIdxs.has(idx));
-      const remaining = items.filter((_, idx) => !selIdxs.has(idx));
-      let tgt = remaining.indexOf(tgtItem); if (tgt < 0) tgt = remaining.length;
-      remaining.splice(after ? tgt + 1 : tgt, 0, ...moved);
-      items = remaining; selectedItems.clear();
-    }
-  } else {
-    const tgtItem = items[tgtIdx];
-    const moved = items.splice(srcIdx, 1)[0];
-    let tgt = items.indexOf(tgtItem);
-    if (tgt < 0) tgt = Math.min(tgtIdx, items.length);
-    items.splice(after ? tgt + 1 : tgt, 0, moved);
-  }
-  // Always rebuild stage + filmstrip from the new items order; playlist remounts when dock is open.
-  rebuildSlides(cur);
-  if (!playlistChromeOpen()) {
-    // Keep virtualized row model in sync even while collapsed so the next expand is correct.
-    buildPlRows();
-  }
-  schedAutoSave();
-  try { notifyPlaylistSync(); } catch (_) {}
+function maybeAutoScrollStrip(clientX) {
+  const strip = g('tstrip');
+  if (!strip) return;
+  const rect = strip.getBoundingClientRect();
+  const edge = 28;
+  if (clientX < rect.left + edge) strip.scrollLeft -= 16;
+  else if (clientX > rect.right - edge) strip.scrollLeft += 16;
 }
 
 g('plnewfolder').onclick = () => {
@@ -6465,7 +6531,13 @@ window.confirmDeleteFile = async function() {
   let lastDropKey = '';
   let lastDropAt = 0;
   async function handleNativeDrop(paths) {
-    const media = filterMediaPaths(paths);
+    const plan = (window.SlideXCore && SlideXCore.planExplorerFileDrop)
+      ? SlideXCore.planExplorerFileDrop(paths, {
+          viewerOpen: !!(viewer && viewer.style.display === 'flex'),
+          itemCount: (items && items.length) || 0
+        })
+      : { media: filterMediaPaths(paths), append: viewer.style.display === 'flex' && items.length > 0 };
+    const media = plan.media || [];
     const key = media.join('|');
     const now = Date.now();
     // Dedupe duplicate tauri://drag-drop emissions.
@@ -6477,9 +6549,8 @@ window.confirmDeleteFile = async function() {
       else showToast('Drop had no readable file paths.', 4000);
       return;
     }
-    const append = viewer.style.display === 'flex' && items.length > 0;
     try {
-      await openMediaPaths(media, { append });
+      await openMediaPaths(media, { append: !!plan.append });
       if (dz) dz.classList.remove('over');
     } catch (e) {
       console.error('SSP native drop failed', e);

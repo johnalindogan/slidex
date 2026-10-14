@@ -1449,3 +1449,173 @@ test('a photo timer then a video FINISHED leaves cur on item 3', () => {
   sandbox.applyFinished({ remote_event: 'finished', item_index: 3 });
   assert.equal(sandbox.cur, 2);
 });
+
+function whatsappShots(n) {
+  const items = [];
+  for (let i = 1; i <= n; i++) {
+    const name = `WhatsApp Image 2026-10-14 at 09.0${i}.0${i}.jpg`;
+    items.push({
+      id: `wa-${i}`,
+      type: 'image',
+      name,
+      path: `C:\\Users\\John\\Pictures\\${name}`
+    });
+  }
+  return items;
+}
+
+function shotNames(items) {
+  return items.map(it => it.name);
+}
+
+const pageHtml = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+const tauriConf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+
+test('reordering by handle works', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  assert.equal(C.pointerPassedReorderThreshold(2, 2), false);
+  assert.equal(pageHtml.includes('pointerPassedReorderThreshold'), true);
+  assert.equal(pageHtml.includes('reorderByHandle'), true);
+  assert.equal(pageHtml.includes("addEventListener('dragstart'"), false);
+  assert.equal(pageHtml.includes('div.draggable = true'), false);
+  const below = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[0].top + 2,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(below.moved, false);
+  assert.deepEqual(Array.from(shotNames(below.items)), shotNames(shots));
+  const moved = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.hit.after, true);
+  assert.equal(moved.hit.itemsIdx, 2);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[1].name, shots[2].name, shots[0].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name, shots[7].name
+  ]);
+  const multi = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[7].top + rows[7].height * 0.75,
+    selected: [0, 1]
+  });
+  assert.equal(multi.clearedSelection, true);
+  assert.deepEqual(Array.from(shotNames(multi.items)), [
+    shots[2].name, shots[3].name, shots[4].name, shots[5].name, shots[6].name, shots[7].name,
+    shots[0].name, shots[1].name
+  ]);
+});
+
+test('reordering by strip works', () => {
+  const shots = whatsappShots(8);
+  assert.equal(pageHtml.includes('reorderByStrip'), true);
+  const leftOfFirst = C.STRIP_PAD_X + C.STRIP_THUMB_W * 0.25;
+  const moved = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: 7,
+    clientX: leftOfFirst,
+    stripLeft: 0,
+    scrollLeft: 0
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.hit.mediaIndex, 0);
+  assert.equal(moved.hit.after, false);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[7].name, shots[0].name, shots[1].name, shots[2].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name
+  ]);
+  const withFolder = [
+    { type: 'folder', id: 'f', name: 'Trip' },
+    shots[0], shots[1]
+  ];
+  const folderMove = C.reorderByStrip({
+    items: withFolder,
+    fromMediaIndex: 1,
+    clientX: C.STRIP_PAD_X + C.STRIP_THUMB_W * 0.25,
+    stripLeft: 0,
+    scrollLeft: 0
+  });
+  assert.deepEqual(Array.from(folderMove.items.map(it => it.name)), ['Trip', shots[1].name, shots[0].name]);
+  assert.deepEqual(Array.from(C.playbackNames(folderMove.items)), [shots[1].name, shots[0].name]);
+});
+
+test('new order holds after Next/Prev and after save and reopen', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  const moved = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    selected: []
+  });
+  const cur = C.playbackIndexAfterReorder(shots, 0, moved.items);
+  assert.equal(C.playbackMedia(moved.items)[cur].name, shots[0].name);
+  const next = C.stepMediaIndex(C.playbackMedia(moved.items).length, cur, false);
+  const prev = C.stepMediaIndex(C.playbackMedia(moved.items).length, next, true);
+  assert.equal(C.playbackMedia(moved.items)[next].name, shots[3].name);
+  assert.equal(prev, cur);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[1].name, shots[2].name, shots[0].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name, shots[7].name
+  ]);
+  assert.equal(pageHtml.includes('items = result.items'), true);
+  assert.equal(pageHtml.includes('schedAutoSave()'), true);
+  const doc = C.buildPlaylistDocument({ items: moved.items, savedAt: 1 });
+  const opened = C.planSessionRestore(C.normalizePlaylist(JSON.parse(JSON.stringify(doc))).items, () => true);
+  assert.deepEqual(Array.from(opened.items.map(it => it.path)), moved.items.map(it => it.path));
+  assert.deepEqual(Array.from(opened.items.map(it => it.name)), Array.from(shotNames(moved.items)));
+  assert.equal(opened.missing, 0);
+});
+
+test('playback follows the new order', () => {
+  const shots = whatsappShots(8);
+  const moved = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: 7,
+    clientX: C.STRIP_PAD_X + C.STRIP_THUMB_W * 0.25,
+    stripLeft: 0,
+    scrollLeft: 0
+  });
+  const order = [
+    shots[7].name, shots[0].name, shots[1].name, shots[2].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name
+  ];
+  assert.deepEqual(Array.from(C.playbackNames(moved.items, 0, 8, false)), order);
+  const len = C.playbackMedia(moved.items).length;
+  assert.equal(C.playbackNames(moved.items, C.stepMediaIndex(len, 7, false), 1, false)[0], order[0]);
+  assert.equal(C.playbackNames(moved.items, 0, 8, true)[1], order[7]);
+});
+
+test('dropping files from Explorer still works', () => {
+  assert.equal(tauriConf.app.windows[0].dragDropEnabled, true);
+  assert.equal(pageHtml.includes('tauri://drag-drop'), true);
+  assert.equal(pageHtml.includes('planExplorerFileDrop'), true);
+  assert.equal(pageHtml.includes('openMediaPaths(media'), true);
+  const shots = whatsappShots(8).map(it => it.path);
+  const dropped = shots.concat(['C:\\Users\\John\\Desktop\\notes.txt']);
+  const ontoShow = C.planExplorerFileDrop(dropped, { viewerOpen: true, itemCount: 8 });
+  assert.deepEqual(Array.from(ontoShow.media), shots);
+  assert.deepEqual(Array.from(ontoShow.skipped), ['C:\\Users\\John\\Desktop\\notes.txt']);
+  assert.equal(ontoShow.append, true);
+  const ontoEmpty = C.planExplorerFileDrop(dropped, { viewerOpen: false, itemCount: 0 });
+  assert.equal(ontoEmpty.append, false);
+  assert.equal(ontoEmpty.media.length, 8);
+  const empty = C.planExplorerFileDrop([], { viewerOpen: true, itemCount: 3 });
+  assert.equal(empty.media.length, 0);
+  assert.equal(empty.append, true);
+});

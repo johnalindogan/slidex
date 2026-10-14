@@ -62,6 +62,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLower()
           $sha = "$exe.sha256.txt"
           Set-Content -LiteralPath $sha -Encoding ascii -Value "$hash  $name"
+          Write-Output "SHA256 $hash"
           $seven = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
           if (-not (Test-Path -LiteralPath $seven)) { throw "7-Zip is not installed" }
           $listing = & $seven l $exe
