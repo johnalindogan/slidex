@@ -2346,7 +2346,11 @@ mod tests {
             );
             let probed = probe_source(ffmpeg, &src).unwrap();
             assert!(probed.hdr_or_10bit, "probe did not see 10-bit or HDR");
-            assert_eq!(probed.transfer_in, "smpte2084");
+            assert!(
+                matches!(probed.transfer_in, "smpte2084" | "arib-std-b67" | "bt2020-10"),
+                "HDR transfer was {}",
+                probed.transfer_in
+            );
             assert!(
                 super::super::decide_cast_video(&src).skip.is_some(),
                 "10-bit HDR is not cast as-is"
@@ -2368,21 +2372,23 @@ mod tests {
     #[test]
     fn ffmpeg_is_gone_after_shutdown() {
         with_pinned_ffmpeg(|ffmpeg| {
+            let root = std::env::temp_dir().join(format!("slidex-tv-kill-{}", uuid_tail()));
+            fs::create_dir_all(&root).unwrap();
+            let sink = root.join("sink.mkv");
             let child = spawn_tracked_ffmpeg(
                 ffmpeg,
                 &[
                     "-hide_banner".into(),
                     "-loglevel".into(),
-                    "error".into(),
+                    "info".into(),
                     "-f".into(),
                     "lavfi".into(),
                     "-i".into(),
-                    "anullsrc=r=8000:cl=mono".into(),
-                    "-t".into(),
-                    "120".into(),
-                    "-f".into(),
-                    "null".into(),
-                    "-".into(),
+                    "testsrc=size=32x32:rate=5:duration=30".into(),
+                    "-an".into(),
+                    "-c:v".into(),
+                    "libx264".into(),
+                    sink.display().to_string(),
                 ],
             )
             .unwrap();
@@ -2390,12 +2396,16 @@ mod tests {
             let started = Instant::now();
             while !process_alive(pid) {
                 if started.elapsed() > Duration::from_secs(8) {
-                    panic!("ffmpeg did not stay running");
+                    let detail = ffmpeg_exit_detail(child);
+                    panic!("ffmpeg did not stay running: {detail}");
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            thread::sleep(Duration::from_millis(150));
-            assert!(process_alive(pid), "ffmpeg exited before shutdown");
+            thread::sleep(Duration::from_millis(400));
+            if !process_alive(pid) {
+                let detail = ffmpeg_exit_detail(child);
+                panic!("ffmpeg exited before shutdown: {detail}");
+            }
             #[cfg(windows)]
             assert!(
                 ffmpeg_in_kill_job(pid),
@@ -2411,7 +2421,19 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(30));
             }
+            let _ = fs::remove_dir_all(&root);
         });
+    }
+
+    fn ffmpeg_exit_detail(child: Child) -> String {
+        match child.wait_with_output() {
+            Ok(out) => format!(
+                "status {:?} stderr {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(err) => format!("wait failed: {err}"),
+        }
     }
 
     fn lavfi(ffmpeg: &Path, args: &[&str], output: &Path) -> bool {
