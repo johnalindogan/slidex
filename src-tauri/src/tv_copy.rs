@@ -5,11 +5,12 @@
 //! `h264_qsv` are the alternatives, so a later LGPL build can switch encoders
 //! without another code path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,11 @@ pub(crate) const PREPARING_TV: &str = "Preparing for TV…";
 
 /// Copies live under `%LOCALAPPDATA%\com.johnalindogan.slideshowpro\tv-cache`.
 const CACHE_LIMIT_DEFAULT: u64 = 20 * 1024 * 1024 * 1024;
+/// One TV cache, so this is also the process-wide cap. Further encodes wait
+/// in a FIFO queue instead of each calling `thread::spawn`.
+const MAX_CONCURRENT_ENCODES: usize = 2;
+/// First retry waits this long. Each later failure doubles it, up to 64×.
+const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const UHD_W: u32 = 3840;
 const UHD_H: u32 = 2160;
 const MAX_LONG_SIDE: u32 = 2160;
@@ -175,7 +181,14 @@ pub(crate) fn ffmpeg_arguments(plan: &TvPlan, input: &Path, output: &Path) -> Ve
     match plan.audio {
         AudioIn::Aac => args.extend(["-c:a".into(), "copy".into()]),
         AudioIn::Other | AudioIn::None => {
-            args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-ac".into(), "2".into()]);
+            args.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "-ac".into(),
+                "2".into(),
+            ]);
         }
     }
     if plan.audio == AudioIn::None {
@@ -222,10 +235,20 @@ fn tone_map_filter(transfer_in: &str) -> String {
 }
 
 pub(crate) enum ForCast {
-    Original { derived: Option<String> },
-    Copy { derived: Option<String> },
-    Preparing { derived: Option<String>, reasons: String },
-    Skip { derived: Option<String>, reasons: String },
+    Original {
+        derived: Option<String>,
+    },
+    Copy {
+        derived: Option<String>,
+    },
+    Preparing {
+        derived: Option<String>,
+        reasons: String,
+    },
+    Skip {
+        derived: Option<String>,
+        reasons: String,
+    },
 }
 
 pub(crate) enum CopyPoll {
@@ -290,20 +313,25 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
     }
 
     let encoder = resolve_encoder();
+    let retry_unit = retry_unit();
+    let part = cache_dir.join(format!("{key}.part.mp4"));
     {
         let mut hub = hub();
-        if hub.failed.contains(&key) {
-            return Ensure::GiveUp;
+        if let Some(failure) = hub.failed.get(&key).cloned() {
+            if Instant::now() < failure.retry_at {
+                return Ensure::GiveUp;
+            }
+            hub.failed.remove(&key);
         }
         if hub
             .jobs
             .get(&key)
-            .is_some_and(|job| matches!(job.state, JobState::Running))
+            .is_some_and(|job| matches!(job.state, JobState::Running | JobState::Queued))
         {
             return Ensure::Pending;
         }
         if matches!(encoder, ActiveEncoder::Missing) {
-            hub.failed.insert(key);
+            note_failure(&mut hub, key, retry_unit);
             drop(hub);
             log_fail(item, "ffmpeg missing");
             return Ensure::GiveUp;
@@ -311,18 +339,17 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
         hub.jobs.insert(
             key.clone(),
             JobSlot {
-                state: JobState::Running,
+                state: JobState::Queued,
                 cache_dir: cache_dir.clone(),
+                part: part.clone(),
+                dest: dest.clone(),
             },
         );
     }
 
     cast_log(
         "tv_copy",
-        &format!(
-            "start item={} reasons={reasons}",
-            item_log_token(item)
-        ),
+        &format!("start item={} reasons={reasons}", item_log_token(item)),
     );
     let log_dir = super::cast_log_override_dir();
     let limit = active_limit();
@@ -332,30 +359,116 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
         dest,
         // The cast check rejects anything whose name is not .mp4 or .mov.
         // The part stays in the cache directory, never beside the original.
-        part: cache_dir.join(format!("{key}.part.mp4")),
+        part,
         cache_dir,
         item,
         encoder,
         limit,
         log_dir,
         started: Instant::now(),
+        retry_unit,
     };
-    thread::spawn(move || run_job(spec));
+    enqueue_or_start(spec);
     Ensure::Pending
 }
 
+/// Start `spec` now when fewer than two encodes are running. Otherwise append
+/// it to the FIFO queue. The slot was already inserted as `Queued`.
+fn enqueue_or_start(spec: JobSpec) {
+    let mut hub = hub();
+    if running_count(&hub) < MAX_CONCURRENT_ENCODES {
+        if let Some(job) = hub.jobs.get_mut(&spec.key) {
+            job.state = JobState::Running;
+        }
+        drop(hub);
+        thread::spawn(move || run_job(spec));
+        return;
+    }
+    hub.queue.push_back(spec);
+}
+
+fn running_count(hub: &Hub) -> usize {
+    hub.jobs
+        .values()
+        .filter(|job| job.state == JobState::Running)
+        .count()
+}
+
+/// Pop the oldest queued job whose slot is still waiting, and mark it running.
+fn take_next(hub: &mut Hub) -> Option<JobSpec> {
+    if running_count(hub) >= MAX_CONCURRENT_ENCODES {
+        return None;
+    }
+    while let Some(spec) = hub.queue.pop_front() {
+        let still_queued = hub
+            .jobs
+            .get(&spec.key)
+            .is_some_and(|job| job.state == JobState::Queued);
+        if !still_queued {
+            continue;
+        }
+        if let Some(job) = hub.jobs.get_mut(&spec.key) {
+            job.state = JobState::Running;
+        }
+        return Some(spec);
+    }
+    None
+}
+
 fn copy_passes(path: &Path) -> bool {
+    let Some(key) = current_key(path) else {
+        return uncached_cast_passes(path);
+    };
+    if let Some(hit) = hub().checks.get(&key).copied() {
+        return hit;
+    }
+    let passes = uncached_cast_passes(path);
+    hub().checks.insert(key, passes);
+    passes
+}
+
+fn uncached_cast_passes(path: &Path) -> bool {
+    if COUNT_CAST_CHECKS.with(|flag| flag.get()) {
+        CAST_CHECK_RUNS.with(|n| n.set(n.get().saturating_add(1)));
+    }
     super::decide_cast_video_logged(path, false).skip.is_none()
 }
 
 fn fail_once(key: &str, item: u32, err: &str) -> Ensure {
     let mut hub = hub();
-    if !hub.failed.insert(key.to_string()) {
+    if hub
+        .failed
+        .get(key)
+        .is_some_and(|failure| Instant::now() < failure.retry_at)
+    {
         return Ensure::GiveUp;
     }
+    note_failure(&mut hub, key.to_string(), retry_unit());
     drop(hub);
     log_fail(item, err);
     Ensure::GiveUp
+}
+
+fn retry_unit() -> Duration {
+    TEST_BACKOFF.with(|slot| slot.borrow().unwrap_or(RETRY_BACKOFF))
+}
+
+fn note_failure(hub: &mut Hub, key: String, unit: Duration) {
+    let attempts = hub
+        .failed
+        .get(&key)
+        .map(|failure| failure.attempts)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let shift = attempts.saturating_sub(1).min(6);
+    let wait = unit.saturating_mul(1_u32 << shift);
+    hub.failed.insert(
+        key,
+        Failure {
+            attempts,
+            retry_at: Instant::now() + wait,
+        },
+    );
 }
 
 fn log_fail(item: u32, err: &str) {
@@ -374,11 +487,11 @@ pub(crate) fn poll_copy(path: &Path) -> CopyPoll {
         return CopyPoll::Absent;
     };
     let hub = hub();
-    if hub.failed.contains(&key) {
+    if hub.failed.contains_key(&key) {
         return CopyPoll::Failed;
     }
     match hub.jobs.get(&key).map(|job| job.state) {
-        Some(JobState::Running) => CopyPoll::Running,
+        Some(JobState::Running) | Some(JobState::Queued) => CopyPoll::Running,
         Some(JobState::Failed) | Some(JobState::Ready) => CopyPoll::Failed,
         None => CopyPoll::Absent,
     }
@@ -422,11 +535,11 @@ pub(crate) fn original_needs_copy(path: &Path) -> bool {
 pub(crate) fn wait_until_settled(timeout: Duration) -> bool {
     let start = Instant::now();
     loop {
-        let running = hub()
+        let busy = hub()
             .jobs
             .values()
-            .any(|job| matches!(job.state, JobState::Running));
-        if !running {
+            .any(|job| matches!(job.state, JobState::Running | JobState::Queued));
+        if !busy {
             return true;
         }
         if start.elapsed() > timeout {
@@ -447,9 +560,11 @@ struct JobSpec {
     limit: u64,
     log_dir: Option<PathBuf>,
     started: Instant,
+    retry_unit: Duration,
 }
 
-fn run_job(spec: JobSpec) {
+fn run_job(mut spec: JobSpec) {
+    spec.started = Instant::now();
     super::apply_cast_log_dir(spec.log_dir.clone());
     let result = encode_job(&spec);
     // Log before the job leaves Running, so a waiter that sees it settle
@@ -475,17 +590,22 @@ fn run_job(spec: JobSpec) {
     match result {
         Ok(_) => {
             hub.ready.insert(spec.source.clone(), spec.dest.clone());
+            hub.failed.remove(&spec.key);
             if let Some(job) = hub.jobs.get_mut(&spec.key) {
                 job.state = JobState::Ready;
             }
         }
         Err(_) => {
-            hub.failed.insert(spec.key.clone());
+            note_failure(&mut hub, spec.key.clone(), spec.retry_unit);
             hub.ready.remove(&spec.source);
             if let Some(job) = hub.jobs.get_mut(&spec.key) {
                 job.state = JobState::Failed;
             }
         }
+    }
+    if let Some(next) = take_next(&mut hub) {
+        drop(hub);
+        thread::spawn(move || run_job(next));
     }
 }
 
@@ -510,6 +630,10 @@ fn encode_job(spec: &JobSpec) -> Result<u64, String> {
             }
             fs::write(&spec.part, bytes).map_err(|_| "could not write the copy".to_string())?;
         }
+        ActiveEncoder::Hold { bytes, gate } => {
+            gate.wait_turn();
+            fs::write(&spec.part, bytes).map_err(|_| "could not write the copy".to_string())?;
+        }
         ActiveEncoder::Ffmpeg(ffmpeg) => {
             run_ffmpeg(ffmpeg, &spec.source, &spec.part, configured_encoder())?;
         }
@@ -518,14 +642,17 @@ fn encode_job(spec: &JobSpec) -> Result<u64, String> {
         let _ = fs::remove_file(&spec.part);
         return Err("copy failed the cast check".into());
     }
-    let bytes = fs::metadata(&spec.part)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let bytes = fs::metadata(&spec.part).map(|m| m.len()).unwrap_or(0);
     if bytes > spec.limit {
         let _ = fs::remove_file(&spec.part);
         return Err("cache limit".into());
     }
-    evict_to_fit(&spec.cache_dir, spec.limit, bytes, Some(spec.dest.as_path()));
+    evict_to_fit(
+        &spec.cache_dir,
+        spec.limit,
+        bytes,
+        Some(spec.dest.as_path()),
+    );
     fs::rename(&spec.part, &spec.dest).map_err(|_| "could not store the copy".to_string())?;
     Ok(bytes)
 }
@@ -533,14 +660,19 @@ fn encode_job(spec: &JobSpec) -> Result<u64, String> {
 impl JobSpec {
     fn encoder_delay(&self) -> Duration {
         match &self.encoder {
-            ActiveEncoder::Fail(_) => Duration::from_millis(0),
+            ActiveEncoder::Fail(_) | ActiveEncoder::Hold { .. } => Duration::from_millis(0),
             ActiveEncoder::Write { delay, .. } => *delay,
             _ => Duration::from_millis(0),
         }
     }
 }
 
-fn run_ffmpeg(ffmpeg: &Path, input: &Path, output: &Path, encoder: TvEncoder) -> Result<(), String> {
+fn run_ffmpeg(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    encoder: TvEncoder,
+) -> Result<(), String> {
     let probed = probe_source(ffmpeg, input)?;
     let mut plan = plan_tv(
         probed.width,
@@ -552,16 +684,8 @@ fn run_ffmpeg(ffmpeg: &Path, input: &Path, output: &Path, encoder: TvEncoder) ->
     );
     plan.transfer_in = probed.transfer_in;
     let args = ffmpeg_arguments(&plan, input, output);
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args(&args).stdin(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let out = cmd
-        .output()
-        .map_err(|_| "could not start ffmpeg".to_string())?;
+    let child = spawn_tracked_ffmpeg(ffmpeg, &args)?;
+    let out = wait_tracked(child)?;
     if out.status.success() {
         return Ok(());
     }
@@ -580,18 +704,13 @@ struct Probe {
 }
 
 fn probe_source(ffmpeg: &Path, input: &Path) -> Result<Probe, String> {
-    let mut cmd = Command::new(ffmpeg);
-    cmd.args(["-hide_banner", "-i"])
-        .arg(input)
-        .stdin(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let out = cmd
-        .output()
-        .map_err(|_| "could not start ffmpeg".to_string())?;
+    let args = vec![
+        "-hide_banner".to_string(),
+        "-i".to_string(),
+        input.display().to_string(),
+    ];
+    let child = spawn_tracked_ffmpeg(ffmpeg, &args)?;
+    let out = wait_tracked(child)?;
     let text = String::from_utf8_lossy(&out.stderr);
     parse_probe(&text).ok_or_else(|| "could not read the video".to_string())
 }
@@ -705,7 +824,11 @@ pub(crate) fn encode_with_ffmpeg(
 pub(crate) fn bundled_ffmpeg() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let candidate = dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+    let candidate = dir.join(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    });
     if candidate.is_file() {
         Some(candidate)
     } else {
@@ -747,7 +870,8 @@ pub(crate) fn set_encoder_name(name: &str) -> Result<(), String> {
     })?;
     let path = encoder_file();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| "Could not store the TV encoder setting.".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|_| "Could not store the TV encoder setting.".to_string())?;
     }
     fs::write(&path, format!("{}\n", encoder.as_str()))
         .map_err(|_| "Could not store the TV encoder setting.".to_string())?;
@@ -773,11 +897,64 @@ fn default_cache_dir() -> PathBuf {
 }
 
 fn active_cache_dir() -> PathBuf {
-    TEST_CACHE.with(|slot| slot.borrow().clone()).unwrap_or_else(default_cache_dir)
+    TEST_CACHE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(default_cache_dir)
 }
 
 fn active_limit() -> u64 {
-    TEST_LIMIT.with(|slot| slot.borrow().unwrap_or(CACHE_LIMIT_DEFAULT))
+    if let Some(limit) = TEST_LIMIT.with(|slot| *slot.borrow()) {
+        return limit;
+    }
+    if let Ok(text) = std::env::var("SLIDEX_TV_CACHE_LIMIT") {
+        if let Some(limit) = parse_cache_limit(&text) {
+            return limit;
+        }
+    }
+    if let Ok(text) = fs::read_to_string(limit_file()) {
+        if let Some(limit) = parse_cache_limit(text.trim()) {
+            return limit;
+        }
+    }
+    CACHE_LIMIT_DEFAULT
+}
+
+fn limit_file() -> PathBuf {
+    if let Some(path) = TEST_LIMIT_FILE.with(|slot| slot.borrow().clone()) {
+        return path;
+    }
+    app_data_dir().join("tv-cache-limit")
+}
+
+/// Byte count, or a number with a `KB` / `MB` / `GB` suffix (1024-based).
+pub(crate) fn parse_cache_limit(text: &str) -> Option<u64> {
+    let compact = text.trim().to_ascii_lowercase().replace(' ', "");
+    if compact.is_empty() {
+        return None;
+    }
+    let (number, mul) = split_limit_suffix(&compact);
+    let number = number.parse::<u64>().ok()?;
+    number.checked_mul(mul)
+}
+
+fn split_limit_suffix(compact: &str) -> (&str, u64) {
+    const SUFFIXES: &[(&str, u64)] = &[
+        ("gib", 1024 * 1024 * 1024),
+        ("gb", 1024 * 1024 * 1024),
+        ("mib", 1024 * 1024),
+        ("mb", 1024 * 1024),
+        ("kib", 1024),
+        ("kb", 1024),
+        ("g", 1024 * 1024 * 1024),
+        ("m", 1024 * 1024),
+        ("k", 1024),
+    ];
+    for (suffix, mul) in SUFFIXES {
+        if let Some(rest) = compact.strip_suffix(suffix) {
+            return (rest, *mul);
+        }
+    }
+    (compact, 1)
 }
 
 fn current_key(path: &Path) -> Option<String> {
@@ -815,7 +992,12 @@ fn fnv1a64(data: &[u8], offset: u64) -> u64 {
     hash
 }
 
-pub(crate) fn cache_output(cache_dir: &Path, source: &Path, len: u64, modified: SystemTime) -> PathBuf {
+pub(crate) fn cache_output(
+    cache_dir: &Path,
+    source: &Path,
+    len: u64,
+    modified: SystemTime,
+) -> PathBuf {
     cache_dir.join(format!("{}.mp4", cache_key(source, len, modified)))
 }
 
@@ -832,8 +1014,17 @@ fn touch(path: &Path) -> std::io::Result<()> {
 pub(crate) fn evict_to_fit(cache_dir: &Path, limit: u64, incoming: u64, keep: Option<&Path>) {
     let mut files = cache_mp4s(cache_dir);
     files.retain(|entry| keep != Some(entry.path.as_path()));
-    files.sort_by(|a, b| a.modified.cmp(&b.modified).then_with(|| a.path.cmp(&b.path)));
-    let mut used: u64 = files.iter().map(|entry| entry.bytes).sum();
+    files.sort_by(|a, b| {
+        a.modified
+            .cmp(&b.modified)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let inflight = in_progress_bytes(cache_dir, keep);
+    let mut used: u64 = files
+        .iter()
+        .map(|entry| entry.bytes)
+        .sum::<u64>()
+        .saturating_add(inflight);
     for entry in files {
         if used.saturating_add(incoming) <= limit {
             break;
@@ -884,6 +1075,75 @@ fn cache_mp4s(cache_dir: &Path) -> Vec<CacheFile> {
     out
 }
 
+/// Bytes of `.part` files that belong to a queued or running encode.
+/// `skip_dest` is the finished name of the encode that is about to be stored,
+/// so its part is not added twice on top of `incoming`.
+fn in_progress_bytes(cache_dir: &Path, skip_dest: Option<&Path>) -> u64 {
+    let hub = hub();
+    let mut total = 0u64;
+    for job in hub.jobs.values() {
+        if !matches!(job.state, JobState::Running | JobState::Queued) {
+            continue;
+        }
+        if job.cache_dir != cache_dir {
+            continue;
+        }
+        if skip_dest.is_some_and(|dest| dest == job.dest) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&job.part) else {
+            continue;
+        };
+        total = total.saturating_add(meta.len());
+    }
+    total
+}
+
+fn cache_accounted_bytes(cache_dir: &Path) -> u64 {
+    cache_mp4s(cache_dir)
+        .iter()
+        .map(|entry| entry.bytes)
+        .sum::<u64>()
+        .saturating_add(in_progress_bytes(cache_dir, None))
+}
+
+/// Delete `.part` files left by a previous process. A part that belongs to an
+/// encode still queued or running in this process is kept.
+pub(crate) fn sweep_stale_parts(cache_dir: &Path) {
+    let protected: Vec<PathBuf> = {
+        let hub = hub();
+        hub.jobs
+            .values()
+            .filter(|job| matches!(job.state, JobState::Running | JobState::Queued))
+            .map(|job| job.part.clone())
+            .collect()
+    };
+    let Ok(read) = fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if !name.ends_with(".part.mp4") || protected.iter().any(|live| live == &path) {
+            continue;
+        }
+        let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if fs::remove_file(&path).is_ok() {
+            cast_log("tv_copy", &format!("sweep bytes={bytes}"));
+        }
+    }
+}
+
+/// Sweep the active cache. Called when the app starts, before any encode.
+pub(crate) fn startup() {
+    let dir = active_cache_dir();
+    let _ = fs::create_dir_all(&dir);
+    sweep_stale_parts(&dir);
+}
+
 fn safe_err(err: &str) -> String {
     let mut out = String::new();
     for ch in err.chars() {
@@ -911,6 +1171,7 @@ enum ActiveEncoder {
     Missing,
     Fail(String),
     Write { bytes: Vec<u8>, delay: Duration },
+    Hold { bytes: Vec<u8>, gate: TestGate },
     Ffmpeg(PathBuf),
 }
 
@@ -919,6 +1180,60 @@ pub(crate) enum TestEncoder {
     Missing,
     Fail(String),
     Write { bytes: Vec<u8>, delay: Duration },
+    Hold { bytes: Vec<u8>, gate: TestGate },
+}
+
+#[derive(Clone)]
+pub(crate) struct TestGate {
+    inner: std::sync::Arc<GateInner>,
+}
+
+struct GateInner {
+    lock: Mutex<bool>,
+    cv: Condvar,
+    entered: AtomicUsize,
+}
+
+impl TestGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(GateInner {
+                lock: Mutex::new(false),
+                cv: Condvar::new(),
+                entered: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn wait_turn(&self) {
+        self.inner.entered.fetch_add(1, Ordering::SeqCst);
+        let mut released = self
+            .inner
+            .lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        while !*released {
+            released = self
+                .inner
+                .cv
+                .wait(released)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    pub(crate) fn entered(&self) -> usize {
+        self.inner.entered.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn release(&self) {
+        let mut released = self
+            .inner
+            .lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *released = true;
+        self.inner.cv.notify_all();
+    }
 }
 
 fn resolve_encoder() -> ActiveEncoder {
@@ -927,6 +1242,7 @@ fn resolve_encoder() -> ActiveEncoder {
             TestEncoder::Missing => ActiveEncoder::Missing,
             TestEncoder::Fail(err) => ActiveEncoder::Fail(err),
             TestEncoder::Write { bytes, delay } => ActiveEncoder::Write { bytes, delay },
+            TestEncoder::Hold { bytes, gate } => ActiveEncoder::Hold { bytes, gate },
         };
     }
     match bundled_ffmpeg() {
@@ -937,6 +1253,7 @@ fn resolve_encoder() -> ActiveEncoder {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobState {
+    Queued,
     Running,
     Ready,
     Failed,
@@ -945,12 +1262,23 @@ enum JobState {
 struct JobSlot {
     state: JobState,
     cache_dir: PathBuf,
+    part: PathBuf,
+    dest: PathBuf,
+}
+
+#[derive(Clone)]
+struct Failure {
+    attempts: u32,
+    retry_at: Instant,
 }
 
 struct Hub {
     jobs: HashMap<String, JobSlot>,
     ready: HashMap<PathBuf, PathBuf>,
-    failed: HashSet<String>,
+    failed: HashMap<String, Failure>,
+    queue: VecDeque<JobSpec>,
+    /// Cast-check result for one path+size+mtime. Range requests reuse it.
+    checks: HashMap<String, bool>,
 }
 
 fn hub() -> std::sync::MutexGuard<'static, Hub> {
@@ -958,7 +1286,9 @@ fn hub() -> std::sync::MutexGuard<'static, Hub> {
         Mutex::new(Hub {
             jobs: HashMap::new(),
             ready: HashMap::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
+            queue: VecDeque::new(),
+            checks: HashMap::new(),
         })
     })
     .lock()
@@ -971,20 +1301,56 @@ thread_local! {
     static TEST_ENCODER: std::cell::RefCell<Option<TestEncoder>> = const { std::cell::RefCell::new(None) };
     static TEST_CACHE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static TEST_LIMIT: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
+    static TEST_LIMIT_FILE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static TEST_ENCODER_FILE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static TEST_ENCODER_SETTING: std::cell::RefCell<Option<TvEncoder>> = const { std::cell::RefCell::new(None) };
+    static TEST_BACKOFF: std::cell::RefCell<Option<Duration>> = const { std::cell::RefCell::new(None) };
+    static COUNT_CAST_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CAST_CHECK_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// TV-copy tests share one process-wide encode cap. Holding a scope keeps
+/// other scopes from starting until this one drops, so a queue assertion is
+/// not racing another test's jobs.
+static SCOPE_N: Mutex<usize> = Mutex::new(0);
+static SCOPE_CV: Condvar = Condvar::new();
+
+struct ScopePermit;
+
+impl ScopePermit {
+    fn acquire() -> Self {
+        let mut n = SCOPE_N.lock().unwrap_or_else(|err| err.into_inner());
+        while *n > 0 {
+            n = SCOPE_CV.wait(n).unwrap_or_else(|err| err.into_inner());
+        }
+        *n += 1;
+        Self
+    }
+}
+
+impl Drop for ScopePermit {
+    fn drop(&mut self) {
+        let mut n = SCOPE_N.lock().unwrap_or_else(|err| err.into_inner());
+        *n = n.saturating_sub(1);
+        SCOPE_CV.notify_all();
+    }
 }
 
 pub(crate) struct TestScope {
     cache: PathBuf,
+    _permit: ScopePermit,
 }
 
 impl TestScope {
     pub(crate) fn new(cache: PathBuf, encoder: TestEncoder) -> Self {
+        let permit = ScopePermit::acquire();
         let _ = fs::create_dir_all(&cache);
         TEST_CACHE.with(|slot| *slot.borrow_mut() = Some(cache.clone()));
         TEST_ENCODER.with(|slot| *slot.borrow_mut() = Some(encoder));
-        Self { cache }
+        Self {
+            cache,
+            _permit: permit,
+        }
     }
 }
 
@@ -992,14 +1358,426 @@ impl Drop for TestScope {
     fn drop(&mut self) {
         TEST_CACHE.with(|slot| *slot.borrow_mut() = None);
         TEST_ENCODER.with(|slot| *slot.borrow_mut() = None);
+        TEST_BACKOFF.with(|slot| *slot.borrow_mut() = None);
         let mut hub = hub();
+        hub.queue.retain(|spec| spec.cache_dir != self.cache);
         hub.jobs.retain(|_, job| job.cache_dir != self.cache);
-        hub.ready.retain(|_, dest| dest.parent() != Some(self.cache.as_path()));
+        hub.ready
+            .retain(|_, dest| dest.parent() != Some(self.cache.as_path()));
     }
+}
+
+pub(crate) fn encode_cap() -> usize {
+    MAX_CONCURRENT_ENCODES
+}
+
+/// Running keys, then queued keys in FIFO order, for one cache directory.
+pub(crate) fn encode_slots(cache: &Path) -> (Vec<String>, Vec<String>) {
+    let hub = hub();
+    let running = hub
+        .jobs
+        .iter()
+        .filter(|(_, job)| job.cache_dir == cache && job.state == JobState::Running)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let queued = hub
+        .queue
+        .iter()
+        .filter(|spec| spec.cache_dir == cache)
+        .map(|spec| spec.key.clone())
+        .collect();
+    (running, queued)
+}
+
+struct RunningMark {
+    key: String,
+}
+
+impl Drop for RunningMark {
+    fn drop(&mut self) {
+        hub().jobs.remove(&self.key);
+    }
+}
+
+fn test_mark_running(cache: &Path, part: &Path) -> RunningMark {
+    let key = format!("live-{}", uuid_for_mark());
+    hub().jobs.insert(
+        key.clone(),
+        JobSlot {
+            state: JobState::Running,
+            cache_dir: cache.to_path_buf(),
+            part: part.to_path_buf(),
+            dest: cache.join(format!("{key}.mp4")),
+        },
+    );
+    RunningMark { key }
+}
+
+fn uuid_for_mark() -> String {
+    format!(
+        "{:x}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 pub(crate) fn set_test_encoder_file(path: Option<PathBuf>) {
     TEST_ENCODER_FILE.with(|slot| *slot.borrow_mut() = path);
+}
+
+/// Spawn ffmpeg and keep the child handle. `Command::output` would drop that
+/// handle when the wait finished, and a killed parent would leave ffmpeg
+/// running. The handle is duplicated into a process-wide list and, on Windows,
+/// the process is assigned to a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+fn spawn_tracked_ffmpeg(ffmpeg: &Path, args: &[String]) -> Result<Child, String> {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|_| "could not start ffmpeg".to_string())?;
+    track_child(&child);
+    Ok(child)
+}
+
+fn wait_tracked(child: Child) -> Result<std::process::Output, String> {
+    let pid = child.id();
+    let out = child
+        .wait_with_output()
+        .map_err(|_| "could not start ffmpeg".to_string());
+    untrack(pid);
+    out
+}
+
+/// Kill every ffmpeg this process still has open, then close the Windows job
+/// so `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` ends anything the handle missed.
+pub(crate) fn shutdown_encodes() {
+    let procs;
+    #[cfg(windows)]
+    let job;
+    {
+        let mut book = track_book();
+        procs = std::mem::take(&mut book.procs);
+        #[cfg(windows)]
+        {
+            job = book.job.take();
+        }
+    }
+    for proc in &procs {
+        terminate_proc(proc);
+    }
+    #[cfg(windows)]
+    if let Some(job) = job {
+        unsafe {
+            TerminateJobObject(job.0, 1);
+            CloseHandle(job.0);
+        }
+    }
+    for proc in procs {
+        close_proc(proc);
+    }
+}
+
+struct TrackBook {
+    procs: Vec<TrackedProc>,
+    #[cfg(windows)]
+    job: Option<SharedHandle>,
+    #[cfg(windows)]
+    last_assign_ok: bool,
+    #[cfg(windows)]
+    last_assign_error: u32,
+}
+
+struct TrackedProc {
+    pid: u32,
+    #[cfg(windows)]
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+struct SharedHandle(*mut std::ffi::c_void);
+
+unsafe impl Send for TrackedProc {}
+#[cfg(windows)]
+unsafe impl Send for SharedHandle {}
+unsafe impl Send for TrackBook {}
+
+fn track_book() -> std::sync::MutexGuard<'static, TrackBook> {
+    TRACK
+        .get_or_init(|| {
+            Mutex::new(TrackBook {
+                procs: Vec::new(),
+                #[cfg(windows)]
+                job: None,
+                #[cfg(windows)]
+                last_assign_ok: false,
+                #[cfg(windows)]
+                last_assign_error: 0,
+            })
+        })
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+static TRACK: std::sync::OnceLock<Mutex<TrackBook>> = std::sync::OnceLock::new();
+
+fn track_child(child: &Child) {
+    let mut book = track_book();
+    #[cfg(windows)]
+    {
+        ensure_job(&mut book);
+        let job_handle = book.job.as_ref().map(|job| job.0);
+        if let Some(job_handle) = job_handle {
+            use std::os::windows::io::AsRawHandle;
+            let ok = unsafe {
+                AssignProcessToJobObject(
+                    job_handle,
+                    child.as_raw_handle() as *mut std::ffi::c_void,
+                )
+            };
+            book.last_assign_ok = ok != 0;
+            if ok == 0 {
+                book.last_assign_error = unsafe { GetLastError() };
+            }
+        }
+        book.procs.push(TrackedProc {
+            pid: child.id(),
+            handle: dup_process(child),
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        book.procs.push(TrackedProc { pid: child.id() });
+    }
+}
+
+fn untrack(pid: u32) {
+    let proc = {
+        let mut book = track_book();
+        let Some(index) = book.procs.iter().position(|proc| proc.pid == pid) else {
+            return;
+        };
+        book.procs.remove(index)
+    };
+    close_proc(proc);
+}
+
+fn terminate_proc(proc: &TrackedProc) {
+    #[cfg(windows)]
+    unsafe {
+        if !proc.handle.is_null() {
+            TerminateProcess(proc.handle, 1);
+        } else {
+            let opened = OpenProcess(0x0001, 0, proc.pid);
+            if !opened.is_null() {
+                TerminateProcess(opened, 1);
+                CloseHandle(opened);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        kill(proc.pid as i32, 9);
+    }
+}
+
+fn close_proc(proc: TrackedProc) {
+    #[cfg(windows)]
+    unsafe {
+        if !proc.handle.is_null() {
+            CloseHandle(proc.handle);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = proc;
+    }
+}
+
+pub(crate) fn process_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let opened = OpenProcess(0x1000, 0, pid);
+        if opened.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(opened, &mut code);
+        CloseHandle(opened);
+        ok != 0 && code == 259
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        kill(pid as i32, 0) == 0
+    }
+}
+
+#[cfg(windows)]
+fn ensure_job(book: &mut TrackBook) {
+    if book.job.is_some() {
+        return;
+    }
+    match create_kill_on_close_job() {
+        Some(job) => book.job = Some(job),
+        None => book.last_assign_error = unsafe { GetLastError() },
+    }
+}
+
+#[cfg(windows)]
+fn dup_process(child: &Child) -> *mut std::ffi::c_void {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        let mut target = std::ptr::null_mut();
+        let ok = DuplicateHandle(
+            GetCurrentProcess(),
+            child.as_raw_handle() as *mut std::ffi::c_void,
+            GetCurrentProcess(),
+            &mut target,
+            0,
+            0,
+            0x0000_0002,
+        );
+        if ok == 0 {
+            std::ptr::null_mut()
+        } else {
+            target
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn ffmpeg_in_kill_job(pid: u32) -> bool {
+    let book = track_book();
+    let Some(job) = book.job.as_ref() else {
+        return false;
+    };
+    unsafe {
+        let opened = OpenProcess(0x0400, 0, pid);
+        if opened.is_null() {
+            return false;
+        }
+        let mut inside = 0i32;
+        let ok = IsProcessInJob(opened, job.0, &mut inside);
+        CloseHandle(opened);
+        ok != 0 && inside != 0
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn last_assign_error() -> u32 {
+    let book = track_book();
+    if book.last_assign_ok {
+        0
+    } else {
+        book.last_assign_error
+    }
+}
+
+#[cfg(windows)]
+fn create_kill_on_close_job() -> Option<SharedHandle> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info = std::mem::zeroed::<JobExtendedLimit>();
+        info.basic.limit_flags = 0x0000_2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        let ok = SetInformationJobObject(
+            job,
+            9, // JobObjectExtendedLimitInformation
+            &info as *const JobExtendedLimit as *const std::ffi::c_void,
+            std::mem::size_of::<JobExtendedLimit>() as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            return None;
+        }
+        Some(SharedHandle(job))
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct JobBasicLimit {
+    per_process_user_time: i64,
+    per_job_user_time: i64,
+    limit_flags: u32,
+    minimum_working_set: usize,
+    maximum_working_set: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct JobIoCounters {
+    read_operation_count: u64,
+    write_operation_count: u64,
+    other_operation_count: u64,
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+    other_transfer_count: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct JobExtendedLimit {
+    basic: JobBasicLimit,
+    io: JobIoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn CreateJobObjectW(attrs: *mut std::ffi::c_void, name: *const u16) -> *mut std::ffi::c_void;
+    fn SetInformationJobObject(
+        job: *mut std::ffi::c_void,
+        class: i32,
+        info: *const std::ffi::c_void,
+        len: u32,
+    ) -> i32;
+    fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+    fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    fn TerminateProcess(handle: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn DuplicateHandle(
+        source_process: *mut std::ffi::c_void,
+        source: *mut std::ffi::c_void,
+        target_process: *mut std::ffi::c_void,
+        target: *mut *mut std::ffi::c_void,
+        access: u32,
+        inherit: i32,
+        options: u32,
+    ) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+    fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
+    fn IsProcessInJob(
+        process: *mut std::ffi::c_void,
+        job: *mut std::ffi::c_void,
+        result: *mut i32,
+    ) -> i32;
+    fn GetLastError() -> u32;
+}
+
+#[cfg(not(windows))]
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 #[cfg(test)]
@@ -1014,7 +1792,8 @@ mod tests {
     }
 
     fn has_pair(args: &[String], flag: &str, value: &str) -> bool {
-        args.windows(2).any(|pair| pair[0] == flag && pair[1] == value)
+        args.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
     }
 
     fn request(w: u32, h: u32, fps: f64, encoder: TvEncoder) -> Vec<String> {
@@ -1063,10 +1842,7 @@ mod tests {
         assert!(mid.exists());
         assert!(new.exists());
         let written = fs::read_to_string(logs.join("cast.log")).unwrap_or_default();
-        assert!(
-            written.contains("tv_copy evict bytes=300"),
-            "{written}"
-        );
+        assert!(written.contains("tv_copy evict bytes=300"), "{written}");
         assert!(!written.contains("old.mp4"), "{written}");
         let _ = fs::remove_dir_all(&root);
     }
@@ -1191,68 +1967,513 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_clip_passes_the_cast_check_when_ffmpeg_is_present() {
-        let require = std::env::var("SLIDEX_REQUIRE_FFMPEG").ok().as_deref() == Some("1");
-        let Some(ffmpeg) = pinned_ffmpeg_exe() else {
-            if require {
-                panic!("pinned ffmpeg.exe is missing");
-            }
-            eprintln!("pinned ffmpeg.exe is not in the checkout; skipping the synthetic encode");
-            return;
-        };
-        match Command::new(&ffmpeg).arg("-version").output() {
-            Ok(out) if out.status.success() => {}
-            other => {
-                if require {
-                    panic!("pinned ffmpeg.exe did not run: {other:?}");
+    fn a_third_encode_waits_in_the_fifo_queue() {
+        assert_eq!(encode_cap(), 2, "the cap is two simultaneous encodes");
+        let root = std::env::temp_dir().join(format!("slidex-tv-queue-{}", uuid_tail()));
+        let cache = root.join("cache");
+        let logs = root.join("logs");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&logs).unwrap();
+        let _log = super::super::push_cast_log_dir(logs);
+        let gate = TestGate::new();
+        let _scope = TestScope::new(
+            cache.clone(),
+            TestEncoder::Hold {
+                bytes: b"not a video".to_vec(),
+                gate: gate.clone(),
+            },
+        );
+        let mut paths = Vec::new();
+        let mut keys = Vec::new();
+        for name in ["one.mkv", "two.mkv", "three.mkv"] {
+            let path = root.join(name);
+            fs::write(&path, b"\x1a\x45\xdf\xa3queue").unwrap();
+            let path = path.canonicalize().unwrap_or(path);
+            let meta = fs::metadata(&path).unwrap();
+            keys.push(cache_key(
+                &path,
+                meta.len(),
+                meta.modified().unwrap_or(UNIX_EPOCH),
+            ));
+            paths.push(path);
+        }
+        for path in &paths {
+            match for_cast(path, 1) {
+                ForCast::Preparing { .. } => {}
+                ForCast::Original { .. } | ForCast::Copy { .. } | ForCast::Skip { .. } => {
+                    panic!("encode should be pending for {}", path.display());
                 }
-                eprintln!("pinned ffmpeg.exe is not runnable here; skipping the synthetic encode");
-                return;
             }
         }
-        let root = std::env::temp_dir().join(format!("slidex-tv-synth-{}", uuid_tail()));
-        fs::create_dir_all(&root).unwrap();
-        let src = root.join("src.mp4");
-        let out = root.join("tv.mp4");
-        let made = Command::new(&ffmpeg)
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=size=64x64:rate=90:duration=0.4",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:sample_rate=48000:duration=0.4",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-profile:v",
-                "high10",
-                "-c:a",
-                "aac",
-                "-shortest",
-            ])
-            .arg(&src)
-            .status();
-        assert!(made.unwrap().success(), "could not write the synthetic source");
-        assert!(
-            super::super::decide_cast_video(&src).skip.is_some(),
-            "the 90 fps 10-bit source is not cast as-is"
+        let started = Instant::now();
+        while gate.entered() < 2 {
+            if started.elapsed() > Duration::from_secs(5) {
+                panic!("the two running encodes did not reach the encoder");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (running, queued) = encode_slots(&cache);
+        assert_eq!(
+            running.len(),
+            2,
+            "two encodes run and the third waits: {running:?}"
         );
-        encode_with_ffmpeg(&ffmpeg, &src, &out, TvEncoder::Libx264).unwrap();
-        let decision = super::super::decide_cast_video(&out);
+        assert_eq!(
+            queued,
+            vec![keys[2].clone()],
+            "the third job waits at the head of the FIFO queue"
+        );
+        assert!(running.contains(&keys[0]), "{running:?}");
+        assert!(running.contains(&keys[1]), "{running:?}");
+        assert_eq!(gate.entered(), 2, "the queued job must not have started");
+        gate.release();
         assert!(
-            decision.skip.is_none(),
-            "the TV copy must pass the cast check: {:?}",
-            decision.skip
+            wait_until_settled(Duration::from_secs(5)),
+            "queued encodes should finish after a slot frees"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_parts_are_swept_at_startup() {
+        let root = std::env::temp_dir().join(format!("slidex-tv-part-{}", uuid_tail()));
+        let cache = root.join("tv-cache");
+        let logs = root.join("logs");
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&logs).unwrap();
+        let _guard = super::super::push_cast_log_dir(logs.clone());
+        let _scope = TestScope::new(cache.clone(), TestEncoder::Missing);
+        let stale = cache.join("orphan.part.mp4");
+        fs::write(&stale, vec![1u8; 1000]).unwrap();
+        let finished = cache.join("done.mp4");
+        fs::write(&finished, vec![2u8; 400]).unwrap();
+        let live = cache.join("live.part.mp4");
+        fs::write(&live, vec![3u8; 500]).unwrap();
+        let _mark = test_mark_running(&cache, &live);
+        startup();
+        assert!(
+            !stale.exists(),
+            "a part from a previous run is swept at startup"
+        );
+        assert!(live.exists(), "a part that is still in progress is kept");
+        assert!(finished.exists());
+        assert_eq!(cache_accounted_bytes(&cache), 900);
+        evict_to_fit(&cache, 600, 0, None);
+        assert!(
+            !finished.exists(),
+            "in-progress part bytes count against the cache limit"
+        );
+        assert!(
+            live.exists(),
+            "eviction does not delete the in-progress part"
+        );
+        let written = fs::read_to_string(logs.join("cast.log")).unwrap_or_default();
+        assert!(written.contains("tv_copy sweep bytes=1000"), "{written}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_key_is_retried_after_backoff() {
+        let root = std::env::temp_dir().join(format!("slidex-tv-retry-{}", uuid_tail()));
+        let cache = root.join("cache");
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let _guard = super::super::push_cast_log_dir(logs.clone());
+        let _scope = TestScope::new(
+            cache,
+            TestEncoder::Fail("encoder rejected the settings".into()),
+        );
+        TEST_BACKOFF.with(|slot| *slot.borrow_mut() = Some(Duration::from_millis(80)));
+        let src = root.join("clip.mkv");
+        fs::write(&src, b"\x1a\x45\xdf\xa3retry").unwrap();
+        assert!(matches!(for_cast(&src, 2), ForCast::Preparing { .. }));
+        assert!(wait_until_settled(Duration::from_secs(5)));
+        assert!(
+            matches!(for_cast(&src, 2), ForCast::Skip { .. }),
+            "a failed key stays failed until the backoff elapses"
+        );
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            matches!(for_cast(&src, 2), ForCast::Preparing { .. }),
+            "the same key is encoded again after the backoff"
+        );
+        assert!(wait_until_settled(Duration::from_secs(5)));
+        let written = fs::read_to_string(logs.join("cast.log")).unwrap_or_default();
+        assert_eq!(written.matches("tv_copy start").count(), 2, "{written}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cast_check_is_cached_per_key() {
+        let root = std::env::temp_dir().join(format!("slidex-tv-check-{}", uuid_tail()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("clip.mp4");
+        fs::write(&path, b"not-a-real-mp4-box").unwrap();
+        COUNT_CAST_CHECKS.with(|flag| flag.set(true));
+        CAST_CHECK_RUNS.with(|n| n.set(0));
+        assert!(!copy_passes(&path));
+        assert!(!copy_passes(&path));
+        assert_eq!(
+            CAST_CHECK_RUNS.with(|n| n.get()),
+            1,
+            "a second range request for the same key must not re-read the file"
+        );
+        COUNT_CAST_CHECKS.with(|flag| flag.set(false));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_limit_reads_a_setting_or_a_byte_suffix() {
+        assert_eq!(parse_cache_limit("20GB"), Some(20 * 1024 * 1024 * 1024));
+        assert_eq!(parse_cache_limit("2 MB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_cache_limit("4096"), Some(4096));
+        assert!(parse_cache_limit("1.5GB").is_none());
+        let root = std::env::temp_dir().join(format!("slidex-tv-limit-{}", uuid_tail()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("tv-cache-limit");
+        fs::write(&file, "3MB\n").unwrap();
+        if std::env::var("SLIDEX_TV_CACHE_LIMIT").is_err() {
+            TEST_LIMIT_FILE.with(|slot| *slot.borrow_mut() = Some(file));
+            assert_eq!(active_limit(), 3 * 1024 * 1024);
+            TEST_LIMIT_FILE.with(|slot| *slot.borrow_mut() = None);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gpl_notice_names_x264_and_the_ffmpeg_source() {
+        let notice = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("ffmpeg-gpl-notice.txt");
+        let text = fs::read_to_string(&notice).unwrap();
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("gnu general public license") || lower.contains("gpl"),
+            "{text}"
+        );
+        assert!(lower.contains("x264"), "{text}");
+        assert!(
+            text.contains("https://github.com/FFmpeg/FFmpeg/commit/946fcce07b"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.7z"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn synthetic_clip_passes_the_cast_check_when_ffmpeg_is_present() {
+        with_pinned_ffmpeg(|ffmpeg| {
+            let root = std::env::temp_dir().join(format!("slidex-tv-synth-{}", uuid_tail()));
+            fs::create_dir_all(&root).unwrap();
+            let src = root.join("src.mp4");
+            let out = root.join("tv.mp4");
+            assert!(
+                lavfi(
+                    ffmpeg,
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc=size=64x64:rate=90:duration=0.4",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:sample_rate=48000:duration=0.4",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p10le",
+                        "-profile:v",
+                        "high10",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                    ],
+                    &src
+                ),
+                "could not write the synthetic source"
+            );
+            assert!(
+                super::super::decide_cast_video(&src).skip.is_some(),
+                "the 90 fps 10-bit source is not cast as-is"
+            );
+            encode_with_ffmpeg(ffmpeg, &src, &out, TvEncoder::Libx264).unwrap();
+            let decision = super::super::decide_cast_video(&out);
+            assert!(
+                decision.skip.is_none(),
+                "the TV copy must pass the cast check: {:?}",
+                decision.skip
+            );
+            let _ = fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn unicode_filename_with_spaces_passes_the_cast_check() {
+        with_pinned_ffmpeg(|ffmpeg| {
+            let root = std::env::temp_dir().join(format!("slidex-tv-uni-{}", uuid_tail()));
+            fs::create_dir_all(&root).unwrap();
+            let src = root.join("café night 画面.mkv");
+            let out = root.join("TV コピー.mp4");
+            assert!(
+                lavfi(
+                    ffmpeg,
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc=size=64x64:rate=24:duration=0.3",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:sample_rate=48000:duration=0.3",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-profile:v",
+                        "high",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                    ],
+                    &src
+                ),
+                "could not write {}",
+                src.display()
+            );
+            encode_with_ffmpeg(ffmpeg, &src, &out, TvEncoder::Libx264).unwrap();
+            let decision = super::super::decide_cast_video(&out);
+            assert!(
+                decision.skip.is_none(),
+                "unicode path with spaces must pass the cast check: {:?}",
+                decision.skip
+            );
+            let _ = fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn ninety_fps_source_passes_the_cast_check() {
+        with_pinned_ffmpeg(|ffmpeg| {
+            let root = std::env::temp_dir().join(format!("slidex-tv-fps-{}", uuid_tail()));
+            fs::create_dir_all(&root).unwrap();
+            let src = root.join("fast.mp4");
+            let out = root.join("tv.mp4");
+            assert!(lavfi(
+                ffmpeg,
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=64x64:rate=90:duration=0.3",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=0.3",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-profile:v",
+                    "high",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                ],
+                &src
+            ));
+            let probed = probe_source(ffmpeg, &src).unwrap();
+            assert!(probed.fps > 60.0, "source fps {}", probed.fps);
+            assert!(!probed.hdr_or_10bit);
+            assert!(
+                super::super::decide_cast_video(&src).skip.is_some(),
+                "90 fps is not cast as-is"
+            );
+            encode_with_ffmpeg(ffmpeg, &src, &out, TvEncoder::Libx264).unwrap();
+            let decision = super::super::decide_cast_video(&out);
+            assert!(
+                decision.skip.is_none(),
+                "the 60 fps copy must pass the cast check: {:?}",
+                decision.skip
+            );
+            let _ = fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn ten_bit_hdr_source_passes_the_cast_check() {
+        with_pinned_ffmpeg(|ffmpeg| {
+            let root = std::env::temp_dir().join(format!("slidex-tv-hdr-{}", uuid_tail()));
+            fs::create_dir_all(&root).unwrap();
+            let src = root.join("hdr.mp4");
+            let out = root.join("tv.mp4");
+            assert!(
+                lavfi(
+                    ffmpeg,
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc=size=160x120:rate=24:duration=0.3",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:sample_rate=48000:duration=0.3",
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p10le",
+                        "-profile:v",
+                        "high10",
+                        "-color_primaries",
+                        "bt2020",
+                        "-color_trc",
+                        "smpte2084",
+                        "-colorspace",
+                        "bt2020nc",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                    ],
+                    &src
+                ),
+                "could not write the 10-bit HDR source"
+            );
+            let probed = probe_source(ffmpeg, &src).unwrap();
+            assert!(probed.hdr_or_10bit, "probe did not see 10-bit or HDR");
+            assert_eq!(probed.transfer_in, "smpte2084");
+            assert!(
+                super::super::decide_cast_video(&src).skip.is_some(),
+                "10-bit HDR is not cast as-is"
+            );
+            encode_with_ffmpeg(ffmpeg, &src, &out, TvEncoder::Libx264).unwrap();
+            let decision = super::super::decide_cast_video(&out);
+            assert!(
+                decision.skip.is_none(),
+                "the tone-mapped copy must pass the cast check: {:?}",
+                decision.skip
+            );
+            let copied = probe_source(ffmpeg, &out).unwrap();
+            assert!(!copied.hdr_or_10bit, "the copy is still 10-bit or HDR");
+            assert_eq!(copied.transfer_in, "bt709");
+            let _ = fs::remove_dir_all(&root);
+        });
+    }
+
+    #[test]
+    fn ffmpeg_is_gone_after_shutdown() {
+        with_pinned_ffmpeg(|ffmpeg| {
+            let child = spawn_tracked_ffmpeg(
+                ffmpeg,
+                &[
+                    "-hide_banner".into(),
+                    "-loglevel".into(),
+                    "error".into(),
+                    "-f".into(),
+                    "lavfi".into(),
+                    "-i".into(),
+                    "anullsrc=r=8000:cl=mono".into(),
+                    "-t".into(),
+                    "120".into(),
+                    "-f".into(),
+                    "null".into(),
+                    "-".into(),
+                ],
+            )
+            .unwrap();
+            let pid = child.id();
+            let started = Instant::now();
+            while !process_alive(pid) {
+                if started.elapsed() > Duration::from_secs(8) {
+                    panic!("ffmpeg did not stay running");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            thread::sleep(Duration::from_millis(150));
+            assert!(process_alive(pid), "ffmpeg exited before shutdown");
+            #[cfg(windows)]
+            assert!(
+                ffmpeg_in_kill_job(pid),
+                "ffmpeg was not assigned to the kill-on-close job (win32 {})",
+                last_assign_error()
+            );
+            shutdown_encodes();
+            let _ = child.wait_with_output();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while process_alive(pid) {
+                if Instant::now() > deadline {
+                    panic!("ffmpeg {pid} is still running after shutdown");
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+    }
+
+    fn lavfi(ffmpeg: &Path, args: &[&str], output: &Path) -> bool {
+        let mut cmd = Command::new(ffmpeg);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
+        cmd.args(args);
+        cmd.arg(output);
+        cmd.status().map(|status| status.success()).unwrap_or(false)
+    }
+
+    static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
+
+    fn ffmpeg_runs(path: &Path) -> bool {
+        Command::new(path)
+            .arg("-version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The pinned Windows binary when it runs. Otherwise a system ffmpeg, so a
+    /// Linux checkout can still exercise the encode. `SLIDEX_REQUIRE_FFMPEG=1`
+    /// refuses that fallback.
+    fn with_pinned_ffmpeg(body: impl FnOnce(&Path)) {
+        let _lock = FFMPEG_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let require = std::env::var("SLIDEX_REQUIRE_FFMPEG").ok().as_deref() == Some("1");
+        if let Some(ffmpeg) = pinned_ffmpeg_exe() {
+            if ffmpeg_runs(&ffmpeg) {
+                body(&ffmpeg);
+                return;
+            }
+            if require {
+                panic!("pinned ffmpeg.exe did not run");
+            }
+        } else if require {
+            panic!("pinned ffmpeg.exe is missing");
+        }
+        let Some(system) = system_ffmpeg() else {
+            eprintln!("pinned ffmpeg.exe is not runnable here; skipping the synthetic encode");
+            return;
+        };
+        eprintln!(
+            "pinned ffmpeg.exe is not runnable; using {}",
+            system.display()
+        );
+        body(&system);
+    }
+
+    fn system_ffmpeg() -> Option<PathBuf> {
+        if !ffmpeg_runs(Path::new("ffmpeg")) {
+            return None;
+        }
+        let out = Command::new("which").arg("ffmpeg").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+        if path.is_file() {
+            Some(path)
+        } else {
+            None
+        }
     }
 
     fn write_sized(path: &Path, bytes: u64, modified: SystemTime) {

@@ -4322,6 +4322,14 @@ pub fn cast_log_path() -> PathBuf {
     cast_log_dir().join("cast.log")
 }
 
+pub fn startup_tv_cache() {
+    tv_copy::startup();
+}
+
+pub fn shutdown_tv_encodes() {
+    tv_copy::shutdown_encodes();
+}
+
 pub fn tv_encoder_name() -> String {
     tv_copy::encoder_name()
 }

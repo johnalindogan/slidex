@@ -1334,6 +1334,7 @@ pub fn run() {
             slidex_save_done
         ])
         .setup(|app| {
+            cast::startup_tv_cache();
             #[cfg(any(windows, target_os = "linux"))]
             {
                 let files = parse_launch_args();
@@ -1385,6 +1386,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = &event {
+                cast::shutdown_tv_encodes();
                 if let Some(state) = app.try_state::<cast::CastState>() {
                     state.shutdown();
                 }

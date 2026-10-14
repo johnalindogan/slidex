@@ -156,7 +156,8 @@
       "windows/cast-fw-check.ps1": "cast-fw-check.ps1",
       "resources/cast-spike/*": "resources/cast-spike/",
       "resources/ffmpeg/ffmpeg.exe": "ffmpeg.exe",
-      "resources/ffmpeg/LICENSE": "ffmpeg-license.txt"
+      "resources/ffmpeg/LICENSE": "ffmpeg-license.txt",
+      "resources/ffmpeg-gpl-notice.txt": "ffmpeg-gpl-notice.txt"
     }
   }
 }

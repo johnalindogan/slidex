@@ -43,6 +43,7 @@ fn ensure_ffmpeg_placeholder(manifest_dir: &std::path::Path) {
         )
         .unwrap_or_else(|e| panic!("write ffmpeg license placeholder: {e}"));
     }
+    install_gpl_notice(manifest_dir, &dir);
 }
 
 #[cfg(not(windows))]
@@ -64,13 +65,15 @@ fn fetch_ffmpeg_windows(manifest_dir: &std::path::Path) {
     let license_inside = json_field(&pin_text, "license_inside");
 
     let dest_dir = manifest_dir.join("resources").join("ffmpeg");
-    std::fs::create_dir_all(&dest_dir).unwrap_or_else(|e| panic!("create ffmpeg resource dir: {e}"));
+    std::fs::create_dir_all(&dest_dir)
+        .unwrap_or_else(|e| panic!("create ffmpeg resource dir: {e}"));
     let exe_dest = dest_dir.join("ffmpeg.exe");
     let license_dest = dest_dir.join("LICENSE");
     if exe_dest.is_file()
         && license_dest.is_file()
         && sha256_file(&exe_dest) == exe_sha.to_ascii_lowercase()
     {
+        install_gpl_notice(manifest_dir, &dest_dir);
         assert_libx264(&exe_dest, &version);
         copy_beside_profile(&exe_dest);
         return;
@@ -123,6 +126,7 @@ fn fetch_ffmpeg_windows(manifest_dir: &std::path::Path) {
     std::fs::copy(&extracted_exe, &exe_dest).unwrap_or_else(|e| panic!("install ffmpeg.exe: {e}"));
     std::fs::copy(&extracted_license, &license_dest)
         .unwrap_or_else(|e| panic!("install ffmpeg LICENSE: {e}"));
+    install_gpl_notice(manifest_dir, &dest_dir);
     assert_libx264(&exe_dest, &version);
     copy_beside_profile(&exe_dest);
 }
@@ -158,7 +162,8 @@ fn copy_beside_profile(exe: &std::path::Path) {
 fn sha256_file(path: &std::path::Path) -> String {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut file = std::fs::File::open(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut file =
+        std::fs::File::open(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut hasher = Sha256::new();
     // Heap buffer. A 1 MiB stack array overflows the Windows build-script stack.
     let mut buf = vec![0u8; 64 * 1024];
@@ -189,6 +194,19 @@ fn json_field(text: &str, key: &str) -> String {
         }
     }
     panic!("ffmpeg.pin.json is missing {key}");
+}
+
+/// GPL/libx264 notice, placed beside the ffmpeg LICENSE the build just installed.
+fn install_gpl_notice(manifest_dir: &std::path::Path, dest_dir: &std::path::Path) {
+    let src = manifest_dir.join("resources").join("ffmpeg-gpl-notice.txt");
+    let dest = dest_dir.join("GPL-x264.txt");
+    std::fs::copy(&src, &dest).unwrap_or_else(|e| {
+        panic!(
+            "install GPL notice beside LICENSE ({} -> {}): {e}",
+            src.display(),
+            dest.display()
+        )
+    });
 }
 
 /// `CAST_FW_TCP` in the NSIS template must match `CAST_PORT_LO`/`CAST_PORT_HI`.
@@ -222,8 +240,8 @@ fn rust_u16_const(src: &str, name: &str) -> u16 {
 
 /// First `"version"` string in a JSON file. For this repo that is the app version.
 fn json_version(path: &std::path::Path) -> String {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     for line in text.lines() {
         let line = line.trim();
         let Some(rest) = line.strip_prefix("\"version\"") else {
@@ -240,8 +258,8 @@ fn json_version(path: &std::path::Path) -> String {
 
 /// `[package] version` from Cargo.toml, before later dependency version keys.
 fn package_version(path: &std::path::Path) -> String {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut in_package = false;
     for line in text.lines() {
         let trimmed = line.trim();
