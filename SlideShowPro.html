@@ -4779,7 +4779,7 @@ function createStripThumb(item, i) {
   ti.className = 'th' + (i === cur ? ' at' : '');
   ti.decoding = 'async';
   ti.draggable = false;
-  ti.onclick = () => goTo(i);
+  tw.addEventListener('click', () => goTo(i));
   tw.addEventListener('pointerdown', e => {
     if (e.button !== 0) return;
     startPointerReorder(e, { kind: 'strip', mediaIndex: i, el: tw });
@@ -5382,7 +5382,6 @@ function startPointerReorder(e, spec) {
     hit: null
   };
   if (spec.kind === 'handle') dragSrcItemsIdx = spec.itemsIdx;
-  try { (spec.el || e.currentTarget).setPointerCapture(e.pointerId); } catch (_) {}
 }
 
 function onReorderPointerMove(e) {
@@ -5396,9 +5395,15 @@ function onReorderPointerMove(e) {
   if (!gesture.active) {
     gesture.active = true;
     reorderSwallowClick = true;
-    if (gesture.el) gesture.el.classList.add('dragging');
+    if (gesture.el) {
+      gesture.el.classList.add('dragging');
+      // Capture only after the drag is real. Capturing on pointerdown retargets
+      // the click to this element and a stationary thumbnail click never reaches goTo.
+      try { gesture.el.setPointerCapture(e.pointerId); } catch (_) {}
+    }
   }
   if (gesture.kind === 'handle') {
+    maybeAutoScrollList(e.clientY);
     const hit = plHitTest(e.clientY);
     gesture.hit = hit;
     updatePlDragIndicator(hit);
@@ -5517,6 +5522,15 @@ function maybeAutoScrollStrip(clientX) {
   const edge = 28;
   if (clientX < rect.left + edge) strip.scrollLeft -= 16;
   else if (clientX > rect.right - edge) strip.scrollLeft += 16;
+}
+
+function maybeAutoScrollList(clientY) {
+  const list = g('pllist');
+  if (!list) return;
+  const rect = list.getBoundingClientRect();
+  const edge = 28;
+  if (clientY < rect.top + edge) list.scrollTop -= 16;
+  else if (clientY > rect.bottom - edge) list.scrollTop += 16;
 }
 
 g('plnewfolder').onclick = () => {

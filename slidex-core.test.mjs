@@ -1553,6 +1553,26 @@ test('reordering by strip works', () => {
   assert.deepEqual(Array.from(C.playbackNames(folderMove.items)), [shots[1].name, shots[0].name]);
 });
 
+test('clicking a strip thumbnail jumps to that slide', () => {
+  const thumb = pageHtml.slice(pageHtml.indexOf('function createStripThumb'), pageHtml.indexOf('function unmountStripThumb'));
+  assert.equal(thumb.includes('ti.onclick'), false);
+  assert.match(thumb, /tw\.addEventListener\('click', \(\) => goTo\(i\)\)/);
+  const start = pageHtml.slice(pageHtml.indexOf('function startPointerReorder'), pageHtml.indexOf('function onReorderPointerMove'));
+  assert.equal(start.includes('setPointerCapture'), false);
+  const move = pageHtml.slice(pageHtml.indexOf('function onReorderPointerMove'), pageHtml.indexOf('function onReorderPointerEnd'));
+  const thresholdAt = move.indexOf('pointerPassedReorderThreshold');
+  const captureAt = move.indexOf('setPointerCapture');
+  assert.ok(thresholdAt >= 0 && captureAt > thresholdAt);
+  const row = pageHtml.slice(pageHtml.indexOf('function createPlMediaRow'), pageHtml.indexOf('function plRowMatchesEl'));
+  assert.match(row, /goTo\(thisMI\)/);
+  assert.equal(row.includes('setPointerCapture'), false);
+  assert.match(row, /div\.onclick = e =>/);
+  assert.match(move, /maybeAutoScrollList\(e\.clientY\)/);
+  assert.equal(C.pointerPassedReorderThreshold(0, 0), false);
+  assert.equal(C.pointerPassedReorderThreshold(3, 0), false);
+  assert.equal(C.pointerPassedReorderThreshold(4, 0), true);
+});
+
 test('new order holds after Next/Prev and after save and reopen', () => {
   const shots = whatsappShots(8);
   const rows = C.stackMediaRows(shots.length);
