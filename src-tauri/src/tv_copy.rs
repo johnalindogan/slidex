@@ -221,7 +221,9 @@ fn video_filter(plan: &TvPlan) -> String {
 /// zscale on `gbrpf32le` returns "no path between colorspaces" in the pinned
 /// ffmpeg, and zscale also has no path from BT.709 into linear light. The HDR
 /// chain therefore runs zscale only on YUV, and the 10-bit SDR chain does not
-/// use zscale at all.
+/// use zscale at all. `setparams` stamps primaries and matrix first: the pinned
+/// zscale returns the same error when those tags are missing and `primariesin`
+/// names BT.2020 anyway.
 fn tone_map_filter(transfer_in: &str) -> String {
     let (primaries, matrix) = match transfer_in {
         "smpte2084" | "arib-std-b67" | "bt2020-10" => ("bt2020", "bt2020nc"),
@@ -230,7 +232,7 @@ fn tone_map_filter(transfer_in: &str) -> String {
         }
     };
     format!(
-        "zscale=transferin={transfer_in}:primariesin={primaries}:matrixin={matrix}:rangein=tv:transfer=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,format=yuv420p10le,zscale=transferin=linear:primariesin=bt709:matrixin=bt709:rangein=tv:transfer=bt709:primaries=bt709:matrix=bt709:range=tv"
+        "setparams=color_primaries={primaries}:color_trc={transfer_in}:colorspace={matrix},zscale=transferin={transfer_in}:primariesin={primaries}:matrixin={matrix}:rangein=tv:transfer=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,format=yuv420p10le,zscale=transferin=linear:primariesin=bt709:matrixin=bt709:rangein=tv:transfer=bt709:primaries=bt709:matrix=bt709:range=tv"
     )
 }
 
@@ -751,17 +753,54 @@ fn parse_video_line(line: &str) -> Option<(u32, u32, f64, bool, &'static str)> {
         || lower.contains("10be")
         || lower.contains("12le")
         || lower.contains("p010");
-    let transfer_in = if lower.contains("smpte2084") {
+    let transfer_in = transfer_from_video_line(&lower);
+    let hdr = transfer_in != "bt709";
+    Some((width, height, fps, ten_bit || hdr, transfer_in))
+}
+
+/// The ffmpeg video line is `pixfmt(range, matrix/primaries/transfer, ...)`.
+/// A BT.2020 matrix with an unnamed transfer is not HDR. PQ, HLG, and an
+/// explicit BT.2020 transfer are.
+fn transfer_from_video_line(lower: &str) -> &'static str {
+    let mut rest = lower;
+    while let Some(start) = rest.find('(') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        if let Some(transfer) = transfer_in_paren(&after[..end]) {
+            return transfer;
+        }
+        rest = &after[end + 1..];
+    }
+    classify_transfer(lower)
+}
+
+fn transfer_in_paren(inside: &str) -> Option<&'static str> {
+    let comma = inside.find(',')?;
+    let spec = inside[comma + 1..].split(',').next()?.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let mut parts = spec.split('/');
+    let first = parts.next()?.trim();
+    let transfer = match (parts.next(), parts.next()) {
+        (Some(_primaries), Some(transfer)) => transfer.trim(),
+        _ => first,
+    };
+    Some(classify_transfer(transfer))
+}
+
+fn classify_transfer(token: &str) -> &'static str {
+    if token.contains("smpte2084") {
         "smpte2084"
-    } else if lower.contains("arib-std-b67") {
+    } else if token.contains("arib-std-b67") {
         "arib-std-b67"
-    } else if lower.contains("bt2020") {
+    } else if token == "bt2020" || token.starts_with("bt2020-") {
         "bt2020-10"
     } else {
         "bt709"
-    };
-    let hdr = transfer_in != "bt709";
-    Some((width, height, fps, ten_bit || hdr, transfer_in))
+    }
 }
 
 fn first_dimensions(line: &str) -> Option<(u32, u32)> {
@@ -1540,10 +1579,7 @@ fn track_child(child: &Child) {
         if let Some(job_handle) = job_handle {
             use std::os::windows::io::AsRawHandle;
             let ok = unsafe {
-                AssignProcessToJobObject(
-                    job_handle,
-                    child.as_raw_handle() as *mut std::ffi::c_void,
-                )
+                AssignProcessToJobObject(job_handle, child.as_raw_handle() as *mut std::ffi::c_void)
             };
             book.last_assign_ok = ok != 0;
             if ok == 0 {
@@ -1964,6 +2000,10 @@ mod tests {
         assert_eq!((w, h, hdr), (1920, 1080, false));
         assert_eq!(fps, 30.0);
         assert_eq!(transfer, "bt709");
+        let matrix_only = "Stream #0:0: Video: h264 (High 10), yuv420p10le(tv, bt2020nc/unknown/unknown, progressive), 160x120, 24 fps";
+        let (_, _, _, hdr, transfer) = parse_video_line(matrix_only).unwrap();
+        assert!(hdr, "10-bit is still HDR-or-10-bit");
+        assert_eq!(transfer, "bt709");
     }
 
     #[test]
@@ -2330,12 +2370,8 @@ mod tests {
                         "yuv420p10le",
                         "-profile:v",
                         "high10",
-                        "-color_primaries",
-                        "bt2020",
-                        "-color_trc",
-                        "smpte2084",
-                        "-colorspace",
-                        "bt2020nc",
+                        "-x264-params",
+                        "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
                         "-c:a",
                         "aac",
                         "-shortest",
@@ -2346,10 +2382,9 @@ mod tests {
             );
             let probed = probe_source(ffmpeg, &src).unwrap();
             assert!(probed.hdr_or_10bit, "probe did not see 10-bit or HDR");
-            assert!(
-                matches!(probed.transfer_in, "smpte2084" | "arib-std-b67" | "bt2020-10"),
-                "HDR transfer was {}",
-                probed.transfer_in
+            assert_eq!(
+                probed.transfer_in, "smpte2084",
+                "the source must be PQ, not only a BT.2020 matrix"
             );
             assert!(
                 super::super::decide_cast_video(&src).skip.is_some(),
@@ -2380,7 +2415,8 @@ mod tests {
                 &[
                     "-hide_banner".into(),
                     "-loglevel".into(),
-                    "info".into(),
+                    "error".into(),
+                    "-re".into(),
                     "-f".into(),
                     "lavfi".into(),
                     "-i".into(),
