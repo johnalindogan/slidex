@@ -250,6 +250,9 @@ pub(crate) enum ForCast {
     Skip {
         derived: Option<String>,
         reasons: String,
+        /// The copy was attempted and failed. The panel says so, and `reasons`
+        /// stays the original cast-check sentence for the log.
+        copy_failed: bool,
     },
 }
 
@@ -271,14 +274,26 @@ pub(crate) fn for_cast(path: &Path, item: u32) -> ForCast {
     match ensure_copy(path, item, &reasons) {
         Ensure::Ready => ForCast::Copy { derived },
         Ensure::Pending => ForCast::Preparing { derived, reasons },
-        Ensure::GiveUp => ForCast::Skip { derived, reasons },
+        Ensure::GiveUp => ForCast::Skip {
+            derived,
+            reasons,
+            copy_failed: false,
+        },
+        Ensure::EncodeFailed => ForCast::Skip {
+            derived,
+            reasons,
+            copy_failed: true,
+        },
     }
 }
 
 enum Ensure {
     Ready,
     Pending,
+    /// The original cannot be cast, and a copy was not attempted.
     GiveUp,
+    /// A copy was attempted and did not produce a playable file.
+    EncodeFailed,
 }
 
 fn canon_path(path: &Path) -> PathBuf {
@@ -321,7 +336,7 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
         let mut hub = hub();
         if let Some(failure) = hub.failed.get(&key).cloned() {
             if Instant::now() < failure.retry_at {
-                return Ensure::GiveUp;
+                return Ensure::EncodeFailed;
             }
             hub.failed.remove(&key);
         }
@@ -443,12 +458,12 @@ fn fail_once(key: &str, item: u32, err: &str) -> Ensure {
         .get(key)
         .is_some_and(|failure| Instant::now() < failure.retry_at)
     {
-        return Ensure::GiveUp;
+        return Ensure::EncodeFailed;
     }
     note_failure(&mut hub, key.to_string(), retry_unit());
     drop(hub);
     log_fail(item, err);
-    Ensure::GiveUp
+    Ensure::EncodeFailed
 }
 
 fn retry_unit() -> Duration {

@@ -366,7 +366,10 @@
       || /aren't supported by the TV/i.test(s)
       || /isn't supported by the TV/i.test(s)
       || /may not play on this TV/i.test(s)
-      || /can't verify this video/i.test(s);
+      || /can't play this/i.test(s)
+      || /still being written/i.test(s)
+      || /Couldn't check this video/i.test(s)
+      || /TV copy failed/i.test(s);
   }
 
   function castBannerText(status, itemName) {

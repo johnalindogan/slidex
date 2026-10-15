@@ -1290,6 +1290,8 @@ struct TrackProbe {
     sample_ticks: u128,
     /// `moof` or `mvex` is present, so timing may live in the fragments.
     fragmented: bool,
+    /// A `moov` box was present. Without one, the file is still being written.
+    saw_moov: bool,
     codec: Option<VisualCodec>,
     /// Tenths from avcC, or the HEVC general_level_idc converted to tenths.
     /// `Some(0)` means the box was present and the level byte was 0.
@@ -1309,6 +1311,7 @@ impl TrackProbe {
             sample_count: 0,
             sample_ticks: 0,
             fragmented: false,
+            saw_moov: false,
             codec: None,
             level: None,
             bit_depth: None,
@@ -1342,20 +1345,32 @@ fn decide_cast_video(path: &Path) -> CastVideoDecision {
 fn decide_cast_video_logged(path: &Path, log: bool) -> CastVideoDecision {
     let ext = ext_of(path);
     if ext != "mp4" && ext != "mov" {
-        return unverifiable_video(path, log);
+        return unverifiable(CastPanelCause::CantPlay(container_label(path)), path, log);
     }
     let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let probe = match read_mp4_video(path) {
         Ok(probe) => probe,
-        Err(_) => return unverifiable_video(path, log),
+        Err(ProbeFail::Incomplete) => {
+            return unverifiable(CastPanelCause::StillWriting, path, log);
+        }
+        Err(ProbeFail::Check(why)) => {
+            return unverifiable(CastPanelCause::CheckFailed(why), path, log);
+        }
     };
+    if !probe.saw_moov {
+        return unverifiable(CastPanelCause::StillWriting, path, log);
+    }
     if probe.codec.is_none() {
-        return unverifiable_video(path, log);
+        return unverifiable(CastPanelCause::CheckFailed("no video track"), path, log);
     }
     // `trex` / `tfhd` are not read. A fragment with no `mdhd` timescale or no
     // `stts` samples cannot be checked, so it is not sent to the TV.
     if probe.fragmented && (probe.timescale == 0 || probe.sample_count == 0) {
-        return unverifiable_video(path, log);
+        return unverifiable(
+            CastPanelCause::CheckFailed("fragmented file has no sample timing"),
+            path,
+            log,
+        );
     }
     let mut derived = None;
     let mut level = probe.level.filter(|tenths| *tenths != 0);
@@ -1430,18 +1445,41 @@ fn container_token(path: &Path) -> String {
     }
 }
 
-fn unverifiable_video(path: &Path, log: bool) -> CastVideoDecision {
-    let container = container_token(path);
+fn shown_skip(reasons: String, copy_failed: bool) -> String {
+    if copy_failed {
+        cast_panel_message(CastPanelCause::CopyFailed)
+    } else {
+        reasons
+    }
+}
+
+fn container_label(path: &Path) -> &'static str {
+    match ext_of(path).as_str() {
+        "mkv" => "MKV",
+        "webm" => "WEBM",
+        "avi" => "AVI",
+        "mp4" | "m4v" => "MP4",
+        "mov" => "MOV",
+        _ => "file",
+    }
+}
+
+fn unverifiable(reason: CastPanelCause, path: &Path, log: bool) -> CastVideoDecision {
     if log {
+        let container = container_token(path);
+        let (kind, detail) = match &reason {
+            CastPanelCause::StillWriting => ("still_writing", String::new()),
+            CastPanelCause::CheckFailed(why) => ("check_failed", format!(" detail={why}")),
+            CastPanelCause::CantPlay(_) => ("cant_play", String::new()),
+            _ => ("other", String::new()),
+        };
         cast_log(
             "skip",
-            &format!("reason=unverifiable container={container}"),
+            &format!("reason={kind} container={container}{detail}"),
         );
     }
     CastVideoDecision {
-        skip: Some(format!(
-            "can't verify this video for the TV ({container})"
-        )),
+        skip: Some(cast_panel_message(reason)),
         derived: None,
     }
 }
@@ -1576,12 +1614,42 @@ fn hevc_level_tenths(idc: u8) -> u8 {
     major.saturating_mul(10).saturating_add(minor)
 }
 
-fn read_mp4_video(path: &Path) -> std::io::Result<TrackProbe> {
-    let mut f = File::open(path)?;
-    let len = f.metadata()?.len();
+enum ProbeFail {
+    Incomplete,
+    Check(&'static str),
+}
+
+fn read_mp4_video(path: &Path) -> Result<TrackProbe, ProbeFail> {
+    let mut f = File::open(path).map_err(map_probe_err)?;
+    let len = f.metadata().map_err(map_probe_err)?.len();
     let mut probe = TrackProbe::new();
-    walk_probe(&mut f, 0, len, 0, &mut probe)?;
+    walk_probe(&mut f, 0, len, 0, &mut probe).map_err(map_probe_err)?;
     Ok(probe)
+}
+
+fn map_probe_err(err: std::io::Error) -> ProbeFail {
+    let msg = err.to_string();
+    if msg.contains("incomplete mp4") {
+        return ProbeFail::Incomplete;
+    }
+    match err.kind() {
+        std::io::ErrorKind::NotFound => ProbeFail::Check("file is missing"),
+        std::io::ErrorKind::PermissionDenied => ProbeFail::Check("file is not readable"),
+        _ => {
+            if msg.contains("extends past") {
+                ProbeFail::Check("box extends past its parent")
+            } else if msg.contains("truncated") {
+                ProbeFail::Check("box header is truncated")
+            } else {
+                ProbeFail::Check("could not read the file")
+            }
+        }
+    }
+}
+
+fn box_is_short_file(err: &std::io::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("extends past its parent") || msg.contains("header is truncated")
 }
 
 fn read_box_header(f: &mut File, end: u64) -> std::io::Result<Option<Mp4Box>> {
@@ -1631,8 +1699,16 @@ fn walk_probe(
     }
     f.seek(SeekFrom::Start(start))?;
     while f.stream_position()? + 8 <= end {
-        let Some(bx) = read_box_header(f, end)? else {
-            break;
+        let bx = match read_box_header(f, end) {
+            Ok(Some(bx)) => bx,
+            Ok(None) => break,
+            Err(err) if depth == 0 && box_is_short_file(&err) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete mp4",
+                ));
+            }
+            Err(err) => return Err(err),
         };
         match &bx.typ {
             b"trak" => {
@@ -1640,11 +1716,16 @@ fn walk_probe(
                 walk_probe(f, bx.payload, bx.end, depth + 1, &mut inner)?;
                 if inner.codec.is_some() {
                     let fragmented = probe.fragmented || inner.fragmented;
+                    let saw_moov = probe.saw_moov || inner.saw_moov;
                     *probe = inner;
                     probe.fragmented = fragmented;
+                    probe.saw_moov = saw_moov;
                 }
             }
             b"moov" | b"mdia" | b"minf" | b"stbl" => {
+                if &bx.typ == b"moov" {
+                    probe.saw_moov = true;
+                }
                 walk_probe(f, bx.payload, bx.end, depth + 1, probe)?;
             }
             b"mvex" | b"moof" => {
@@ -2122,12 +2203,10 @@ fn video_for_cast_check(path: &Path) -> Option<(String, String)> {
         _ => return None,
     };
     let decision = decide_cast_video_logged(path, false);
-    let skip = decision.skip.as_deref()?;
-    if skip.contains("can't verify this video") {
-        Some((ctype.to_string(), "video".to_string()))
-    } else {
-        None
-    }
+    decision
+        .skip
+        .is_some()
+        .then(|| (ctype.to_string(), "video".to_string()))
 }
 
 fn lookup_playlist<'a>(book: &'a AllowBook, path: &Path) -> Result<&'a AllowEntry, String> {
@@ -2377,13 +2456,17 @@ impl MediaHttp {
                         skipped.push(tv_copy::PREPARING_TV.to_string());
                         continue;
                     }
-                    tv_copy::ForCast::Skip { derived, reasons } => {
+                    tv_copy::ForCast::Skip {
+                        derived,
+                        reasons,
+                        copy_failed,
+                    } => {
                         log_level_derived(*page, derived.as_deref());
                         cast_log(
                             "video_skipped",
                             &format!("item={} reasons={reasons}", item_log_token(*page)),
                         );
-                        skipped.push(reasons);
+                        skipped.push(shown_skip(reasons, copy_failed));
                         continue;
                     }
                 }
@@ -4508,12 +4591,23 @@ fn link_down_message() -> String {
 
 /// Why the panel text changed. Connect failures stay "TV unreachable".
 /// A live control channel that cannot fetch media, or that does not answer a
-/// media command, uses [`MEDIA_FETCH_MESSAGE`].
+/// media command, uses [`MEDIA_FETCH_MESSAGE`]. A video the check cannot send
+/// as-is names that reason instead of one generic sentence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CastPanelCause {
     ConnectFailed,
     MediaCommandTimeout,
     LoadError,
+    /// The file is still growing, or the `moov` index is not there yet.
+    StillWriting,
+    /// The boxes could not be read. The string is a short reason, not a path.
+    CheckFailed(&'static str),
+    /// The TV cannot play this as-is. The string is HEVC, a container, or a level.
+    CantPlay(&'static str),
+    /// A TV copy of a file the TV cannot play is being built.
+    Preparing,
+    /// The TV copy was started and did not produce a file the TV can play.
+    CopyFailed,
 }
 
 pub fn cast_panel_message(cause: CastPanelCause) -> String {
@@ -4522,6 +4616,13 @@ pub fn cast_panel_message(cause: CastPanelCause) -> String {
         CastPanelCause::MediaCommandTimeout | CastPanelCause::LoadError => {
             MEDIA_FETCH_MESSAGE.to_string()
         }
+        CastPanelCause::StillWriting => {
+            "This video is still being written, or it has no moov index yet.".to_string()
+        }
+        CastPanelCause::CheckFailed(why) => format!("Couldn't check this video ({why})."),
+        CastPanelCause::CantPlay(what) => format!("The TV can't play this {what} as-is."),
+        CastPanelCause::Preparing => tv_copy::PREPARING_TV.to_string(),
+        CastPanelCause::CopyFailed => "The TV copy failed.".to_string(),
     }
 }
 
@@ -5378,9 +5479,9 @@ fn run_session(
     eprintln!("[cast] session ended");
 }
 
-/// When the current slide's TV copy finishes, LOAD it. A failed copy shows the
-/// original skip reason. A different LOAD clears `pending_tv`, so advancing
-/// away does not pull the TV back.
+/// When the current slide's TV copy finishes, LOAD it. A failed copy says so
+/// on the panel. A different LOAD clears `pending_tv`, so advancing away does
+/// not pull the TV back.
 fn promote_pending_tv(
     http: &MediaHttp,
     link: &CastLink,
@@ -5394,7 +5495,20 @@ fn promote_pending_tv(
         tv_copy::CopyPoll::Running | tv_copy::CopyPoll::Absent => {}
         tv_copy::CopyPoll::Failed => {
             flags.pending_tv = None;
-            publish_media_failure(flags, status, &pending.reasons, false);
+            cast_log(
+                "video_skipped",
+                &format!(
+                    "item={} reasons={}",
+                    item_log_token(pending.item),
+                    pending.reasons
+                ),
+            );
+            publish_media_failure(
+                flags,
+                status,
+                &cast_panel_message(CastPanelCause::CopyFailed),
+                false,
+            );
         }
         tv_copy::CopyPoll::Ready => {
             flags.pending_tv = None;
@@ -5519,14 +5633,18 @@ fn handle_cmd(
                             });
                             return Err(tv_copy::PREPARING_TV.to_string());
                         }
-                        tv_copy::ForCast::Skip { derived, reasons } => {
+                        tv_copy::ForCast::Skip {
+                            derived,
+                            reasons,
+                            copy_failed,
+                        } => {
                             log_level_derived(item, derived.as_deref());
                             cast_log(
                                 "video_skipped",
                                 &format!("item={} reasons={reasons}", item_log_token(item)),
                             );
                             flags.pending_tv = None;
-                            return Err(reasons);
+                            return Err(shown_skip(reasons, copy_failed));
                         }
                     }
                 }
@@ -6660,22 +6778,54 @@ mod tests {
     }
 
     #[test]
+    fn each_cast_panel_reason_has_its_own_message() {
+        let still = cast_panel_message(CastPanelCause::StillWriting);
+        let checked = cast_panel_message(CastPanelCause::CheckFailed("box extends past its parent"));
+        let hevc = cast_panel_message(CastPanelCause::CantPlay("HEVC"));
+        let level = cast_panel_message(CastPanelCause::CantPlay("H.264 level 6.2"));
+        let preparing = cast_panel_message(CastPanelCause::Preparing);
+        let failed = cast_panel_message(CastPanelCause::CopyFailed);
+        assert_eq!(
+            still,
+            "This video is still being written, or it has no moov index yet."
+        );
+        assert_eq!(
+            checked,
+            "Couldn't check this video (box extends past its parent)."
+        );
+        assert_eq!(hevc, "The TV can't play this HEVC as-is.");
+        assert_eq!(level, "The TV can't play this H.264 level 6.2 as-is.");
+        assert_eq!(preparing, "Preparing for TV…");
+        assert_eq!(failed, "The TV copy failed.");
+        let messages = [&still, &checked, &hevc, &level, &preparing, &failed];
+        for (i, left) in messages.iter().enumerate() {
+            for right in messages.iter().skip(i + 1) {
+                assert_ne!(left, right);
+            }
+            assert!(
+                !left.contains("can't verify this video"),
+                "{left}"
+            );
+        }
+    }
+
+    #[test]
     fn unreadable_videos_are_skipped_as_unverifiable() {
         let log = LogDir::new();
         let mkv = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
         assert_eq!(
             decide_cast_video(&mkv).skip.as_deref(),
-            Some("can't verify this video for the TV (MKV)")
+            Some("The TV can't play this MKV as-is.")
         );
         let webm = scratch("clip.webm", b"\x1a\x45\xdf\xa3");
         assert_eq!(
             decide_cast_video(&webm).skip.as_deref(),
-            Some("can't verify this video for the TV (WEBM)")
+            Some("The TV can't play this WEBM as-is.")
         );
         let avi = scratch("clip.avi", b"RIFF");
         assert_eq!(
             decide_cast_video(&avi).skip.as_deref(),
-            Some("can't verify this video for the TV (AVI)")
+            Some("The TV can't play this AVI as-is.")
         );
         // moov is complete, then a trailing box claims more bytes than remain.
         let mut cut = h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000));
@@ -6686,28 +6836,32 @@ mod tests {
         let truncated = scratch("cut.mp4", &cut);
         assert_eq!(
             decide_cast_video(&truncated).skip.as_deref(),
-            Some("can't verify this video for the TV (MP4)")
+            Some("This video is still being written, or it has no moov index yet.")
         );
         let missing = truncated.with_file_name("missing-video.mp4");
         assert_eq!(
             decide_cast_video(&missing).skip.as_deref(),
-            Some("can't verify this video for the TV (MP4)")
+            Some("Couldn't check this video (file is missing).")
         );
         let written = log.text();
         assert!(
-            written.contains("skip reason=unverifiable container=MKV"),
+            written.contains("skip reason=cant_play container=MKV"),
             "{written}"
         );
         assert!(
-            written.contains("skip reason=unverifiable container=WEBM"),
+            written.contains("skip reason=cant_play container=WEBM"),
             "{written}"
         );
         assert!(
-            written.contains("skip reason=unverifiable container=AVI"),
+            written.contains("skip reason=cant_play container=AVI"),
             "{written}"
         );
         assert!(
-            written.contains("skip reason=unverifiable container=MP4"),
+            written.contains("skip reason=still_writing container=MP4"),
+            "{written}"
+        );
+        assert!(
+            written.contains("skip reason=check_failed container=MP4 detail=file is missing"),
             "{written}"
         );
         let mov = scratch(
@@ -6756,17 +6910,20 @@ mod tests {
         assert_eq!(succ.item, 5);
         assert_eq!(succ.media_type, "photo");
         let note = note.expect("skip notes");
-        assert!(note.contains("can't verify this video for the TV (MKV)"), "{note}");
-        assert!(note.contains("can't verify this video for the TV (WEBM)"), "{note}");
-        assert!(note.contains("can't verify this video for the TV (MP4)"), "{note}");
+        assert!(note.contains("The TV can't play this MKV as-is."), "{note}");
+        assert!(note.contains("The TV can't play this WEBM as-is."), "{note}");
+        assert!(
+            note.contains("This video is still being written, or it has no moov index yet."),
+            "{note}"
+        );
         assert!(!note.contains("Unsupported media"), "{note}");
         let written = log.text();
-        assert!(written.contains("skip reason=unverifiable container=MKV"), "{written}");
-        assert!(written.contains("skip reason=unverifiable container=WEBM"), "{written}");
-        assert!(written.contains("skip reason=unverifiable container=MP4"), "{written}");
-        assert!(written.contains("video_skipped item=2 reasons=can't verify this video for the TV (MKV)"), "{written}");
-        assert!(written.contains("video_skipped item=3 reasons=can't verify this video for the TV (WEBM)"), "{written}");
-        assert!(written.contains("video_skipped item=4 reasons=can't verify this video for the TV (MP4)"), "{written}");
+        assert!(written.contains("skip reason=cant_play container=MKV"), "{written}");
+        assert!(written.contains("skip reason=cant_play container=WEBM"), "{written}");
+        assert!(written.contains("skip reason=still_writing container=MP4"), "{written}");
+        assert!(written.contains("video_skipped item=2 reasons=The TV can't play this MKV as-is."), "{written}");
+        assert!(written.contains("video_skipped item=3 reasons=The TV can't play this WEBM as-is."), "{written}");
+        assert!(written.contains("video_skipped item=4 reasons=This video is still being written, or it has no moov index yet."), "{written}");
     }
 
     #[test]
@@ -6789,11 +6946,13 @@ mod tests {
         );
         assert_eq!(
             decide_cast_video(&empty).skip.as_deref(),
-            Some("can't verify this video for the TV (MP4)")
+            Some("Couldn't check this video (fragmented file has no sample timing).")
         );
         let written = log.text();
         assert!(
-            written.contains("skip reason=unverifiable container=MP4"),
+            written.contains(
+                "skip reason=check_failed container=MP4 detail=fragmented file has no sample timing"
+            ),
             "{written}"
         );
         // mvex/moof with a real stts is still measured from those samples.
@@ -6898,7 +7057,7 @@ mod tests {
         let written = log.text();
         assert!(
             written.contains(
-                "tv_copy start item=2 reasons=can't verify this video for the TV (MKV)"
+                "tv_copy start item=2 reasons=The TV can't play this MKV as-is."
             ),
             "{written}"
         );
@@ -6978,10 +7137,7 @@ mod tests {
         assert_eq!(written.matches("tv_copy start").count(), 1, "{written}");
         let (again, note) = http.next_castable(1);
         assert_eq!(again.expect("still the photo").item, 3);
-        assert_eq!(
-            note.as_deref(),
-            Some("H.264 level 5.3 may not play on this TV")
-        );
+        assert_eq!(note.as_deref(), Some("The TV copy failed."));
         let written = log.text();
         assert_eq!(written.matches("tv_copy start").count(), 1, "{written}");
     }
@@ -7011,10 +7167,7 @@ mod tests {
         let (again, note) = http.next_castable(1);
         let again = again.expect("photo");
         assert_eq!(again.item, 3);
-        assert_eq!(
-            note.as_deref(),
-            Some("can't verify this video for the TV (MKV)")
-        );
+        assert_eq!(note.as_deref(), Some("The TV copy failed."));
         assert_ne!(again.item, 2);
     }
 

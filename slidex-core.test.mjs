@@ -1187,7 +1187,11 @@ test('a cast skip message names TV limits and a level the TV may not play', () =
   assert.equal(C.isCastSkipMessage('H.264 level 5.2 may not play on this TV'), true);
   assert.equal(C.isCastSkipMessage('HEVC level 5.2 may not play on this TV'), true);
   assert.equal(C.isCastSkipMessage('Unsupported media. Cast plays JPEG, PNG, and MP4 (H.264 + AAC). Skipped.'), true);
-  assert.equal(C.isCastSkipMessage("can't verify this video for the TV (MKV)"), true);
+  assert.equal(C.isCastSkipMessage("The TV can't play this MKV as-is."), true);
+  assert.equal(C.isCastSkipMessage("The TV can't play this HEVC as-is."), true);
+  assert.equal(C.isCastSkipMessage('This video is still being written, or it has no moov index yet.'), true);
+  assert.equal(C.isCastSkipMessage("Couldn't check this video (file is missing)."), true);
+  assert.equal(C.isCastSkipMessage('The TV copy failed.'), true);
   assert.equal(C.isCastSkipMessage('TV unreachable. It may be off or the Wi-Fi dropped.'), false);
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
