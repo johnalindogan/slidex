@@ -1,0 +1,8 @@
+{
+  "version": "9.0.2",
+  "url": "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.7z",
+  "archive_sha256": "f0e46253c70dfe902bac915dfb4224f0cf1b7c6eeab9da2ccc9a5581f9a71b13",
+  "exe_sha256": "589e50b766d251afdf181dd664d40bd94407e200b019989fd7468c7d118a28d0",
+  "exe_inside": "ffmpeg-9.0.2-full_build/bin/ffmpeg.exe",
+  "license_inside": "ffmpeg-9.0.2-full_build/LICENSE"
+}

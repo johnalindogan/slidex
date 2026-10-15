@@ -50,7 +50,15 @@ The status line also names the adapters that were browsed and, when the PC has n
 - Nothing is logged that contains a token, a device UUID, or a full path.
 - After the token check, `transform_media` opens the allowlisted file. That is the identity transform. A later slideshow-only crop sidecar can return a generated still from that function without changing auth or the socket loop. Crop is not implemented in this release.
 
-JPEG, PNG, and MP4 (H.264 + AAC) are registered. Anything else is skipped with a note and the slideshow moves on.
+JPEG, PNG, and MP4 (H.264 + AAC) are registered. A video the TV-limit check rejects, and a container that check cannot read (MKV, WebM, AVI, or an unreadable MP4), stays in the playlist so Cast can build a TV copy. Anything else is skipped with a note and the slideshow moves on.
+
+## TV copy
+
+When a video fails the cast check, or the check cannot read it, SlideX starts a background encode and the banner says `Preparing for TV…`. A file that is still being written, a check that cannot parse it, a file the TV cannot play as-is, and a TV copy that failed each get their own banner sentence. The slideshow moves to the next item. The copy is cast the next time that item comes round, or immediately if that item is still the current one when the copy is ready.
+
+Copies live in `%LOCALAPPDATA%\com.johnalindogan.slideshowpro\tv-cache`, keyed by path, size, and mtime. The cache stops at 20 GB by default and deletes the least recently used copy first. `SLIDEX_TV_CACHE_LIMIT` (a byte count, or a value such as `20GB` or `500MB`) or the file `tv-cache-limit` next to the TV encoder setting overrides that cap. In-progress `.part` files count toward it. Leftover `.part` files from a previous run are deleted at startup. Nothing is written next to the original. At most two encodes run at once; the rest wait in a FIFO queue. A failed encode is tried again after a backoff that starts at 5 seconds and doubles, instead of staying failed until SlideX restarts. The encoder is one setting, `libx264` by default, with `h264_mf`, `h264_nvenc`, and `h264_qsv` as alternatives. The pinned ffmpeg.exe is installed beside `slideshowpro.exe`, not on PATH. On Windows it is assigned to a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and SlideX kills running encodes when it exits. `ffmpeg-gpl-notice.txt` sits beside `ffmpeg-license.txt` and names the GPL/libx264 terms and the ffmpeg source URL.
+
+`cast.log` records `tv_copy start`, `tv_copy done`, `tv_copy fail`, `tv_copy cache_hit`, `tv_copy evict`, and `tv_copy sweep`. Those lines do not include a file path. A copy that does not itself pass the cast check is deleted and not sent. The cast check for a given path, size, and mtime is cached, so a range request does not read the MP4 boxes again.
 
 ## Receiver handshake
 

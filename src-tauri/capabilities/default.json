@@ -47,6 +47,8 @@
     "allow-cast-firewall-status",
     "allow-cast-log-path",
     "allow-cast-log-dur-fallback",
+    "allow-cast-get-tv-encoder",
+    "allow-cast-set-tv-encoder",
     "allow-slidex-save-done"
   ]
 }

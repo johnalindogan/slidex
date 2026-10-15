@@ -219,6 +219,22 @@ function walkFiles(dir) {
   return out;
 }
 
+function pinnedFfmpegResource(pattern, tauriDir) {
+  const allowed = new Set(['resources/ffmpeg/ffmpeg.exe', 'resources/ffmpeg/LICENSE']);
+  if (!allowed.has(pattern.replaceAll('\\', '/'))) return false;
+  const pinPath = path.join(tauriDir, 'ffmpeg.pin.json');
+  if (!fs.existsSync(pinPath)) fail('ffmpeg.pin.json is missing');
+  const pin = parseJsonStrict(fs.readFileSync(pinPath, 'utf8'));
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(String(pin.version || ''))) {
+    fail('ffmpeg.pin.json version is not pinned');
+  }
+  for (const key of ['archive_sha256', 'exe_sha256']) {
+    if (!/^[0-9a-f]{64}$/.test(String(pin[key] || ''))) fail(`ffmpeg.pin.json ${key} is not a sha256`);
+  }
+  if (!String(pin.url || '').startsWith('https://')) fail('ffmpeg.pin.json url is not pinned');
+  return true;
+}
+
 function resolveBundleResources(conf, tauriDir) {
   const resources = conf?.bundle?.resources;
   if (!resources || Array.isArray(resources) || typeof resources !== 'object') {
@@ -240,7 +256,16 @@ function resolveBundleResources(conf, tauriDir) {
       }
     } else {
       const abs = path.resolve(tauriDir, pattern);
-      if (!fs.existsSync(abs)) fail(`resource not found: ${pattern}`);
+      if (!fs.existsSync(abs)) {
+        // ffmpeg.exe is downloaded and hash-checked by build.rs on Windows.
+        // It is not stored in git. The pin file is what this check can see.
+        if (!pinnedFfmpegResource(pattern, tauriDir)) fail(`resource not found: ${pattern}`);
+        resolved.push({
+          source: pattern.replaceAll('\\', '/'),
+          target: dest || path.basename(pattern),
+        });
+        continue;
+      }
       if (fs.statSync(abs).isDirectory()) {
         for (const file of walkFiles(abs)) {
           const rel = path.relative(abs, file).replaceAll('\\', '/');
@@ -267,6 +292,9 @@ function assertTauriBundle() {
   const targets = resolved.map((item) => item.target);
   if (!targets.includes('cast-fw-check.ps1')) {
     fail(`resolved bundle resources do not install cast-fw-check.ps1 beside the exe: ${targets.join(', ')}`);
+  }
+  if (!targets.includes('ffmpeg.exe') || !targets.includes('ffmpeg-license.txt')) {
+    fail(`ffmpeg must install beside the exe, not on PATH: ${targets.join(', ')}`);
   }
   const ps1 = resolved.find((item) => item.target === 'cast-fw-check.ps1');
   if (ps1.source !== 'windows/cast-fw-check.ps1') fail(`cast-fw-check.ps1 source is ${ps1.source}`);
