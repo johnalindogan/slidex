@@ -6061,7 +6061,7 @@ function buildGradeSidecar(item) {
     savedAt: new Date().toISOString(),
     source: { name: item.name || null, path: item.path || null, type: item.type || null, id: item.id || null },
     clr,
-    note: 'Playback already applies these grades via playlist imageUpdates.clr. This sidecar is for external tools or re-import. Full video re-encode is best-effort (canvas/MediaRecorder WebM); ffmpeg is not bundled.'
+    note: 'Playback already applies these grades via playlist imageUpdates.clr. This sidecar is for external tools or re-import. Full video re-encode is best-effort (canvas/MediaRecorder WebM). Graded export does not use the bundled ffmpeg.'
   };
 }
 const VIDEO_BAKE_MAX_SEC = 45;
@@ -7400,6 +7400,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <input id="castPort" type="number" min="1" max="65535" placeholder="8009" aria-label="Cast port">
   </div>
   <div class="row">
+    <label for="castEncoder">TV encoder</label>
+    <select id="castEncoder" aria-label="TV video encoder">
+      <option value="libx264">libx264</option>
+      <option value="h264_mf">h264_mf</option>
+      <option value="h264_nvenc">h264_nvenc</option>
+      <option value="h264_qsv">h264_qsv</option>
+    </select>
+  </div>
+  <div class="row">
     <button type="button" id="castStart">Cast slideshow</button>
     <button type="button" id="castDisconnect">Disconnect</button>
     <button type="button" id="castLog">Copy Cast log path</button>
@@ -7494,7 +7503,23 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function openPanel() {
     panel.classList.add("open");
     refreshFirewall();
+    bindTvEncoder();
     startScan("open");
+  }
+  function bindTvEncoder() {
+    var encoderEl = document.getElementById("castEncoder");
+    if (!encoderEl) return;
+    call("cast_get_tv_encoder").then(function (name) {
+      name = String(name || "libx264");
+      if (encoderEl.querySelector('option[value="' + name + '"]')) encoderEl.value = name;
+    }).catch(function () {});
+    if (encoderEl.getAttribute("data-bound") === "1") return;
+    encoderEl.setAttribute("data-bound", "1");
+    encoderEl.addEventListener("change", function () {
+      call("cast_set_tv_encoder", { name: encoderEl.value }).catch(function (e) {
+        setStatus((e && e.message) ? e.message : String(e));
+      });
+    });
   }
   function call(cmd, args) {
     if (!sspIsTauri() || typeof tauriInvoke !== "function") {
@@ -7652,6 +7677,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       return refreshCastBanner();
     }).catch(function (e) {
       var msg = (e && e.message) ? e.message : String(e);
+      if (msg === "Preparing for TV…") {
+        noteSkip(msg);
+        var playlistCount = Math.max(1, sspCastPaths().length);
+        if (playlistCount > 1 && skipBurst + 1 < playlistCount) {
+          skipBurst++;
+          if (typeof goTo === "function" && typeof nextMI === "function") goTo(nextMI(), src);
+        }
+        return;
+      }
       if (castSkipMessage(msg)) {
         rememberCastBad(path);
         noteSkip(msg);

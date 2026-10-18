@@ -745,19 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.12 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.13 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.12');
-  assert.equal(tauri.version, '0.1.12');
+  assert.equal(pkg.version, '0.1.13');
+  assert.equal(tauri.version, '0.1.13');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.12"/m);
-  assert.match(lock, /"version": "0\.1\.12"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.12"/);
+  assert.match(cargo, /^version = "0\.1\.13"/m);
+  assert.match(lock, /"version": "0\.1\.13"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.13"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -1183,12 +1183,17 @@ test('the Cast panel can copy the Cast log path', () => {
 });
 
 test('a cast skip message names TV limits and a level the TV may not play', () => {
+  assert.equal(C.isCastSkipMessage('Preparing for TV…'), true);
   assert.equal(C.isCastSkipMessage("90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"), true);
   assert.equal(C.isCastSkipMessage("10-bit isn't supported by the TV"), true);
   assert.equal(C.isCastSkipMessage('H.264 level 5.2 may not play on this TV'), true);
   assert.equal(C.isCastSkipMessage('HEVC level 5.2 may not play on this TV'), true);
   assert.equal(C.isCastSkipMessage('Unsupported media. Cast plays JPEG, PNG, and MP4 (H.264 + AAC). Skipped.'), true);
-  assert.equal(C.isCastSkipMessage("can't verify this video for the TV (MKV)"), true);
+  assert.equal(C.isCastSkipMessage("The TV can't play this MKV as-is."), true);
+  assert.equal(C.isCastSkipMessage("The TV can't play this HEVC as-is."), true);
+  assert.equal(C.isCastSkipMessage('This video is still being written, or it has no moov index yet.'), true);
+  assert.equal(C.isCastSkipMessage("Couldn't check this video (file is missing)."), true);
+  assert.equal(C.isCastSkipMessage('The TV copy failed.'), true);
   assert.equal(C.isCastSkipMessage('TV unreachable. It may be off or the Wi-Fi dropped.'), false);
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const load = html.slice(html.indexOf('function loadCurrent'), html.indexOf('function syncTransport'));
@@ -1263,6 +1268,83 @@ test('a cast skip during loadCurrent moves straight to the next slide', async ()
   assert.equal(sandbox.window.__sspCastBadPaths['C:/slides/bad.mp4'], true);
   assert.equal(sandbox.skipBurst, 1);
   assert.equal(sandbox.cur, 0);
+});
+
+test('Preparing for TV moves on without marking the item bad', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('function currentSkipped'), html.indexOf('function syncTransport'));
+  const caps = fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8');
+  const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  const nsi = fs.readFileSync(new URL('./src-tauri/windows/installer.nsi', import.meta.url), 'utf8');
+  const pin = JSON.parse(fs.readFileSync(new URL('./src-tauri/ffmpeg.pin.json', import.meta.url), 'utf8'));
+  const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  assert.equal(pin.version, '9.0.2');
+  assert.equal(pin.archive_sha256, 'f0e46253c70dfe902bac915dfb4224f0cf1b7c6eeab9da2ccc9a5581f9a71b13');
+  assert.equal(pin.exe_sha256, '589e50b766d251afdf181dd664d40bd94407e200b019989fd7468c7d118a28d0');
+  assert.equal(tauri.bundle.resources['resources/ffmpeg/ffmpeg.exe'], 'ffmpeg.exe');
+  assert.equal(tauri.bundle.resources['resources/ffmpeg/LICENSE'], 'ffmpeg-license.txt');
+  assert.match(html, /id="castEncoder"/);
+  assert.match(html, /value="libx264"/);
+  assert.match(html, /value="h264_mf"/);
+  assert.match(html, /value="h264_nvenc"/);
+  assert.match(html, /value="h264_qsv"/);
+  assert.match(html, /cast_get_tv_encoder/);
+  assert.match(html, /cast_set_tv_encoder/);
+  assert.match(caps, /allow-cast-get-tv-encoder/);
+  assert.match(caps, /allow-cast-set-tv-encoder/);
+  assert.match(perms, /cast_get_tv_encoder/);
+  assert.match(perms, /cast_set_tv_encoder/);
+  assert.doesNotMatch(nsi, /ffmpeg\.exe/);
+  assert.equal(
+    C.castBannerText({ player_state: 'playing', error: 'Preparing for TV…' }, 'clip.mkv'),
+    'Preparing for TV…'
+  );
+  function runLoad(paths, rejectMessage) {
+    const moves = [];
+    const statuses = [];
+    const core = {
+      isCastSkipMessage: C.isCastSkipMessage,
+      DEFAULT_IMAGE_DURATION_MS: C.DEFAULT_IMAGE_DURATION_MS
+    };
+    const sandbox = {
+      Promise,
+      String,
+      Number,
+      Math,
+      Object,
+      window: { __sspCastActive: true, SlideXCore: core },
+      SlideXCore: core,
+      castActive: true,
+      skipBurst: 0,
+      skippedNotes: [],
+      cur: 0,
+      setTimeout() { return 0; },
+      setStatus(msg) { statuses.push(msg); },
+      showToast() {},
+      esc(s) { return String(s); },
+      sspCastCurrentPath() { return paths[0]; },
+      sspCastCurrentName() { return 'clip.mkv'; },
+      sspCastPaths() { return paths; },
+      sspCastPlaying() { return true; },
+      nextMI() { return 1; },
+      goTo(index, source) { moves.push([index, source]); },
+      call() { return Promise.reject(new Error(rejectMessage)); }
+    };
+    return vm.runInNewContext(src + '\nloadCurrent("user");', sandbox).then(() => ({ moves, statuses, sandbox }));
+  }
+  const moved = await runLoad(
+    ['C:/slides/clip.mkv', 'C:/slides/next.jpg'],
+    'Preparing for TV…'
+  );
+  assert.deepEqual(moved.moves, [[1, 'user']]);
+  assert.equal(moved.sandbox.window.__sspCastBadPaths, undefined);
+  assert.equal(moved.statuses[0], 'Preparing for TV…');
+  assert.equal(moved.sandbox.skipBurst, 1);
+  const stayed = await runLoad(['C:/slides/clip.mkv'], 'Preparing for TV…');
+  assert.deepEqual(stayed.moves, []);
+  assert.equal(stayed.sandbox.window.__sspCastBadPaths, undefined);
+  assert.equal(stayed.statuses[0], 'Preparing for TV…');
+  assert.equal(stayed.sandbox.skipBurst, 0);
 });
 
 test('a cast ignores local video events and tags the command source', () => {
@@ -1630,6 +1712,61 @@ test('multi-select drag by the strip moves past one unavailable item', () => {
     pageHtml,
     /function getMediaItems\(\) \{ return items\.filter\(it => it\.type !== 'folder' && !it\.unavailable && !it\.missing\); \}/
   );
+});
+
+test('a single drag with nothing selected keeps the slide on screen', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  const beforeCur = 3;
+  const cell = C.STRIP_THUMB_W + C.STRIP_GAP;
+  const byHandle = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 1,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(byHandle.moved, true);
+  assert.equal(byHandle.clearedSelection, false);
+  const handleCur = C.playbackIndexAfterReorder(shots, beforeCur, byHandle.items);
+  assert.equal(C.playbackMedia(byHandle.items)[handleCur].name, shots[beforeCur].name);
+  const handleSelf = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: beforeCur,
+    clientY: rows[4].top + rows[4].height * 0.75,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(handleSelf.moved, true);
+  const handleSelfCur = C.playbackIndexAfterReorder(shots, beforeCur, handleSelf.items);
+  assert.equal(C.playbackMedia(handleSelf.items)[handleSelfCur].name, shots[beforeCur].name);
+  const byStrip = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: 1,
+    clientX: C.STRIP_PAD_X + 2 * cell + C.STRIP_THUMB_W * 0.75,
+    stripLeft: 0,
+    scrollLeft: 0,
+    selected: []
+  });
+  assert.equal(byStrip.moved, true);
+  assert.equal(byStrip.clearedSelection, false);
+  const stripCur = C.playbackIndexAfterReorder(shots, beforeCur, byStrip.items);
+  assert.equal(C.playbackMedia(byStrip.items)[stripCur].name, shots[beforeCur].name);
+  const stripSelf = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: beforeCur,
+    clientX: C.STRIP_PAD_X + 4 * cell + C.STRIP_THUMB_W * 0.75,
+    stripLeft: 0,
+    scrollLeft: 0,
+    selected: []
+  });
+  assert.equal(stripSelf.moved, true);
+  const stripSelfCur = C.playbackIndexAfterReorder(shots, beforeCur, stripSelf.items);
+  assert.equal(C.playbackMedia(stripSelf.items)[stripSelfCur].name, shots[beforeCur].name);
 });
 
 test('the slide on screen stays the same after a move', () => {

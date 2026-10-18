@@ -1,0 +1,15 @@
+SlideX bundles the GyanD ffmpeg 9.0.2 full build. That build links libx264.
+
+libx264 is free software licensed under the GNU General Public License,
+version 2 or later. Because this ffmpeg binary is linked with libx264, the
+binary is distributed under the GPL. A copy of the ffmpeg license is in
+ffmpeg-license.txt beside this notice.
+
+ffmpeg source for this build:
+https://github.com/FFmpeg/FFmpeg/commit/946fcce07b
+
+ffmpeg binary this build verifies:
+https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-full_build.7z
+
+Release that names that source:
+https://github.com/GyanD/codexffmpeg/releases/tag/9.0.2

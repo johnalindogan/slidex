@@ -5,6 +5,7 @@ ui/index.html
 ui/slidex-core.js
 src-tauri/target/
 src-tauri/gen/
+src-tauri/resources/ffmpeg/
 *.log
 .DS_Store
 android/.gradle/
