@@ -745,19 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.15 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.16 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.15');
-  assert.equal(tauri.version, '0.1.15');
+  assert.equal(pkg.version, '0.1.16');
+  assert.equal(tauri.version, '0.1.16');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.15"/m);
-  assert.match(lock, /"version": "0\.1\.15"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.15"/);
+  assert.match(cargo, /^version = "0\.1\.16"/m);
+  assert.match(lock, /"version": "0\.1\.16"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.16"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'

@@ -1077,16 +1077,17 @@ impl Drop for ClearPlaylistOpening {
 }
 
 /// Destroy a leftover playlist window and wait until its label is gone.
-/// Creating while that label still exists leaves a stray Media Manager.
-fn wait_until_playlist_destroyed(app: &AppHandle) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+/// Returns immediately when no playlist window exists. Polls on the async
+/// runtime (never `thread::sleep`, which blocks the worker that builds the
+/// new window) for at most 500ms.
+async fn wait_until_playlist_destroyed(app: &AppHandle) -> Result<(), String> {
+    if app.get_webview_window("playlist").is_none() {
+        playlist_gate().closing = false;
+        return Ok(());
+    }
+    let deadline = Instant::now() + Duration::from_millis(500);
     loop {
-        let existing = app.get_webview_window("playlist");
-        let closing = playlist_gate().closing;
-        if existing.is_none() && !closing {
-            return Ok(());
-        }
-        if let Some(window) = existing {
+        if let Some(window) = app.get_webview_window("playlist") {
             playlist_gate().closing = true;
             match window.destroy() {
                 Ok(()) => {}
@@ -1104,7 +1105,7 @@ fn wait_until_playlist_destroyed(app: &AppHandle) -> Result<(), String> {
             eprintln!("[slideshowpro] {msg}");
             return Err(msg);
         }
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -1124,7 +1125,19 @@ async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
     {
         let mut gate = playlist_gate();
         if gate.opening {
+            drop(gate);
+            // Skipped open: the in-flight create emits ready when the window
+            // exists. Emit again if it is already up, so this caller still binds.
+            if app.get_webview_window("playlist").is_some() {
+                if let Err(e) = app.emit("ssp-pl-ready", ()) {
+                    eprintln!("[slideshowpro] ssp-pl-ready emit failed: {e}");
+                }
+            }
             return Ok(());
+        }
+        // A stale closing flag with no window must not enter the poll loop.
+        if app.get_webview_window("playlist").is_none() {
+            gate.closing = false;
         }
         gate.opening = true;
     }
@@ -1133,9 +1146,9 @@ async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         let _clear = ClearPlaylistOpening;
         // Label check before create: never build while "playlist" exists or is closing.
-        let ready = (|| -> Result<(), String> {
+        let ready = async {
             if handle.get_webview_window("playlist").is_some() || playlist_gate().closing {
-                wait_until_playlist_destroyed(&handle)?;
+                wait_until_playlist_destroyed(&handle).await?;
             }
             if handle.get_webview_window("playlist").is_some() {
                 let msg = "refusing to create a second playlist window".to_string();
@@ -1160,7 +1173,8 @@ async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
                 msg
             })?;
             Ok(())
-        })();
+        }
+        .await;
         match ready {
             Ok(()) => {
                 if let Err(e) = handle.emit("ssp-pl-ready", ()) {

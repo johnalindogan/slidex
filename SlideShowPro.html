@@ -1789,13 +1789,15 @@ async function undockPlaylistWindow() {
     await tauriInvoke('open_playlist_window');
   } catch (e) {
     console.warn(e);
+    _plUndocking = false;
     playlistUndocked = false;
     applyUndockedMainChrome();
     showToast('Could not open playlist window: ' + (e && e.message ? e.message : e), 5000);
     return;
-  } finally {
-    _plUndocking = false;
   }
+  // Hold the lock until ssp-pl-ready or ssp-pl-open-failed. Releasing it when
+  // the invoke returns lets a second click invalidate the destroyed listener
+  // before the window exists.
   if (_plOpenFailed) {
     _plOpenFailed = false;
     playlistUndocked = false;
@@ -1855,20 +1857,30 @@ async function destroyOwnPlaylistWindow() {
 
 async function dockPlaylistWindow() {
   if (SSP_IS_PLAYLIST_WINDOW) {
-    // Push latest state, ask main to restore chrome, then destroy this window.
-    try { await broadcastPlaylistSync(); } catch (e) { console.warn('playlist sync before dock failed', e); }
-    try {
-      if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
-        await window.__TAURI__.event.emit('ssp-pl-dock', { origin: 'playlist' });
-      }
-    } catch (e) { console.warn('ssp-pl-dock emit failed', e); }
-    try {
-      await destroyOwnPlaylistWindow();
-    } catch (e) {
+    // destroy() is the first IPC on this click. Awaiting the playlist push
+    // (300–510ms) or ssp-pl-dock (up to 3s) left the child open. Sync is
+    // already continuous; main rebuilds from its own state on destroyed.
+    let settled = false;
+    const pendingDestroy = destroyOwnPlaylistWindow();
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      tauriInvoke('close_playlist_window').catch((e) => {
+        console.warn('close_playlist_window failed', e);
+      });
+    }, 250);
+    pendingDestroy.then(() => {
+      settled = true;
+      clearTimeout(timer);
+    }).catch((e) => {
       console.warn('playlist destroy failed', e);
-      try { await tauriInvoke('close_playlist_window'); }
-      catch (err) { console.warn('close_playlist_window failed', err); }
-    }
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      tauriInvoke('close_playlist_window').catch((err) => {
+        console.warn('close_playlist_window failed', err);
+      });
+    });
     return;
   }
   // Main: destroy the child if it is still open, and show the dock.
@@ -1943,6 +1955,7 @@ function initPlaylistWindowSync() {
       }).catch((e) => { console.warn('ssp-pl-dock listen failed', e); });
       window.__TAURI__.event.listen('ssp-pl-ready', () => {
         _plReadySeen++;
+        _plUndocking = false;
         if (!playlistUndocked) return;
         _plReadyBound = _plReadySeen;
         tryBindPlaylistWindowClosed();
@@ -1950,7 +1963,8 @@ function initPlaylistWindowSync() {
       window.__TAURI__.event.listen('ssp-pl-open-failed', (event) => {
         console.warn('playlist window failed to open', event && event.payload);
         _plOpenFailed = true;
-        if (!_plUndocking) restoreDockedMediaManager();
+        _plUndocking = false;
+        restoreDockedMediaManager();
       }).catch((e) => { console.warn('ssp-pl-open-failed listen failed', e); });
     }
     return true;

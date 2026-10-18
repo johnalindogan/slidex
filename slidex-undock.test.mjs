@@ -115,8 +115,19 @@ function assertDockClosesChild(html) {
   assert.doesNotMatch(destroy, /\.close\s*\(\s*\)/);
   const dock = extractFunction(html, 'dockPlaylistWindow');
   const playlistBranch = (dock.split('if (SSP_IS_PLAYLIST_WINDOW)')[1] || '').split('// Main:')[0];
-  assert.match(playlistBranch, /destroyOwnPlaylistWindow\s*\(/, 'playlist Dock does not destroy its own window');
+  const destroyAt = playlistBranch.search(/destroyOwnPlaylistWindow\s*\(/);
+  assert.ok(destroyAt >= 0, 'playlist Dock does not destroy its own window');
+  assert.doesNotMatch(playlistBranch.slice(0, destroyAt), /\bawait\b/, 'destroy() is queued behind an awaited push or event');
+  assert.doesNotMatch(playlistBranch, /broadcastPlaylistSync\s*\(|emit\(\s*'ssp-pl-dock'/);
+  assert.match(playlistBranch, /setTimeout\([\s\S]*?,\s*250\)/, 'JS destroy has no short fallback to close_playlist_window');
+  assert.match(playlistBranch, /close_playlist_window/);
   assert.doesNotMatch(playlistBranch, /\.close\s*\(\s*\)/);
+  const undock = extractFunction(html, 'undockPlaylistWindow');
+  assert.doesNotMatch(undock, /finally\s*\{[^}]*_plUndocking\s*=\s*false/, 'undock releases its lock before the window is ready');
+  const readyAt = html.indexOf("listen('ssp-pl-ready'");
+  assert.match(html.slice(readyAt, readyAt + 500), /_plUndocking\s*=\s*false/);
+  const failedAt = html.indexOf("listen('ssp-pl-open-failed'");
+  assert.match(html.slice(failedAt, failedAt + 500), /_plUndocking\s*=\s*false/);
   const mainBranch = dock.split('// Main:')[1] || '';
   assert.match(mainBranch, /close_playlist_window/, 'main Dock path does not destroy the child');
   assert.match(mainBranch, /restoreDockedMediaManager\s*\(/);
@@ -141,6 +152,16 @@ function assertRustDestroy(lib) {
   const lockAt = open.indexOf('gate.opening');
   assert.ok(lockAt >= 0 && lockAt < createAt, 'undock has no lock before create');
   assert.ok(labelAt >= 0 && labelAt < createAt, 'playlist label is not checked before create');
+  const skipped = open.slice(lockAt, open.indexOf('gate.opening = true'));
+  assert.match(skipped, /ssp-pl-ready/, 'a skipped open does not emit ready');
+  const wait = extractRustFn(lib, 'wait_until_playlist_destroyed');
+  assert.match(wait, /tokio::time::sleep/);
+  assert.match(wait, /Duration::from_millis\(25\)/);
+  assert.match(wait, /Duration::from_millis\(500\)/);
+  assert.match(wait, /get_webview_window\("playlist"\)\.is_none\(\)/);
+  assert.doesNotMatch(wait, /thread::sleep/);
+  assert.doesNotMatch(open, /thread::sleep/);
+  assert.doesNotMatch(lib, /std::thread::sleep\(Duration::from_millis\(20\)\)/);
 }
 
 function assertDestroyPermission() {
