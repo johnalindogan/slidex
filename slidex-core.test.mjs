@@ -745,17 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.10 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.12 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
+  const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.10');
-  assert.equal(tauri.version, '0.1.10');
+  assert.equal(pkg.version, '0.1.12');
+  assert.equal(tauri.version, '0.1.12');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.10"/m);
-  assert.match(lock, /"version": "0\.1\.10"/);
+  assert.match(cargo, /^version = "0\.1\.12"/m);
+  assert.match(lock, /"version": "0\.1\.12"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.12"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -1551,6 +1553,105 @@ test('reordering by strip works', () => {
   });
   assert.deepEqual(Array.from(folderMove.items.map(it => it.name)), ['Trip', shots[1].name, shots[0].name]);
   assert.deepEqual(Array.from(C.playbackNames(folderMove.items)), [shots[1].name, shots[0].name]);
+});
+
+function missingFile() {
+  return {
+    id: 'gone',
+    type: 'image',
+    name: 'missing.jpg',
+    path: 'C:\\Users\\John\\Pictures\\missing.jpg',
+    missing: true,
+    unavailable: true
+  };
+}
+
+// [s0, missing, s1, s2, s3]. selectedItems is the Media Manager mi, which skips
+// the missing file, so [1, 2] is s1 and s2. Dropping them after s3 leaves the
+// missing file where it is.
+function playlistPastUnavailable(shots) {
+  return [shots[0], missingFile(), shots[1], shots[2], shots[3]];
+}
+
+function rowsForPlaylist(items) {
+  const h = C.PL_MEDIA_IMAGE_H;
+  return items.map((_, i) => ({
+    itemsIdx: i,
+    top: C.PL_PAD_Y + i * h,
+    height: h
+  }));
+}
+
+test('multi-select drag by the list handle moves past one unavailable item', () => {
+  const shots = whatsappShots(4);
+  const items = playlistPastUnavailable(shots);
+  const rows = rowsForPlaylist(items);
+  const moved = C.reorderByHandle({
+    items,
+    rows,
+    fromItemsIdx: 2,
+    clientY: rows[4].top + rows[4].height * 0.75,
+    selected: [1, 2]
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.clearedSelection, true);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[0].name, 'missing.jpg', shots[3].name, shots[1].name, shots[2].name
+  ]);
+  assert.equal(moved.items[1].unavailable, true);
+  assert.equal(moved.items[1], items[1]);
+});
+
+test('multi-select drag by the strip moves past one unavailable item', () => {
+  const shots = whatsappShots(4);
+  const items = playlistPastUnavailable(shots);
+  assert.deepEqual(Array.from(C.playbackNames(items)), [
+    shots[0].name, shots[1].name, shots[2].name, shots[3].name
+  ]);
+  const cell = C.STRIP_THUMB_W + C.STRIP_GAP;
+  const clientX = C.STRIP_PAD_X + 3 * cell + C.STRIP_THUMB_W / 2;
+  const moved = C.reorderByStrip({
+    items,
+    fromMediaIndex: 1,
+    clientX,
+    stripLeft: 0,
+    scrollLeft: 0,
+    selected: [1, 2]
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.hit.mediaIndex, 3);
+  assert.equal(moved.hit.after, true);
+  assert.equal(moved.clearedSelection, true);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[0].name, 'missing.jpg', shots[3].name, shots[1].name, shots[2].name
+  ]);
+  assert.equal(moved.items[1].unavailable, true);
+  assert.match(
+    pageHtml,
+    /function getMediaItems\(\) \{ return items\.filter\(it => it\.type !== 'folder' && !it\.unavailable && !it\.missing\); \}/
+  );
+});
+
+test('the slide on screen stays the same after a move', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  const beforeCur = 2;
+  const moved = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    selected: []
+  });
+  const next = C.playbackIndexAfterReorder(shots, beforeCur, moved.items);
+  assert.equal(C.playbackMedia(moved.items)[next].name, shots[2].name);
+  assert.notEqual(C.playbackMedia(moved.items)[beforeCur].name, shots[2].name);
+  const apply = pageHtml.slice(pageHtml.indexOf('function applyReorderResult'), pageHtml.indexOf('function plHitTest'));
+  assert.match(apply, /playbackIndexAfterReorder\(beforeItems, beforeCur, items\)/);
+  assert.equal(apply.includes('rebuildSlides(cur)'), false);
+  const assignAt = apply.indexOf('cur = nextCur');
+  const rebuildAt = apply.indexOf('rebuildSlides(nextCur)');
+  assert.ok(assignAt >= 0 && rebuildAt > assignAt);
 });
 
 test('clicking a strip thumbnail jumps to that slide', () => {

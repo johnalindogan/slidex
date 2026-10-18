@@ -2434,7 +2434,7 @@ let kbEnabled = true, kbZoomInt = 4.0, kbPanInt = 4.0, kbDirection = 'mix', kbEa
 let kbManualHold = false, kbVisual = null;
 
 /* ── Media helpers ── */
-function getMediaItems() { return items.filter(it => it.type !== 'folder' && !it.unavailable); }
+function getMediaItems() { return items.filter(it => it.type !== 'folder' && !it.unavailable && !it.missing); }
 function nextMI() { const len = getMediaItems().length; return reversePlay ? (cur - 1 + len) % len : (cur + 1) % len; }
 
 function makeItemId() {
@@ -5466,9 +5466,16 @@ function onReorderPointerEnd(e) {
 
 function applyReorderResult(result) {
   if (!result || !result.moved) return;
+  const beforeItems = items;
+  const beforeCur = cur;
   items = result.items;
   if (result.clearedSelection) selectedItems.clear();
-  rebuildSlides(cur);
+  const core = window.SlideXCore;
+  const nextCur = core && core.playbackIndexAfterReorder
+    ? core.playbackIndexAfterReorder(beforeItems, beforeCur, items)
+    : beforeCur;
+  cur = nextCur;
+  rebuildSlides(nextCur);
   if (!playlistChromeOpen()) buildPlRows();
   schedAutoSave();
   try { notifyPlaylistSync(); } catch (_) {}

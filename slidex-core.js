@@ -692,10 +692,18 @@
     return { items: out, missing: missing };
   }
 
+  /*
+   * Index stored in selectedItems. Media Manager rows (buildPlRows) assign `mi`
+   * only to a non-folder that is not unavailable and not missing; a missing file
+   * is shown in the list with mi -1 and is not part of the selection. The filmstrip
+   * and both reorder paths use this same index.
+   */
+  function countsForMediaIndex(it) {
+    return !!(it && it.type !== 'folder' && !it.unavailable && !it.missing);
+  }
+
   function slideshowItems(items) {
-    return (items || []).filter(function (it) {
-      return it && it.type !== 'folder' && !it.unavailable && !it.missing;
-    });
+    return (items || []).filter(countsForMediaIndex);
   }
 
   function isAltBackspaceReset(e) {
@@ -1315,17 +1323,14 @@
   }
 
   function playbackMedia(items) {
-    return (items || []).filter(function (it) {
-      return it && it.type !== 'folder' && !it.unavailable;
-    });
+    return slideshowItems(items);
   }
 
   function itemsIndexForPlayback(items, mediaIndex) {
     var n = 0;
     var list = items || [];
     for (var i = 0; i < list.length; i++) {
-      var it = list[i];
-      if (!it || it.type === 'folder' || it.unavailable) continue;
+      if (!countsForMediaIndex(list[i])) continue;
       if (n === mediaIndex) return i;
       n++;
     }
@@ -1359,10 +1364,9 @@
       var selIdxs = {};
       var mc = 0;
       for (var i = 0; i < list.length; i++) {
-        if (list[i] && list[i].type !== 'folder') {
-          if (selSet[mc]) selIdxs[i] = true;
-          mc++;
-        }
+        if (!countsForMediaIndex(list[i])) continue;
+        if (selSet[mc]) selIdxs[i] = true;
+        mc++;
       }
       if (!selIdxs[srcIdx]) {
         singleMoveItems(list, srcIdx, tgtIdx, after);
