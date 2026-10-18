@@ -35,7 +35,7 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 #ladvanced a,#lbupdates-link{color:rgba(255,255,255,.38);text-decoration:none;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.12);}
 #ladvanced a:hover,#lbupdates-link:hover{color:rgba(255,255,255,.65);border-bottom-color:rgba(255,255,255,.35);}
 #fi,#fiadd,#fiplist,#fiupd{display:none;}
-#viewer{display:none;flex-direction:column;width:100vw;height:100vh;}
+#viewer{display:none;flex-direction:column;width:100vw;flex:1;min-height:0;}
 #stage{position:relative;flex:1;overflow:hidden;background:#000;cursor:default;}
 #stage.ldrag{cursor:grabbing;}
 .sl{position:absolute;inset:0;opacity:0;}
@@ -160,7 +160,7 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 
 /* Media Dock styling */
 #media-dock {
-  display: flex;
+  display: none;
   flex-direction: column;
   background: var(--bg-glass);
   backdrop-filter: blur(18px);
@@ -176,6 +176,10 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 }
 #media-dock.collapsed {
   height: 64px;
+}
+/* Shown with the slideshow. Hidden on the landing page, where #viewer is not open. */
+#viewer[style*="flex"] ~ #media-dock {
+  display: flex;
 }
 #media-dock.expanded {
   height: 320px;
@@ -368,6 +372,7 @@ body.ssp-playlist-window #app {
 body.ssp-playlist-window #media-dock,
 body.ssp-playlist-window #media-dock.expanded,
 body.ssp-playlist-window #media-dock.collapsed {
+  display: flex !important;
   position: fixed;
   inset: 0;
   width: 100vw;
@@ -1049,8 +1054,9 @@ body.ssp-playlist-window #dock-toggle-btn {
       </button>
     </div>
   </div>
+</div>
 
-  <!-- Unified Media Dock -->
+  <!-- Unified Media Dock. Sibling of #viewer: playlist mode hides #viewer and must not hide this. -->
   <div id="media-dock" class="collapsed">
     <!-- Dock Header -->
     <div id="dock-hdr">
@@ -1089,7 +1095,6 @@ body.ssp-playlist-window #dock-toggle-btn {
       </div>
     </div>
   </div>
-</div>
 </div>
 
 <!-- Ken Burns modal -->
@@ -1791,25 +1796,52 @@ function tryBindPlaylistWindowClosed(attempt) {
   });
 }
 
+async function closePlaylistWebview() {
+  // Close through the webview API. A sync close_playlist_window invoke from
+  // the child deadlocks WebView2, so Dock restored the main panel and left
+  // the child open.
+  let closed = false;
+  try {
+    const WW = window.__TAURI__ && window.__TAURI__.webviewWindow;
+    if (SSP_IS_PLAYLIST_WINDOW && WW && typeof WW.getCurrentWebviewWindow === 'function') {
+      const cur = WW.getCurrentWebviewWindow();
+      if (cur && cur.label === 'playlist' && typeof cur.close === 'function') {
+        await cur.close();
+        closed = true;
+      }
+    }
+    if (!closed && WW && WW.WebviewWindow && typeof WW.WebviewWindow.getByLabel === 'function') {
+      const w = await WW.WebviewWindow.getByLabel('playlist');
+      if (w && typeof w.close === 'function') {
+        await w.close();
+        closed = true;
+      }
+    }
+  } catch (_) {}
+  if (!closed) {
+    try { await tauriInvoke('close_playlist_window'); } catch (_) {
+      try { window.close(); } catch (__) {}
+    }
+  }
+}
+
 async function dockPlaylistWindow() {
   if (SSP_IS_PLAYLIST_WINDOW) {
-    // Push latest state then ask main to restore chrome / close us.
+    // Push latest state, ask main to restore chrome, then close this window.
     try { await broadcastPlaylistSync(); } catch (_) {}
     try {
       if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
         await window.__TAURI__.event.emit('ssp-pl-dock', { origin: 'playlist' });
       }
     } catch (_) {}
-    try { await tauriInvoke('close_playlist_window'); } catch (_) {
-      try { window.close(); } catch (__) {}
-    }
+    await closePlaylistWebview();
     return;
   }
   // Main: close child if any and show dock.
   stopUndockSyncPush();
   playlistUndocked = false;
   applyUndockedMainChrome();
-  try { await tauriInvoke('close_playlist_window'); } catch (_) {}
+  try { await closePlaylistWebview(); } catch (_) {}
   dockExpanded = true;
   const dock = g('media-dock');
   if (dock) {
@@ -1893,6 +1925,8 @@ function initPlaylistWindowSync() {
         }
         g('bplt') && g('bplt').classList.add('on');
         renderPlaylist();
+        // The child's own close can fail; main must close the window too.
+        try { closePlaylistWebview(); } catch (_) {}
       }).catch(() => {});
     }
     return true;

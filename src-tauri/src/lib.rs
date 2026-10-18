@@ -1094,11 +1094,19 @@ async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Close the undocked Media Manager.
+///
+/// Must not run `close()` inside the command that the child is awaiting.
+/// On Windows that sync close deadlocks WebView2, Dock restores the main
+/// panel, and the child window stays open.
 #[tauri::command]
-fn close_playlist_window(app: AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("playlist") {
-        w.close().map_err(|e| e.to_string())?;
-    }
+async fn close_playlist_window(app: AppHandle) -> Result<(), String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(w) = handle.get_webview_window("playlist") {
+            let _ = w.close();
+        }
+    });
     Ok(())
 }
 
