@@ -174,9 +174,9 @@ pub(crate) fn ffmpeg_arguments(plan: &TvPlan, input: &Path, output: &Path) -> Ve
         "-b:v".into(),
         "35M".into(),
         "-maxrate".into(),
-        "40M".into(),
+        "36M".into(),
         "-bufsize".into(),
-        "40M".into(),
+        "36M".into(),
     ]);
     match plan.audio {
         AudioIn::Aac => args.extend(["-c:a".into(), "copy".into()]),
@@ -1911,8 +1911,8 @@ mod tests {
         assert!(has_pair(&square, "-level:v", "5.2"));
         assert!(has_pair(&square, "-pix_fmt", "yuv420p"));
         assert!(has_pair(&square, "-b:v", "35M"));
-        assert!(has_pair(&square, "-maxrate", "40M"));
-        assert!(has_pair(&square, "-bufsize", "40M"));
+        assert!(has_pair(&square, "-maxrate", "36M"));
+        assert!(has_pair(&square, "-bufsize", "36M"));
         assert!(has_pair(&square, "-movflags", "+faststart"));
         assert!(has_pair(&square, "-c:a", "copy"));
 
