@@ -692,10 +692,18 @@
     return { items: out, missing: missing };
   }
 
+  /*
+   * Index stored in selectedItems. Media Manager rows (buildPlRows) assign `mi`
+   * only to a non-folder that is not unavailable and not missing; a missing file
+   * is shown in the list with mi -1 and is not part of the selection. The filmstrip
+   * and both reorder paths use this same index.
+   */
+  function countsForMediaIndex(it) {
+    return !!(it && it.type !== 'folder' && !it.unavailable && !it.missing);
+  }
+
   function slideshowItems(items) {
-    return (items || []).filter(function (it) {
-      return it && it.type !== 'folder' && !it.unavailable && !it.missing;
-    });
+    return (items || []).filter(countsForMediaIndex);
   }
 
   function isAltBackspaceReset(e) {
@@ -1289,6 +1297,214 @@
     return d + sep + name;
   }
 
+  /*
+   * Playlist reorder is pointer-driven. On Windows, Tauri's native file-drop
+   * target (dragDropEnabled, default true) calls RegisterDragDrop on the
+   * WebView2 child HWND and replaces WebView2's drop target, so HTML5
+   * dragstart never fires. Pointer events still do. Native tauri://drag-drop
+   * stays on so Explorer drops keep real paths.
+   */
+  var STRIP_THUMB_W = 64;
+  var STRIP_GAP = 8;
+  var STRIP_PAD_X = 16;
+  var PL_PAD_Y = 12;
+  var PL_MEDIA_IMAGE_H = 78;
+  var REORDER_DRAG_THRESHOLD_PX = 4;
+  var EXPLORER_MEDIA_EXTS = {
+    jpg: 1, jpeg: 1, png: 1, gif: 1, webp: 1, bmp: 1, tif: 1, tiff: 1, ico: 1,
+    mp4: 1, mov: 1, webm: 1, m4v: 1, mkv: 1, avi: 1
+  };
+
+  function pointerPassedReorderThreshold(dx, dy, threshold) {
+    var t = (threshold == null || !isFinite(threshold)) ? REORDER_DRAG_THRESHOLD_PX : threshold;
+    var x = dx || 0;
+    var y = dy || 0;
+    return Math.sqrt(x * x + y * y) >= t;
+  }
+
+  function playbackMedia(items) {
+    return slideshowItems(items);
+  }
+
+  function itemsIndexForPlayback(items, mediaIndex) {
+    var n = 0;
+    var list = items || [];
+    for (var i = 0; i < list.length; i++) {
+      if (!countsForMediaIndex(list[i])) continue;
+      if (n === mediaIndex) return i;
+      n++;
+    }
+    return -1;
+  }
+
+  function singleMoveItems(list, srcIdx, tgtIdx, after) {
+    var tgtItem = list[tgtIdx];
+    var moved = list.splice(srcIdx, 1)[0];
+    var tgt = list.indexOf(tgtItem);
+    if (tgt < 0) tgt = Math.min(tgtIdx, list.length);
+    list.splice(after ? tgt + 1 : tgt, 0, moved);
+    return list;
+  }
+
+  function movePlaylistItems(items, srcIdx, tgtIdx, after, selectedMediaIndexes) {
+    var source = items || [];
+    if (srcIdx == null || tgtIdx == null) return { items: source.slice(), moved: false, clearedSelection: false };
+    srcIdx = srcIdx | 0;
+    tgtIdx = tgtIdx | 0;
+    if (srcIdx < 0 || tgtIdx < 0 || srcIdx >= source.length || tgtIdx >= source.length || srcIdx === tgtIdx) {
+      return { items: source.slice(), moved: false, clearedSelection: false };
+    }
+    var srcItem = source[srcIdx];
+    if (!srcItem) return { items: source.slice(), moved: false, clearedSelection: false };
+    var selected = selectedMediaIndexes || [];
+    var list = source.slice();
+    if (srcItem.type !== 'folder' && selected.length > 1) {
+      var selSet = {};
+      for (var s = 0; s < selected.length; s++) selSet[selected[s]] = true;
+      var selIdxs = {};
+      var mc = 0;
+      for (var i = 0; i < list.length; i++) {
+        if (!countsForMediaIndex(list[i])) continue;
+        if (selSet[mc]) selIdxs[i] = true;
+        mc++;
+      }
+      if (!selIdxs[srcIdx]) {
+        singleMoveItems(list, srcIdx, tgtIdx, after);
+        return { items: list, moved: true, clearedSelection: false };
+      }
+      var tgtItem = list[tgtIdx];
+      var moved = [];
+      var remaining = [];
+      for (var j = 0; j < list.length; j++) {
+        if (selIdxs[j]) moved.push(list[j]);
+        else remaining.push(list[j]);
+      }
+      var tgt = remaining.indexOf(tgtItem);
+      if (tgt < 0) tgt = remaining.length;
+      var at = after ? tgt + 1 : tgt;
+      for (var k = 0; k < moved.length; k++) remaining.splice(at + k, 0, moved[k]);
+      return { items: remaining, moved: true, clearedSelection: true };
+    }
+    singleMoveItems(list, srcIdx, tgtIdx, after);
+    return { items: list, moved: true, clearedSelection: false };
+  }
+
+  function listReorderHit(rows, clientY, listTop, scrollTop) {
+    if (!rows || !rows.length) return null;
+    var y = (clientY - (listTop || 0)) + (scrollTop || 0);
+    var i;
+    for (i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      if (y < row.top + row.height) {
+        return { rowIdx: i, itemsIdx: row.itemsIdx, after: y >= row.top + row.height / 2 };
+      }
+    }
+    var last = rows[rows.length - 1];
+    return { rowIdx: rows.length - 1, itemsIdx: last.itemsIdx, after: true };
+  }
+
+  function stackMediaRows(count, opts) {
+    var pad = opts && opts.padY != null ? opts.padY : PL_PAD_Y;
+    var h = opts && opts.height != null ? opts.height : PL_MEDIA_IMAGE_H;
+    var rows = [];
+    var top = pad;
+    for (var i = 0; i < count; i++) {
+      rows.push({ kind: 'media', itemsIdx: i, mi: i, top: top, height: h });
+      top += h;
+    }
+    return rows;
+  }
+
+  function reorderByHandle(opts) {
+    opts = opts || {};
+    var items = opts.items || [];
+    var hit = listReorderHit(opts.rows, opts.clientY, opts.listTop, opts.scrollTop);
+    if (!hit || hit.itemsIdx === opts.fromItemsIdx) {
+      return { items: items.slice(), hit: hit, moved: false, clearedSelection: false };
+    }
+    var moved = movePlaylistItems(items, opts.fromItemsIdx, hit.itemsIdx, hit.after, opts.selected);
+    moved.hit = hit;
+    return moved;
+  }
+
+  function stripReorderHit(clientX, stripLeft, scrollLeft, count, metrics) {
+    if (!count) return null;
+    var m = metrics || {};
+    var thumbW = m.thumbW || STRIP_THUMB_W;
+    var gap = m.gap == null ? STRIP_GAP : m.gap;
+    var padX = m.padX == null ? STRIP_PAD_X : m.padX;
+    var cell = thumbW + gap;
+    var x = (clientX - (stripLeft || 0)) + (scrollLeft || 0) - padX;
+    if (x < 0) return { mediaIndex: 0, after: false };
+    var i = Math.floor(x / cell);
+    if (i >= count) return { mediaIndex: count - 1, after: true };
+    var within = x - i * cell;
+    return { mediaIndex: i, after: within >= thumbW / 2 };
+  }
+
+  function reorderByStrip(opts) {
+    opts = opts || {};
+    var items = opts.items || [];
+    var media = playbackMedia(items);
+    var hit = stripReorderHit(opts.clientX, opts.stripLeft, opts.scrollLeft, media.length, opts.metrics);
+    var src = itemsIndexForPlayback(items, opts.fromMediaIndex);
+    if (!hit || src < 0) return { items: items.slice(), hit: hit, moved: false, clearedSelection: false };
+    var tgt = itemsIndexForPlayback(items, hit.mediaIndex);
+    if (tgt < 0 || tgt === src) return { items: items.slice(), hit: hit, moved: false, clearedSelection: false };
+    var moved = movePlaylistItems(items, src, tgt, hit.after, opts.selected);
+    moved.hit = hit;
+    return moved;
+  }
+
+  function stepMediaIndex(len, cur, reverse) {
+    len = len | 0;
+    if (!len) return 0;
+    var c = ((cur % len) + len) % len;
+    return reverse ? (c - 1 + len) % len : (c + 1) % len;
+  }
+
+  function playbackIndexAfterReorder(beforeItems, beforeCur, afterItems) {
+    var before = playbackMedia(beforeItems);
+    var after = playbackMedia(afterItems);
+    var curItem = before[beforeCur];
+    var nc = curItem ? after.indexOf(curItem) : -1;
+    if (nc < 0) nc = beforeCur || 0;
+    if (!after.length) return 0;
+    return Math.max(0, Math.min(nc, after.length - 1));
+  }
+
+  function playbackNames(items, start, steps, reverse) {
+    var media = playbackMedia(items);
+    var out = [];
+    if (!media.length) return out;
+    var i = ((start || 0) % media.length + media.length) % media.length;
+    var n = steps == null ? media.length : steps;
+    for (var k = 0; k < n; k++) {
+      out.push(media[i].name);
+      i = stepMediaIndex(media.length, i, !!reverse);
+    }
+    return out;
+  }
+
+  function planExplorerFileDrop(paths, state) {
+    var media = [];
+    var skipped = [];
+    (paths || []).forEach(function (p) {
+      if (p == null || p === '') return;
+      var s = String(p);
+      var norm = s.replace(/\\/g, '/');
+      var cut = norm.lastIndexOf('/');
+      var name = cut >= 0 ? norm.slice(cut + 1) : norm;
+      var dot = name.lastIndexOf('.');
+      var ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+      if (EXPLORER_MEDIA_EXTS[ext]) media.push(s);
+      else skipped.push(s);
+    });
+    var viewerOpen = !!(state && state.viewerOpen);
+    var itemCount = state && state.itemCount ? state.itemCount : 0;
+    return { media: media, skipped: skipped, append: !!(viewerOpen && itemCount > 0) };
+  }
+
   root.SlideXCore = {
     CROP_VERSION: CROP_VERSION,
     PLAYLIST_SSP_VERSION: PLAYLIST_SSP_VERSION,
@@ -1382,6 +1598,25 @@
     injectPngDate: injectPngDate,
     readDateTaken: readDateTaken,
     copyDateTaken: copyDateTaken,
-    joinPath: joinPath
+    joinPath: joinPath,
+    STRIP_THUMB_W: STRIP_THUMB_W,
+    STRIP_GAP: STRIP_GAP,
+    STRIP_PAD_X: STRIP_PAD_X,
+    PL_PAD_Y: PL_PAD_Y,
+    PL_MEDIA_IMAGE_H: PL_MEDIA_IMAGE_H,
+    REORDER_DRAG_THRESHOLD_PX: REORDER_DRAG_THRESHOLD_PX,
+    pointerPassedReorderThreshold: pointerPassedReorderThreshold,
+    playbackMedia: playbackMedia,
+    itemsIndexForPlayback: itemsIndexForPlayback,
+    movePlaylistItems: movePlaylistItems,
+    listReorderHit: listReorderHit,
+    stackMediaRows: stackMediaRows,
+    reorderByHandle: reorderByHandle,
+    stripReorderHit: stripReorderHit,
+    reorderByStrip: reorderByStrip,
+    stepMediaIndex: stepMediaIndex,
+    playbackIndexAfterReorder: playbackIndexAfterReorder,
+    playbackNames: playbackNames,
+    planExplorerFileDrop: planExplorerFileDrop
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
