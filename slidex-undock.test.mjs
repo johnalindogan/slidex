@@ -82,22 +82,96 @@ function extractFunction(src, name) {
   return '';
 }
 
-function assertDockClosesChild(html, lib) {
-  const closer = extractFunction(html, 'closePlaylistWebview');
-  assert.ok(closer, 'Dock has no closePlaylistWebview(); the child stays open after re-dock');
-  assert.match(closer, /getCurrentWebviewWindow\s*\(\s*\)/);
-  assert.match(closer, /\.close\s*\(\s*\)/);
+function extractRustFn(src, name) {
+  const at = src.indexOf('fn ' + name);
+  if (at < 0) return '';
+  const brace = src.indexOf('{', at);
+  let depth = 0;
+  for (let i = brace; i < src.length; i++) {
+    if (src[i] === '{') depth += 1;
+    else if (src[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return src.slice(at, i + 1);
+    }
+  }
+  return '';
+}
+
+function assertDockClosesChild(html) {
+  assert.doesNotMatch(
+    html,
+    /tauri:\/\/close-requested/,
+    'a close-requested listener on the playlist window prevents the close'
+  );
+  const bind = extractFunction(html, 'tryBindPlaylistWindowClosed');
+  assert.match(bind, /tauri:\/\/destroyed/, 're-dock must listen for tauri://destroyed');
+  assert.match(bind, /token !== _plBindToken/, 'destroyed re-dock is not guarded against a stale window');
+  const restore = extractFunction(html, 'restoreDockedMediaManager');
+  assert.match(restore, /if \(!playlistUndocked\) return/, 're-dock is not idempotent');
+  const destroy = extractFunction(html, 'destroyOwnPlaylistWindow');
+  assert.match(destroy, /getCurrentWebviewWindow\s*\(\s*\)/);
+  assert.match(destroy, /cur\.label === 'playlist'/);
+  assert.match(destroy, /\.destroy\s*\(\s*\)/);
+  assert.doesNotMatch(destroy, /\.close\s*\(\s*\)/);
   const dock = extractFunction(html, 'dockPlaylistWindow');
-  const playlistBranch = dock.split('if (SSP_IS_PLAYLIST_WINDOW)')[1] || '';
-  const mainBranch = playlistBranch.split('// Main:')[1] ? '' : playlistBranch;
-  assert.match(playlistBranch, /closePlaylistWebview\s*\(/, 'playlist Dock does not close the child webview');
-  assert.match(dock, /closePlaylistWebview\s*\(/);
-  assert.ok(mainBranch || dock.includes('closePlaylistWebview'), 'main Dock path must close the child too');
+  const playlistBranch = (dock.split('if (SSP_IS_PLAYLIST_WINDOW)')[1] || '').split('// Main:')[0];
+  assert.match(playlistBranch, /destroyOwnPlaylistWindow\s*\(/, 'playlist Dock does not destroy its own window');
+  assert.doesNotMatch(playlistBranch, /\.close\s*\(\s*\)/);
+  const mainBranch = dock.split('// Main:')[1] || '';
+  assert.match(mainBranch, /close_playlist_window/, 'main Dock path does not destroy the child');
+  assert.match(mainBranch, /restoreDockedMediaManager\s*\(/);
   const listenerAt = html.indexOf("listen('ssp-pl-dock'");
   assert.ok(listenerAt > 0, 'main window does not listen for ssp-pl-dock');
-  const listener = html.slice(listenerAt, listenerAt + 900);
-  assert.match(listener, /closePlaylistWebview\s*\(/, 'ssp-pl-dock restores the panel without closing the child');
-  assert.match(lib, /async fn close_playlist_window/, 'close_playlist_window is a sync command and deadlocks WebView2 when the child closes itself');
+  const listener = html.slice(listenerAt, listenerAt + 500);
+  assert.match(listener, /restoreDockedMediaManager\s*\(/, 'ssp-pl-dock does not re-dock');
+  assert.doesNotMatch(html, /closePlaylistWebview/);
+}
+
+function assertRustDestroy(lib) {
+  const close = extractRustFn(lib, 'close_playlist_window');
+  assert.match(close, /\.destroy\s*\(/);
+  assert.doesNotMatch(close, /\.close\s*\(/);
+  const afterDestroy = close.slice(close.indexOf('.destroy('));
+  assert.match(afterDestroy, /get_webview_window\("playlist"\)/, 'close does not check the label after destroy');
+  assert.match(close, /eprintln!/, 'destroy errors are discarded');
+  assert.doesNotMatch(close, /let _ =/);
+  const open = extractRustFn(lib, 'open_playlist_window');
+  const labelAt = open.indexOf('get_webview_window("playlist")');
+  const createAt = open.indexOf('WebviewWindowBuilder');
+  const lockAt = open.indexOf('gate.opening');
+  assert.ok(lockAt >= 0 && lockAt < createAt, 'undock has no lock before create');
+  assert.ok(labelAt >= 0 && labelAt < createAt, 'playlist label is not checked before create');
+}
+
+function assertDestroyPermission() {
+  const dir = new URL('./src-tauri/capabilities/', import.meta.url);
+  const files = fs.readdirSync(dir).filter((name) => name.endsWith('.json'));
+  const grants = [];
+  for (const name of files) {
+    const cap = JSON.parse(fs.readFileSync(new URL(name, dir), 'utf8'));
+    for (const perm of cap.permissions || []) {
+      const id = typeof perm === 'string' ? perm : perm && perm.identifier;
+      if (id === 'core:window:allow-destroy' || id === 'core:window:allow-close') {
+        grants.push({ file: name, id, windows: cap.windows || [] });
+      }
+    }
+  }
+  const destroy = grants.filter((grant) => grant.id === 'core:window:allow-destroy');
+  assert.equal(destroy.length, 1, 'core:window:allow-destroy must be granted once');
+  assert.deepEqual(destroy[0].windows, ['playlist'], 'destroy must be scoped to the playlist window, not every window');
+  for (const grant of grants) {
+    if (grant.id === 'core:window:allow-close') {
+      assert.deepEqual(grant.windows, ['playlist'], 'allow-close must be scoped to the playlist window');
+    }
+  }
+}
+
+function assertViewerClass(html) {
+  assert.doesNotMatch(html, /#viewer\[style\*="flex"\]/);
+  assert.match(html, /body\.ssp-viewer-open\s+#media-dock\s*\{[^}]*display\s*:\s*flex/);
+  const shown = extractFunction(html, 'setViewerShown');
+  assert.match(shown, /ssp-viewer-open/);
+  assert.match(shown, /classList\.toggle\('ssp-viewer-open'/);
 }
 
 function assertPlaylistDockVisible(html, label) {
@@ -117,10 +191,14 @@ test('playlist window shows #media-dock at non-zero size', () => {
   assertPlaylistDockVisible(ui, 'ui/index.html');
 });
 
-test('Dock closes the undocked child window', () => {
+test('Dock destroys the undocked child and re-docks on destroyed', () => {
   const html = readHtml('./SlideShowPro.html');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assertDockClosesChild(html, lib);
+  assertDockClosesChild(html);
+  assertRustDestroy(lib);
+  assertDestroyPermission();
+  assertViewerClass(html);
   const ui = fs.readFileSync(new URL('./ui/index.html', import.meta.url), 'utf8');
-  assertDockClosesChild(ui, lib);
+  assertDockClosesChild(ui);
+  assertViewerClass(ui);
 });

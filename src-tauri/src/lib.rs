@@ -1052,61 +1052,160 @@ fn read_text_file(path: String, allowed: State<'_, AllowedMedia>) -> Result<Stri
 }
 
 
-/// Open (or focus) the undocked Media Manager window.
+/// One undock at a time. A second click must not build another Media Manager
+/// while the first window is still opening or closing.
+struct PlaylistWindowGate {
+    opening: bool,
+    closing: bool,
+}
+
+static PLAYLIST_GATE: Mutex<PlaylistWindowGate> = Mutex::new(PlaylistWindowGate {
+    opening: false,
+    closing: false,
+});
+
+fn playlist_gate() -> std::sync::MutexGuard<'static, PlaylistWindowGate> {
+    PLAYLIST_GATE.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+struct ClearPlaylistOpening;
+
+impl Drop for ClearPlaylistOpening {
+    fn drop(&mut self) {
+        playlist_gate().opening = false;
+    }
+}
+
+/// Destroy a leftover playlist window and wait until its label is gone.
+/// Creating while that label still exists leaves a stray Media Manager.
+fn wait_until_playlist_destroyed(app: &AppHandle) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let existing = app.get_webview_window("playlist");
+        let closing = playlist_gate().closing;
+        if existing.is_none() && !closing {
+            return Ok(());
+        }
+        if let Some(window) = existing {
+            playlist_gate().closing = true;
+            match window.destroy() {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("[slideshowpro] undock could not destroy the previous playlist window: {e}");
+                }
+            }
+        }
+        if app.get_webview_window("playlist").is_none() {
+            playlist_gate().closing = false;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let msg = "playlist window was not destroyed before a new one could open".to_string();
+            eprintln!("[slideshowpro] {msg}");
+            return Err(msg);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Open the undocked Media Manager window.
 ///
 /// Must return promptly: on Windows, calling `WebviewWindowBuilder::build()`
 /// from a *sync* IPC command deadlocks (WebView2). Even in an async command,
 /// awaiting `build()` can leave the frontend `invoke` hanging. Schedule create
-/// on the async runtime and resolve the invoke immediately so main can set
-/// `playlistUndocked` / hide the dock without waiting for the child to load.
+/// on the async runtime and resolve the invoke immediately so main can hide
+/// the dock without waiting for the child to load.
+///
+/// If a playlist window already exists or is closing, it is destroyed and the
+/// new one is created only after `get_webview_window("playlist")` is empty.
+/// `opening` is the double-click lock.
 #[tauri::command]
 async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("playlist") {
-        let _ = w.show();
-        let _ = w.set_focus();
-        return Ok(());
+    {
+        let mut gate = playlist_gate();
+        if gate.opening {
+            return Ok(());
+        }
+        gate.opening = true;
     }
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Some(w) = handle.get_webview_window("playlist") {
-            let _ = w.show();
-            let _ = w.set_focus();
-            return;
-        }
-        if let Err(e) = WebviewWindowBuilder::new(
-            &handle,
-            "playlist",
-            WebviewUrl::App("index.html?sspWindow=playlist#sspWindow=playlist".into()),
-        )
-        .title("SlideX — Media Manager")
-        .inner_size(560.0, 820.0)
-        .min_inner_size(360.0, 420.0)
-        .resizable(true)
-        .focused(true)
-        .additional_browser_args(HIGH_PERF_BROWSER_ARGS)
-        .build()
-        {
-            eprintln!("[slideshowpro] open_playlist_window build failed: {e}");
+        let _clear = ClearPlaylistOpening;
+        // Label check before create: never build while "playlist" exists or is closing.
+        let ready = (|| -> Result<(), String> {
+            if handle.get_webview_window("playlist").is_some() || playlist_gate().closing {
+                wait_until_playlist_destroyed(&handle)?;
+            }
+            if handle.get_webview_window("playlist").is_some() {
+                let msg = "refusing to create a second playlist window".to_string();
+                eprintln!("[slideshowpro] {msg}");
+                return Err(msg);
+            }
+            WebviewWindowBuilder::new(
+                &handle,
+                "playlist",
+                WebviewUrl::App("index.html?sspWindow=playlist#sspWindow=playlist".into()),
+            )
+            .title("SlideX — Media Manager")
+            .inner_size(560.0, 820.0)
+            .min_inner_size(360.0, 420.0)
+            .resizable(true)
+            .focused(true)
+            .additional_browser_args(HIGH_PERF_BROWSER_ARGS)
+            .build()
+            .map_err(|e| {
+                let msg = format!("open_playlist_window build failed: {e}");
+                eprintln!("[slideshowpro] {msg}");
+                msg
+            })?;
+            Ok(())
+        })();
+        match ready {
+            Ok(()) => {
+                if let Err(e) = handle.emit("ssp-pl-ready", ()) {
+                    eprintln!("[slideshowpro] ssp-pl-ready emit failed: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("[slideshowpro] open_playlist_window failed: {e}");
+                if let Err(emit_err) = handle.emit("ssp-pl-open-failed", e) {
+                    eprintln!("[slideshowpro] ssp-pl-open-failed emit failed: {emit_err}");
+                }
+            }
         }
     });
 
     Ok(())
 }
 
-/// Close the undocked Media Manager.
+/// Destroy the undocked Media Manager.
 ///
-/// Must not run `close()` inside the command that the child is awaiting.
-/// On Windows that sync close deadlocks WebView2, Dock restores the main
-/// panel, and the child window stays open.
+/// `close()` asks the webview to close and any `close-requested` listener can
+/// veto it, so Dock restored the main panel and left the child open. `destroy()`
+/// removes the window. The command returns an error if the label is still registered.
 #[tauri::command]
 async fn close_playlist_window(app: AppHandle) -> Result<(), String> {
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Some(w) = handle.get_webview_window("playlist") {
-            let _ = w.close();
+    let Some(window) = app.get_webview_window("playlist") else {
+        playlist_gate().closing = false;
+        return Ok(());
+    };
+    playlist_gate().closing = true;
+    match window.destroy() {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("[slideshowpro] close_playlist_window destroy failed: {e}");
+            if app.get_webview_window("playlist").is_some() {
+                return Err(format!("close_playlist_window destroy failed: {e}"));
+            }
         }
-    });
+    }
+    if app.get_webview_window("playlist").is_some() {
+        let msg = "close_playlist_window: playlist window still exists after destroy".to_string();
+        eprintln!("[slideshowpro] {msg}");
+        return Err(msg);
+    }
+    playlist_gate().closing = false;
     Ok(())
 }
 

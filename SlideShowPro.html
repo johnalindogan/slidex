@@ -177,8 +177,8 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 #media-dock.collapsed {
   height: 64px;
 }
-/* Shown with the slideshow. Hidden on the landing page, where #viewer is not open. */
-#viewer[style*="flex"] ~ #media-dock {
+/* Shown with the slideshow. Hidden on the landing page, where the viewer is closed. */
+body.ssp-viewer-open #media-dock {
   display: flex;
 }
 #media-dock.expanded {
@@ -1176,6 +1176,11 @@ body.ssp-playlist-window #dock-toggle-btn {
 <script>
 const g = id => document.getElementById(id);
 const dz = g('dz'), fi = g('fi'), viewer = g('viewer'), stage = g('stage'), app = g('app');
+
+function setViewerShown(shown) {
+  if (viewer) viewer.style.display = shown ? 'flex' : 'none';
+  document.body.classList.toggle('ssp-viewer-open', !!shown);
+}
 const PICKER_OPTS = { multiple: true, types: [{ description: 'Images & Videos', accept: {
   'image/*': ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.tif','.tiff','.ico'],
   'video/*': ['.mp4','.mov','.webm','.mkv','.avi','.m4v'],
@@ -1729,19 +1734,49 @@ function applyUndockedMainChrome() {
   }
 }
 
+let _plUndocking = false;
+let _plBindToken = 0;
+let _plCloseBound = false;
+let _plReadySeen = 0;
+let _plReadyBound = 0;
+let _plOpenFailed = false;
+
+function invalidatePlaylistCloseBinding() {
+  _plBindToken++;
+  _plCloseBound = false;
+}
+
+/** Put the Media Manager back on the main window. A second call is a no-op. */
+function restoreDockedMediaManager() {
+  if (SSP_IS_PLAYLIST_WINDOW || _plUndocking) return;
+  _plCloseBound = false;
+  stopUndockSyncPush();
+  if (!playlistUndocked) return;
+  playlistUndocked = false;
+  applyUndockedMainChrome();
+  dockExpanded = true;
+  const dock = g('media-dock');
+  if (dock) {
+    dock.classList.add('expanded');
+    dock.classList.remove('collapsed');
+  }
+  const bplt = g('bplt');
+  if (bplt) bplt.classList.add('on');
+  renderPlaylist();
+  showToast('Media Manager docked.', 2000);
+}
+
 async function undockPlaylistWindow() {
-  if (SSP_IS_PLAYLIST_WINDOW) return;
+  if (SSP_IS_PLAYLIST_WINDOW || _plUndocking) return;
   if (!sspIsTauri()) {
     showToast('Undock requires the SlideX desktop app.', 3500);
     return;
   }
-  try {
-    await tauriInvoke('open_playlist_window');
-  } catch (e) {
-    console.warn(e);
-    showToast('Could not open playlist window: ' + (e && e.message ? e.message : e), 5000);
-    return;
-  }
+  _plUndocking = true;
+  _plOpenFailed = false;
+  // Drop the previous window's destroyed listener before it is destroyed,
+  // or that event re-docks the panel while the new window is opening.
+  invalidatePlaylistCloseBinding();
   playlistUndocked = true;
   dockExpanded = false;
   const dock = g('media-dock');
@@ -1750,106 +1785,96 @@ async function undockPlaylistWindow() {
     dock.classList.add('collapsed');
   }
   applyUndockedMainChrome();
+  try {
+    await tauriInvoke('open_playlist_window');
+  } catch (e) {
+    console.warn(e);
+    playlistUndocked = false;
+    applyUndockedMainChrome();
+    showToast('Could not open playlist window: ' + (e && e.message ? e.message : e), 5000);
+    return;
+  } finally {
+    _plUndocking = false;
+  }
+  if (_plOpenFailed) {
+    _plOpenFailed = false;
+    playlistUndocked = false;
+    applyUndockedMainChrome();
+    showToast('Could not open playlist window.', 5000);
+    return;
+  }
   notifyPlaylistSync();
   startUndockSyncPush();
-  // Detect close → dock chrome back without losing playlist state.
-  tryBindPlaylistWindowClosed();
+  if (_plReadySeen !== _plReadyBound) {
+    _plReadyBound = _plReadySeen;
+    tryBindPlaylistWindowClosed();
+  }
   showToast('Media Manager undocked.', 2200);
 }
 
-let _plCloseBound = false;
 function tryBindPlaylistWindowClosed(attempt) {
-  if (_plCloseBound || !window.__TAURI__) return;
+  if (!window.__TAURI__) return;
   const WW = window.__TAURI__.webviewWindow && window.__TAURI__.webviewWindow.WebviewWindow;
   if (!WW || !WW.getByLabel) return;
+  const token = _plBindToken;
   const n = attempt || 0;
   // open_playlist_window returns before build() finishes — retry until label exists.
   WW.getByLabel('playlist').then(w => {
+    if (token !== _plBindToken) return;
     if (!w) {
       if (n < 50) setTimeout(() => tryBindPlaylistWindowClosed(n + 1), 40);
       return;
     }
     if (_plCloseBound) return;
     _plCloseBound = true;
-    const onClosed = () => {
+    const onDestroyed = () => {
       _plCloseBound = false;
-      stopUndockSyncPush();
-      if (!playlistUndocked) return;
-      playlistUndocked = false;
-      applyUndockedMainChrome();
-      // Restore dock chrome expanded so toolbar/list return to main.
-      dockExpanded = true;
-      const dock = g('media-dock');
-      if (dock) {
-        dock.classList.add('expanded');
-        dock.classList.remove('collapsed');
-      }
-      const bplt = g('bplt');
-      if (bplt) bplt.classList.add('on');
-      renderPlaylist();
-      showToast('Media Manager docked.', 2000);
+      if (token !== _plBindToken) return;
+      restoreDockedMediaManager();
     };
-    try { w.once('tauri://destroyed', onClosed); } catch (_) {}
-    try { w.once('tauri://close-requested', onClosed); } catch (_) {}
-  }).catch(() => {
-    if (n < 50) setTimeout(() => tryBindPlaylistWindowClosed(n + 1), 40);
+    // destroyed only. A close-requested listener on this window prevents the close in Tauri 2.
+    try { w.once('tauri://destroyed', onDestroyed); }
+    catch (e) { console.warn('playlist destroyed listener failed', e); }
+  }).catch((e) => {
+    console.warn('playlist window lookup failed', e);
+    if (token === _plBindToken && n < 50) setTimeout(() => tryBindPlaylistWindowClosed(n + 1), 40);
   });
 }
 
-async function closePlaylistWebview() {
-  // Close through the webview API. A sync close_playlist_window invoke from
-  // the child deadlocks WebView2, so Dock restored the main panel and left
-  // the child open.
-  let closed = false;
-  try {
-    const WW = window.__TAURI__ && window.__TAURI__.webviewWindow;
-    if (SSP_IS_PLAYLIST_WINDOW && WW && typeof WW.getCurrentWebviewWindow === 'function') {
-      const cur = WW.getCurrentWebviewWindow();
-      if (cur && cur.label === 'playlist' && typeof cur.close === 'function') {
-        await cur.close();
-        closed = true;
-      }
-    }
-    if (!closed && WW && WW.WebviewWindow && typeof WW.WebviewWindow.getByLabel === 'function') {
-      const w = await WW.WebviewWindow.getByLabel('playlist');
-      if (w && typeof w.close === 'function') {
-        await w.close();
-        closed = true;
-      }
-    }
-  } catch (_) {}
-  if (!closed) {
-    try { await tauriInvoke('close_playlist_window'); } catch (_) {
-      try { window.close(); } catch (__) {}
-    }
+async function destroyOwnPlaylistWindow() {
+  const WW = window.__TAURI__ && window.__TAURI__.webviewWindow;
+  if (!(SSP_IS_PLAYLIST_WINDOW && WW && typeof WW.getCurrentWebviewWindow === 'function')) {
+    throw new Error('playlist destroy is only available in the Media Manager window');
   }
+  const cur = WW.getCurrentWebviewWindow();
+  if (!(cur && cur.label === 'playlist' && typeof cur.destroy === 'function')) {
+    throw new Error('playlist window has no destroy()');
+  }
+  await cur.destroy();
 }
 
 async function dockPlaylistWindow() {
   if (SSP_IS_PLAYLIST_WINDOW) {
-    // Push latest state, ask main to restore chrome, then close this window.
-    try { await broadcastPlaylistSync(); } catch (_) {}
+    // Push latest state, ask main to restore chrome, then destroy this window.
+    try { await broadcastPlaylistSync(); } catch (e) { console.warn('playlist sync before dock failed', e); }
     try {
       if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
         await window.__TAURI__.event.emit('ssp-pl-dock', { origin: 'playlist' });
       }
-    } catch (_) {}
-    await closePlaylistWebview();
+    } catch (e) { console.warn('ssp-pl-dock emit failed', e); }
+    try {
+      await destroyOwnPlaylistWindow();
+    } catch (e) {
+      console.warn('playlist destroy failed', e);
+      try { await tauriInvoke('close_playlist_window'); }
+      catch (err) { console.warn('close_playlist_window failed', err); }
+    }
     return;
   }
-  // Main: close child if any and show dock.
-  stopUndockSyncPush();
-  playlistUndocked = false;
-  applyUndockedMainChrome();
-  try { await closePlaylistWebview(); } catch (_) {}
-  dockExpanded = true;
-  const dock = g('media-dock');
-  if (dock) {
-    dock.classList.add('expanded');
-    dock.classList.remove('collapsed');
-  }
-  g('bplt') && g('bplt').classList.add('on');
-  renderPlaylist();
+  // Main: destroy the child if it is still open, and show the dock.
+  restoreDockedMediaManager();
+  try { await tauriInvoke('close_playlist_window'); }
+  catch (e) { console.warn('close_playlist_window failed', e); }
 }
 
 function enterPlaylistWindowShell() {
@@ -1865,7 +1890,7 @@ function enterPlaylistWindowShell() {
   // Hide landing / force app shell if present
   try {
     if (dz) dz.style.display = 'none';
-    if (viewer) viewer.style.display = 'none';
+    setViewerShown(false);
   } catch (_) {}
   const ctrls = g('ctrls');
   if (ctrls) ctrls.style.display = 'none';
@@ -1914,20 +1939,19 @@ function initPlaylistWindowSync() {
     }).catch(() => {});
     if (!SSP_IS_PLAYLIST_WINDOW) {
       window.__TAURI__.event.listen('ssp-pl-dock', () => {
-        stopUndockSyncPush();
-        playlistUndocked = false;
-        applyUndockedMainChrome();
-        dockExpanded = true;
-        const dock = g('media-dock');
-        if (dock) {
-          dock.classList.add('expanded');
-          dock.classList.remove('collapsed');
-        }
-        g('bplt') && g('bplt').classList.add('on');
-        renderPlaylist();
-        // The child's own close can fail; main must close the window too.
-        try { closePlaylistWebview(); } catch (_) {}
-      }).catch(() => {});
+        restoreDockedMediaManager();
+      }).catch((e) => { console.warn('ssp-pl-dock listen failed', e); });
+      window.__TAURI__.event.listen('ssp-pl-ready', () => {
+        _plReadySeen++;
+        if (!playlistUndocked) return;
+        _plReadyBound = _plReadySeen;
+        tryBindPlaylistWindowClosed();
+      }).catch((e) => { console.warn('ssp-pl-ready listen failed', e); });
+      window.__TAURI__.event.listen('ssp-pl-open-failed', (event) => {
+        console.warn('playlist window failed to open', event && event.payload);
+        _plOpenFailed = true;
+        if (!_plUndocking) restoreDockedMediaManager();
+      }).catch((e) => { console.warn('ssp-pl-open-failed listen failed', e); });
     }
     return true;
   }
@@ -4051,7 +4075,7 @@ async function restoreTauriSession(entries) {
     return hit;
   });
   dz.style.display = 'none';
-  viewer.style.display = 'flex';
+  setViewerShown(true);
   build(next);
   clearLoadStatus();
   if (typeof updateLocateButton === 'function') updateLocateButton();
@@ -4106,7 +4130,7 @@ async function restoreFromSnapshot(snap) {
   for (const { entry, handle } of withHandles) {
     resolved.push({ entry, handle: await ensureReadPermission(handle) });
   }
-  dz.style.display = 'none'; viewer.style.display = 'flex';
+  dz.style.display = 'none'; setViewerShown(true);
   const total = resolved.filter(r => r.handle).length;
   let unavailCount = 0;
   if (total === 0) {
@@ -4222,7 +4246,7 @@ g('bru').onclick = function() {
   g('tstrip').innerHTML = '';
   g('pllist').innerHTML = '';
   stage.classList.remove('hmax','vmax','hmax3','vmax3');
-  viewer.style.display = 'none'; dz.style.display = 'flex'; fi.value = '';
+  setViewerShown(false); dz.style.display = 'flex'; fi.value = '';
   clearLoadStatus();
   if (!ctrlsVisible) toggleControls();
   if (watchMode) toggleWatchMode();
@@ -4367,7 +4391,7 @@ async function ingestDecodedFiles(entries, opts) {
     if (item) {
       if (!shown) {
         dz.style.display = 'none';
-        viewer.style.display = 'flex';
+        setViewerShown(true);
         build([item]);
         shown = true;
       } else finishAdd([item], { light: true });
@@ -4510,7 +4534,7 @@ async function openMediaPaths(paths, opts) {
       if (gen !== folderIngestGen) { clearLoadStatus(); return; }
       if (chunk.length) {
         if (!shown) {
-          dz.style.display = 'none'; viewer.style.display = 'flex';
+          dz.style.display = 'none'; setViewerShown(true);
           build(chunk);
           shown = true;
         } else finishAdd(chunk, { light: true });
@@ -7134,7 +7158,7 @@ async function installPlaylistDocument(doc) {
       }
       byPath.set(hit.path, hit);
       if (!shown) {
-        dz.style.display = 'none'; viewer.style.display = 'flex';
+        dz.style.display = 'none'; setViewerShown(true);
         build([hit]);
         shown = true;
       } else finishAdd([hit], { light: true });
@@ -7163,7 +7187,7 @@ async function installPlaylistDocument(doc) {
     });
     return hit;
   });
-  dz.style.display = 'none'; viewer.style.display = 'flex';
+  dz.style.display = 'none'; setViewerShown(true);
   build(next);
   clearLoadStatus();
   updateLocateButton();
