@@ -745,17 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.11 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.13 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
+  const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.11');
-  assert.equal(tauri.version, '0.1.11');
+  assert.equal(pkg.version, '0.1.13');
+  assert.equal(tauri.version, '0.1.13');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.11"/m);
-  assert.match(lock, /"version": "0\.1\.11"/);
+  assert.match(cargo, /^version = "0\.1\.13"/m);
+  assert.match(lock, /"version": "0\.1\.13"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.13"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -1530,4 +1532,348 @@ test('a photo timer then a video FINISHED leaves cur on item 3', () => {
   assert.equal(sandbox.cur, 1);
   sandbox.applyFinished({ remote_event: 'finished', item_index: 3 });
   assert.equal(sandbox.cur, 2);
+});
+
+function whatsappShots(n) {
+  const items = [];
+  for (let i = 1; i <= n; i++) {
+    const name = `WhatsApp Image 2026-10-14 at 09.0${i}.0${i}.jpg`;
+    items.push({
+      id: `wa-${i}`,
+      type: 'image',
+      name,
+      path: `C:\\Users\\John\\Pictures\\${name}`
+    });
+  }
+  return items;
+}
+
+function shotNames(items) {
+  return items.map(it => it.name);
+}
+
+const pageHtml = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+const tauriConf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+
+test('reordering by handle works', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  assert.equal(C.pointerPassedReorderThreshold(2, 2), false);
+  assert.equal(pageHtml.includes('pointerPassedReorderThreshold'), true);
+  assert.equal(pageHtml.includes('reorderByHandle'), true);
+  assert.equal(pageHtml.includes("addEventListener('dragstart'"), false);
+  assert.equal(pageHtml.includes('div.draggable = true'), false);
+  const below = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[0].top + 2,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(below.moved, false);
+  assert.deepEqual(Array.from(shotNames(below.items)), shotNames(shots));
+  const moved = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.hit.after, true);
+  assert.equal(moved.hit.itemsIdx, 2);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[1].name, shots[2].name, shots[0].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name, shots[7].name
+  ]);
+  const multi = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[7].top + rows[7].height * 0.75,
+    selected: [0, 1]
+  });
+  assert.equal(multi.clearedSelection, true);
+  assert.deepEqual(Array.from(shotNames(multi.items)), [
+    shots[2].name, shots[3].name, shots[4].name, shots[5].name, shots[6].name, shots[7].name,
+    shots[0].name, shots[1].name
+  ]);
+});
+
+test('reordering by strip works', () => {
+  const shots = whatsappShots(8);
+  assert.equal(pageHtml.includes('reorderByStrip'), true);
+  const leftOfFirst = C.STRIP_PAD_X + C.STRIP_THUMB_W * 0.25;
+  const moved = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: 7,
+    clientX: leftOfFirst,
+    stripLeft: 0,
+    scrollLeft: 0
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.hit.mediaIndex, 0);
+  assert.equal(moved.hit.after, false);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[7].name, shots[0].name, shots[1].name, shots[2].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name
+  ]);
+  const withFolder = [
+    { type: 'folder', id: 'f', name: 'Trip' },
+    shots[0], shots[1]
+  ];
+  const folderMove = C.reorderByStrip({
+    items: withFolder,
+    fromMediaIndex: 1,
+    clientX: C.STRIP_PAD_X + C.STRIP_THUMB_W * 0.25,
+    stripLeft: 0,
+    scrollLeft: 0
+  });
+  assert.deepEqual(Array.from(folderMove.items.map(it => it.name)), ['Trip', shots[1].name, shots[0].name]);
+  assert.deepEqual(Array.from(C.playbackNames(folderMove.items)), [shots[1].name, shots[0].name]);
+});
+
+function missingFile() {
+  return {
+    id: 'gone',
+    type: 'image',
+    name: 'missing.jpg',
+    path: 'C:\\Users\\John\\Pictures\\missing.jpg',
+    missing: true,
+    unavailable: true
+  };
+}
+
+// [s0, missing, s1, s2, s3]. selectedItems is the Media Manager mi, which skips
+// the missing file, so [1, 2] is s1 and s2. Dropping them after s3 leaves the
+// missing file where it is.
+function playlistPastUnavailable(shots) {
+  return [shots[0], missingFile(), shots[1], shots[2], shots[3]];
+}
+
+function rowsForPlaylist(items) {
+  const h = C.PL_MEDIA_IMAGE_H;
+  return items.map((_, i) => ({
+    itemsIdx: i,
+    top: C.PL_PAD_Y + i * h,
+    height: h
+  }));
+}
+
+test('multi-select drag by the list handle moves past one unavailable item', () => {
+  const shots = whatsappShots(4);
+  const items = playlistPastUnavailable(shots);
+  const rows = rowsForPlaylist(items);
+  const moved = C.reorderByHandle({
+    items,
+    rows,
+    fromItemsIdx: 2,
+    clientY: rows[4].top + rows[4].height * 0.75,
+    selected: [1, 2]
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.clearedSelection, true);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[0].name, 'missing.jpg', shots[3].name, shots[1].name, shots[2].name
+  ]);
+  assert.equal(moved.items[1].unavailable, true);
+  assert.equal(moved.items[1], items[1]);
+});
+
+test('multi-select drag by the strip moves past one unavailable item', () => {
+  const shots = whatsappShots(4);
+  const items = playlistPastUnavailable(shots);
+  assert.deepEqual(Array.from(C.playbackNames(items)), [
+    shots[0].name, shots[1].name, shots[2].name, shots[3].name
+  ]);
+  const cell = C.STRIP_THUMB_W + C.STRIP_GAP;
+  const clientX = C.STRIP_PAD_X + 3 * cell + C.STRIP_THUMB_W / 2;
+  const moved = C.reorderByStrip({
+    items,
+    fromMediaIndex: 1,
+    clientX,
+    stripLeft: 0,
+    scrollLeft: 0,
+    selected: [1, 2]
+  });
+  assert.equal(moved.moved, true);
+  assert.equal(moved.hit.mediaIndex, 3);
+  assert.equal(moved.hit.after, true);
+  assert.equal(moved.clearedSelection, true);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[0].name, 'missing.jpg', shots[3].name, shots[1].name, shots[2].name
+  ]);
+  assert.equal(moved.items[1].unavailable, true);
+  assert.match(
+    pageHtml,
+    /function getMediaItems\(\) \{ return items\.filter\(it => it\.type !== 'folder' && !it\.unavailable && !it\.missing\); \}/
+  );
+});
+
+test('a single drag with nothing selected keeps the slide on screen', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  const beforeCur = 3;
+  const cell = C.STRIP_THUMB_W + C.STRIP_GAP;
+  const byHandle = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 1,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(byHandle.moved, true);
+  assert.equal(byHandle.clearedSelection, false);
+  const handleCur = C.playbackIndexAfterReorder(shots, beforeCur, byHandle.items);
+  assert.equal(C.playbackMedia(byHandle.items)[handleCur].name, shots[beforeCur].name);
+  const handleSelf = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: beforeCur,
+    clientY: rows[4].top + rows[4].height * 0.75,
+    listTop: 0,
+    scrollTop: 0,
+    selected: []
+  });
+  assert.equal(handleSelf.moved, true);
+  const handleSelfCur = C.playbackIndexAfterReorder(shots, beforeCur, handleSelf.items);
+  assert.equal(C.playbackMedia(handleSelf.items)[handleSelfCur].name, shots[beforeCur].name);
+  const byStrip = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: 1,
+    clientX: C.STRIP_PAD_X + 2 * cell + C.STRIP_THUMB_W * 0.75,
+    stripLeft: 0,
+    scrollLeft: 0,
+    selected: []
+  });
+  assert.equal(byStrip.moved, true);
+  assert.equal(byStrip.clearedSelection, false);
+  const stripCur = C.playbackIndexAfterReorder(shots, beforeCur, byStrip.items);
+  assert.equal(C.playbackMedia(byStrip.items)[stripCur].name, shots[beforeCur].name);
+  const stripSelf = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: beforeCur,
+    clientX: C.STRIP_PAD_X + 4 * cell + C.STRIP_THUMB_W * 0.75,
+    stripLeft: 0,
+    scrollLeft: 0,
+    selected: []
+  });
+  assert.equal(stripSelf.moved, true);
+  const stripSelfCur = C.playbackIndexAfterReorder(shots, beforeCur, stripSelf.items);
+  assert.equal(C.playbackMedia(stripSelf.items)[stripSelfCur].name, shots[beforeCur].name);
+});
+
+test('the slide on screen stays the same after a move', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  const beforeCur = 2;
+  const moved = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    selected: []
+  });
+  const next = C.playbackIndexAfterReorder(shots, beforeCur, moved.items);
+  assert.equal(C.playbackMedia(moved.items)[next].name, shots[2].name);
+  assert.notEqual(C.playbackMedia(moved.items)[beforeCur].name, shots[2].name);
+  const apply = pageHtml.slice(pageHtml.indexOf('function applyReorderResult'), pageHtml.indexOf('function plHitTest'));
+  assert.match(apply, /playbackIndexAfterReorder\(beforeItems, beforeCur, items\)/);
+  assert.equal(apply.includes('rebuildSlides(cur)'), false);
+  const assignAt = apply.indexOf('cur = nextCur');
+  const rebuildAt = apply.indexOf('rebuildSlides(nextCur)');
+  assert.ok(assignAt >= 0 && rebuildAt > assignAt);
+});
+
+test('clicking a strip thumbnail jumps to that slide', () => {
+  const thumb = pageHtml.slice(pageHtml.indexOf('function createStripThumb'), pageHtml.indexOf('function unmountStripThumb'));
+  assert.equal(thumb.includes('ti.onclick'), false);
+  assert.match(thumb, /tw\.addEventListener\('click', \(\) => goTo\(i\)\)/);
+  const start = pageHtml.slice(pageHtml.indexOf('function startPointerReorder'), pageHtml.indexOf('function onReorderPointerMove'));
+  assert.equal(start.includes('setPointerCapture'), false);
+  const move = pageHtml.slice(pageHtml.indexOf('function onReorderPointerMove'), pageHtml.indexOf('function onReorderPointerEnd'));
+  const thresholdAt = move.indexOf('pointerPassedReorderThreshold');
+  const captureAt = move.indexOf('setPointerCapture');
+  assert.ok(thresholdAt >= 0 && captureAt > thresholdAt);
+  const row = pageHtml.slice(pageHtml.indexOf('function createPlMediaRow'), pageHtml.indexOf('function plRowMatchesEl'));
+  assert.match(row, /goTo\(thisMI\)/);
+  assert.equal(row.includes('setPointerCapture'), false);
+  assert.match(row, /div\.onclick = e =>/);
+  assert.match(move, /maybeAutoScrollList\(e\.clientY\)/);
+  assert.equal(C.pointerPassedReorderThreshold(0, 0), false);
+  assert.equal(C.pointerPassedReorderThreshold(3, 0), false);
+  assert.equal(C.pointerPassedReorderThreshold(4, 0), true);
+});
+
+test('new order holds after Next/Prev and after save and reopen', () => {
+  const shots = whatsappShots(8);
+  const rows = C.stackMediaRows(shots.length);
+  const moved = C.reorderByHandle({
+    items: shots,
+    rows,
+    fromItemsIdx: 0,
+    clientY: rows[2].top + rows[2].height * 0.75,
+    selected: []
+  });
+  const cur = C.playbackIndexAfterReorder(shots, 0, moved.items);
+  assert.equal(C.playbackMedia(moved.items)[cur].name, shots[0].name);
+  const next = C.stepMediaIndex(C.playbackMedia(moved.items).length, cur, false);
+  const prev = C.stepMediaIndex(C.playbackMedia(moved.items).length, next, true);
+  assert.equal(C.playbackMedia(moved.items)[next].name, shots[3].name);
+  assert.equal(prev, cur);
+  assert.deepEqual(Array.from(shotNames(moved.items)), [
+    shots[1].name, shots[2].name, shots[0].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name, shots[7].name
+  ]);
+  assert.equal(pageHtml.includes('items = result.items'), true);
+  assert.equal(pageHtml.includes('schedAutoSave()'), true);
+  const doc = C.buildPlaylistDocument({ items: moved.items, savedAt: 1 });
+  const opened = C.planSessionRestore(C.normalizePlaylist(JSON.parse(JSON.stringify(doc))).items, () => true);
+  assert.deepEqual(Array.from(opened.items.map(it => it.path)), moved.items.map(it => it.path));
+  assert.deepEqual(Array.from(opened.items.map(it => it.name)), Array.from(shotNames(moved.items)));
+  assert.equal(opened.missing, 0);
+});
+
+test('playback follows the new order', () => {
+  const shots = whatsappShots(8);
+  const moved = C.reorderByStrip({
+    items: shots,
+    fromMediaIndex: 7,
+    clientX: C.STRIP_PAD_X + C.STRIP_THUMB_W * 0.25,
+    stripLeft: 0,
+    scrollLeft: 0
+  });
+  const order = [
+    shots[7].name, shots[0].name, shots[1].name, shots[2].name,
+    shots[3].name, shots[4].name, shots[5].name, shots[6].name
+  ];
+  assert.deepEqual(Array.from(C.playbackNames(moved.items, 0, 8, false)), order);
+  const len = C.playbackMedia(moved.items).length;
+  assert.equal(C.playbackNames(moved.items, C.stepMediaIndex(len, 7, false), 1, false)[0], order[0]);
+  assert.equal(C.playbackNames(moved.items, 0, 8, true)[1], order[7]);
+});
+
+test('dropping files from Explorer still works', () => {
+  assert.equal(tauriConf.app.windows[0].dragDropEnabled, true);
+  assert.equal(pageHtml.includes('tauri://drag-drop'), true);
+  assert.equal(pageHtml.includes('planExplorerFileDrop'), true);
+  assert.equal(pageHtml.includes('openMediaPaths(media'), true);
+  const shots = whatsappShots(8).map(it => it.path);
+  const dropped = shots.concat(['C:\\Users\\John\\Desktop\\notes.txt']);
+  const ontoShow = C.planExplorerFileDrop(dropped, { viewerOpen: true, itemCount: 8 });
+  assert.deepEqual(Array.from(ontoShow.media), shots);
+  assert.deepEqual(Array.from(ontoShow.skipped), ['C:\\Users\\John\\Desktop\\notes.txt']);
+  assert.equal(ontoShow.append, true);
+  const ontoEmpty = C.planExplorerFileDrop(dropped, { viewerOpen: false, itemCount: 0 });
+  assert.equal(ontoEmpty.append, false);
+  assert.equal(ontoEmpty.media.length, 8);
+  const empty = C.planExplorerFileDrop([], { viewerOpen: true, itemCount: 3 });
+  assert.equal(empty.media.length, 0);
+  assert.equal(empty.append, true);
 });

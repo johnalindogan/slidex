@@ -1442,11 +1442,19 @@ fn container_token(path: &Path) -> String {
 
 fn shown_skip(reasons: String, copy_failed: bool, ffmpeg_missing: bool) -> String {
     if ffmpeg_missing {
-        tv_copy::FFMPEG_MISSING.to_string()
-    } else if copy_failed {
-        cast_panel_message(CastPanelCause::CopyFailed)
+        return tv_copy::FFMPEG_MISSING.to_string();
+    }
+    if !copy_failed {
+        return reasons;
+    }
+    let failed = cast_panel_message(CastPanelCause::CopyFailed);
+    if reasons.is_empty() || reasons == failed {
+        return failed;
+    }
+    if reasons.ends_with('.') || reasons.ends_with('…') {
+        format!("{reasons} {failed}")
     } else {
-        reasons
+        format!("{reasons}. {failed}")
     }
 }
 
@@ -1483,9 +1491,23 @@ fn unverifiable(reason: CastPanelCause, path: &Path, log: bool) -> CastVideoDeci
 
 fn join_skip_notes(notes: &[String]) -> Option<String> {
     if notes.is_empty() {
+        return None;
+    }
+    let mut kept = Vec::with_capacity(notes.len());
+    let mut saw_missing = false;
+    for note in notes {
+        if note == tv_copy::FFMPEG_MISSING {
+            if saw_missing {
+                continue;
+            }
+            saw_missing = true;
+        }
+        kept.push(note.clone());
+    }
+    if kept.is_empty() {
         None
     } else {
-        Some(notes.join(". "))
+        Some(kept.join(". "))
     }
 }
 
@@ -6985,6 +7007,9 @@ mod tests {
         assert!(classify_playlist_file(&mkv).is_err());
         assert!(classify_playlist_file(&webm).is_err());
         assert!(classify_playlist_file(&truncated).is_err());
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Fail(
+            "encoder rejected the settings".into(),
+        ));
         let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
         let update = http
             .set_playlist(&[
@@ -7003,16 +7028,31 @@ mod tests {
             "{:?}",
             update.skipped
         );
-        let (succ, note) = http.next_castable(1);
+        let (succ, preparing) = http.next_castable(1);
         let succ = succ.expect("the photo after the unverifiable videos");
         assert_eq!(succ.item, 5);
         assert_eq!(succ.media_type, "photo");
-        let note = note.expect("skip notes");
         assert_eq!(
-            note,
-            "ffmpeg is missing. ffmpeg is missing. ffmpeg is missing"
+            preparing.as_deref(),
+            Some("Preparing for TV…. Preparing for TV…. Preparing for TV…")
         );
+        assert!(
+            tv_copy::wait_until_settled(Duration::from_secs(5)),
+            "the failing encoder did not finish"
+        );
+        let (succ, note) = http.next_castable(1);
+        let succ = succ.expect("still the photo");
+        assert_eq!(succ.item, 5);
+        let note = note.expect("skip notes");
+        assert!(note.contains("The TV can't play this MKV as-is."), "{note}");
+        assert!(note.contains("The TV can't play this WEBM as-is."), "{note}");
+        assert!(
+            note.contains("This video is still being written, or it has no moov index yet."),
+            "{note}"
+        );
+        assert!(note.contains("The TV copy failed."), "{note}");
         assert!(!note.contains("Unsupported media"), "{note}");
+        assert!(!note.contains(tv_copy::FFMPEG_MISSING), "{note}");
         let written = log.text();
         assert!(written.contains("skip reason=cant_play container=MKV"), "{written}");
         assert!(written.contains("skip reason=cant_play container=WEBM"), "{written}");
@@ -7074,6 +7114,9 @@ mod tests {
     #[test]
     fn auto_advance_skips_an_unsupported_video_and_logs_it() {
         let log = LogDir::new();
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Fail(
+            "encoder rejected the settings".into(),
+        ));
         let photo = scratch("one.jpg", &jpeg_bytes());
         let bad = scratch(
             "skip-me.mp4",
@@ -7097,7 +7140,14 @@ mod tests {
         let succ = succ.expect("the photo after the bad video");
         assert_eq!(succ.item, 3);
         assert_eq!(succ.media_type, "photo");
-        assert_eq!(skipped.as_deref(), Some(tv_copy::FFMPEG_MISSING));
+        assert_eq!(skipped.as_deref(), Some(tv_copy::PREPARING_TV));
+        assert!(tv_copy::wait_until_settled(Duration::from_secs(5)));
+        let (again, skipped) = http.next_castable(1);
+        assert_eq!(again.expect("still the photo").item, 3);
+        assert_eq!(
+            skipped.as_deref(),
+            Some("H.264 level 6.0 may not play on this TV. The TV copy failed.")
+        );
         let written = log.text();
         assert!(written.contains("video_skipped"), "{written}");
         assert!(written.contains("item=2"), "{written}");
@@ -7181,6 +7231,45 @@ mod tests {
     }
 
     #[test]
+    fn missing_ffmpeg_is_one_panel_line() {
+        let log = LogDir::new();
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Missing);
+        let photo = scratch("one.jpg", &jpeg_bytes());
+        let mkv = scratch("clip.mkv", b"\x1a\x45\xdf\xa3");
+        let webm = scratch("clip.webm", b"\x1a\x45\xdf\xa3");
+        let mut cut = h264_clip(1920, 1080, 30, 1, Some(40), Some(8_000_000));
+        cut.truncate(cut.len().saturating_sub(32));
+        let truncated = scratch("cut.mp4", &cut);
+        let after = scratch("two.jpg", &jpeg_bytes());
+        let http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
+        http.set_playlist(&[photo, mkv, webm, truncated, after])
+            .unwrap();
+        let (succ, note) = http.next_castable(1);
+        assert_eq!(succ.expect("the next photo").item, 5);
+        assert_eq!(note.as_deref(), Some(tv_copy::FFMPEG_MISSING));
+        assert_eq!(note.unwrap().matches("ffmpeg is missing").count(), 1);
+        let written = log.text();
+        assert!(
+            written.contains("reasons=The TV can't play this MKV as-is."),
+            "{written}"
+        );
+        assert!(
+            written.contains("reasons=The TV can't play this WEBM as-is."),
+            "{written}"
+        );
+        assert!(
+            written.contains(
+                "reasons=This video is still being written, or it has no moov index yet."
+            ),
+            "{written}"
+        );
+        assert!(
+            !written.contains("tv_copy start"),
+            "a missing ffmpeg does not start a copy: {written}"
+        );
+    }
+
+    #[test]
     fn missing_ffmpeg_fails_closed_without_loading() {
         let _scope = tv_cache_scope(tv_copy::TestEncoder::Missing);
         let (log, fake, result, live) = drive_load(
@@ -7198,7 +7287,7 @@ mod tests {
         );
         let written = log.text();
         assert!(
-            written.contains("tv_copy fail item=1 err=ffmpeg is missing"),
+            written.contains("tv_copy fail item=1 err=ffmpeg is missing."),
             "{written}"
         );
         assert!(written.contains("encoder=libx264"), "{written}");
@@ -7235,7 +7324,10 @@ mod tests {
         assert_eq!(written.matches("tv_copy start").count(), 1, "{written}");
         let (again, note) = http.next_castable(1);
         assert_eq!(again.expect("still the photo").item, 3);
-        assert_eq!(note.as_deref(), Some("The TV copy failed."));
+        assert_eq!(
+            note.as_deref(),
+            Some("H.264 level 5.3 may not play on this TV. The TV copy failed.")
+        );
         let written = log.text();
         assert_eq!(written.matches("tv_copy start").count(), 1, "{written}");
     }
@@ -7265,7 +7357,10 @@ mod tests {
         let (again, note) = http.next_castable(1);
         let again = again.expect("photo");
         assert_eq!(again.item, 3);
-        assert_eq!(note.as_deref(), Some("The TV copy failed."));
+        assert_eq!(
+            note.as_deref(),
+            Some("The TV can't play this MKV as-is. The TV copy failed.")
+        );
         assert_ne!(again.item, 2);
     }
 
@@ -7344,6 +7439,16 @@ mod tests {
         name: &str,
         bytes: &[u8],
     ) -> (LogDir, FakeTv, Result<(), String>, CastLiveStatus) {
+        drive_loads(name, bytes, 1)
+    }
+
+    /// Load the same file `passes` times. Later passes wait until a TV copy
+    /// started by an earlier pass has settled.
+    fn drive_loads(
+        name: &str,
+        bytes: &[u8],
+        passes: usize,
+    ) -> (LogDir, FakeTv, Result<(), String>, CastLiveStatus) {
         let log = LogDir::new();
         let path = scratch(name, bytes);
         let mut http = MediaHttp::bind_on(Ipv4Addr::LOCALHOST, std::iter::once(0)).unwrap();
@@ -7368,24 +7473,34 @@ mod tests {
         flags.player_state = "idle".into();
         flags.item_index = 0;
         let mut running = true;
-        let (tx, rx) = mpsc::channel();
-        let kept = handle_cmd(
-            CastCmd::Load {
-                path,
-                autoplay: true,
-                origin: CastOrigin::User,
-                duration_ms: None,
-                reply: tx,
-            },
-            &mut http,
-            &link,
-            &mut flags,
-            &status,
-            &mut running,
-        );
-        assert!(kept);
-        let result = rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        let live = status.lock().unwrap().clone();
+        let mut result = Ok(());
+        let mut live = status.lock().unwrap().clone();
+        for pass in 0..passes.max(1) {
+            if pass > 0 {
+                assert!(
+                    tv_copy::wait_until_settled(Duration::from_secs(5)),
+                    "the TV copy did not settle before the next load"
+                );
+            }
+            let (tx, rx) = mpsc::channel();
+            let kept = handle_cmd(
+                CastCmd::Load {
+                    path: path.clone(),
+                    autoplay: true,
+                    origin: CastOrigin::User,
+                    duration_ms: None,
+                    reply: tx,
+                },
+                &mut http,
+                &link,
+                &mut flags,
+                &status,
+                &mut running,
+            );
+            assert!(kept);
+            result = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            live = status.lock().unwrap().clone();
+        }
         // Keep the link up until the reply is in hand. Drop order is the
         // return tuple, then these locals.
         let _ = link;
@@ -7414,12 +7529,19 @@ mod tests {
 
     #[test]
     fn level_above_5_2_load_sends_no_load_and_logs_video_skipped() {
-        let (log, fake, result, live) = drive_load(
+        let _scope = tv_cache_scope(tv_copy::TestEncoder::Fail(
+            "encoder rejected the settings".into(),
+        ));
+        let (log, fake, result, live) = drive_loads(
             "no-load.mp4",
             &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
+            2,
         );
         let err = result.expect_err("a level above 5.2 is not loaded");
-        assert_eq!(err, tv_copy::FFMPEG_MISSING);
+        assert_eq!(
+            err,
+            "H.264 level 5.3 may not play on this TV. The TV copy failed."
+        );
         assert!(live.connected);
         assert_eq!(live.error.as_deref(), Some(err.as_str()));
         let text = fake.trace_text();

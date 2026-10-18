@@ -32,7 +32,7 @@ const MAX_LONG_SIDE: u32 = 2160;
 
 /// Shown when the bundled ffmpeg.exe is not beside the app. The original
 /// file is not sent.
-pub(crate) const FFMPEG_MISSING: &str = "ffmpeg is missing";
+pub(crate) const FFMPEG_MISSING: &str = "ffmpeg is missing.";
 
 /// Encode rate and the cast-check cap for one output size. Both the ffmpeg
 /// arguments and the cast check read this table. The long side is
@@ -321,7 +321,7 @@ pub(crate) enum ForCast {
         /// The copy was attempted and failed. The panel says so, and `reasons`
         /// stays the original cast-check sentence for the log.
         copy_failed: bool,
-        /// ffmpeg.exe is not beside the app. The panel says `ffmpeg is missing`,
+        /// ffmpeg.exe is not beside the app. The panel says `ffmpeg is missing.`,
         /// and `reasons` stays the original cast-check sentence for the log.
         ffmpeg_missing: bool,
     },
@@ -2147,7 +2147,7 @@ mod tests {
         }
         let written = fs::read_to_string(logs.join("cast.log")).unwrap_or_default();
         assert_eq!(
-            written.matches("tv_copy fail item=4 err=ffmpeg is missing").count(),
+            written.matches("tv_copy fail item=4 err=ffmpeg is missing.").count(),
             1,
             "{written}"
         );
