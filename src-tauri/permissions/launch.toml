@@ -44,6 +44,11 @@ description = "Allow focusing the undocked Media Manager playlist window"
 commands.allow = ["focus_playlist_window"]
 
 [[permission]]
+identifier = "allow-playlist-log"
+description = "Allow the page to append a short line to the Media Manager timing log"
+commands.allow = ["playlist_log"]
+
+[[permission]]
 identifier = "allow-write-export-file"
 description = "Allow writing graded image/video/sidecar exports to a user-chosen path"
 commands.allow = ["write_export_file"]

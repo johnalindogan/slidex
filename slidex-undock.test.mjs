@@ -115,26 +115,45 @@ function assertDockClosesChild(html) {
   assert.doesNotMatch(destroy, /\.close\s*\(\s*\)/);
   const dock = extractFunction(html, 'dockPlaylistWindow');
   const playlistBranch = (dock.split('if (SSP_IS_PLAYLIST_WINDOW)')[1] || '').split('// Main:')[0];
+  const emitAt = playlistBranch.search(/emit\(\s*'ssp-pl-dock'\s*,\s*payload\s*\)/);
+  assert.ok(emitAt >= 0, 'Dock does not put the playlist in the ssp-pl-dock payload');
+  const beforeEmit = playlistBranch.slice(0, emitAt);
+  assert.match(beforeEmit, /stopPeriodicPlaylistSync\s*\(/, 'periodic sync is still running when Dock emits');
+  assert.match(beforeEmit, /getLiveSyncPayload\s*\(/, 'ssp-pl-dock does not carry the full playlist');
+  assert.doesNotMatch(beforeEmit, /\bawait\b/, 'ssp-pl-dock emit is awaited');
+  assert.doesNotMatch(playlistBranch, /broadcastPlaylistSync\s*\(/);
   const destroyAt = playlistBranch.search(/destroyOwnPlaylistWindow\s*\(/);
-  assert.ok(destroyAt >= 0, 'playlist Dock does not destroy its own window');
-  assert.doesNotMatch(playlistBranch.slice(0, destroyAt), /\bawait\b/, 'destroy() is queued behind an awaited push or event');
-  assert.doesNotMatch(playlistBranch, /broadcastPlaylistSync\s*\(|emit\(\s*'ssp-pl-dock'/);
-  assert.match(playlistBranch, /setTimeout\([\s\S]*?,\s*250\)/, 'JS destroy has no short fallback to close_playlist_window');
-  assert.match(playlistBranch, /close_playlist_window/);
+  assert.ok(destroyAt > emitAt, 'self-destroy backstop runs before the dock payload is sent');
+  assert.match(playlistBranch, /setTimeout\([\s\S]*?,\s*300\)/, 'child has no 300ms self-destroy backstop');
+  assert.doesNotMatch(playlistBranch, /close_playlist_window\s*\(/, 'child Dock closes itself before main applies the playlist');
   assert.doesNotMatch(playlistBranch, /\.close\s*\(\s*\)/);
+  const onDock = extractFunction(html, 'onPlaylistDock');
+  const applyAt = onDock.indexOf('applyLiveSync');
+  const restoreAt = onDock.indexOf('restoreDockedMediaManager');
+  const closeAt = onDock.indexOf('close_playlist_window');
+  assert.ok(applyAt >= 0 && restoreAt > applyAt && closeAt > restoreAt, 'main does not apply the playlist and then close_playlist_window');
+  assert.match(onDock, /payload\.snap/, 'main ignores the playlist carried on ssp-pl-dock');
   const undock = extractFunction(html, 'undockPlaylistWindow');
   assert.doesNotMatch(undock, /finally\s*\{[^}]*_plUndocking\s*=\s*false/, 'undock releases its lock before the window is ready');
+  assert.match(undock, /armUndockLockTimeout\s*\(/);
+  const arm = extractFunction(html, 'armUndockLockTimeout');
+  assert.match(arm, /setTimeout\([\s\S]*?,\s*5000\)/, 'undock lock has no 5s timeout');
+  assert.match(arm, /console\.warn/);
+  assert.match(arm, /_plUndocking\s*=\s*false/, '5s timeout does not release the undock lock');
+  assert.match(arm, /playlist_log/, '5s timeout is not written to the Rust log');
   const readyAt = html.indexOf("listen('ssp-pl-ready'");
   assert.match(html.slice(readyAt, readyAt + 500), /_plUndocking\s*=\s*false/);
+  assert.match(html.slice(readyAt, readyAt + 500), /clearUndockLockTimeout\s*\(/);
   const failedAt = html.indexOf("listen('ssp-pl-open-failed'");
   assert.match(html.slice(failedAt, failedAt + 500), /_plUndocking\s*=\s*false/);
+  assert.match(html.slice(failedAt, failedAt + 500), /clearUndockLockTimeout\s*\(/);
   const mainBranch = dock.split('// Main:')[1] || '';
   assert.match(mainBranch, /close_playlist_window/, 'main Dock path does not destroy the child');
   assert.match(mainBranch, /restoreDockedMediaManager\s*\(/);
   const listenerAt = html.indexOf("listen('ssp-pl-dock'");
   assert.ok(listenerAt > 0, 'main window does not listen for ssp-pl-dock');
   const listener = html.slice(listenerAt, listenerAt + 500);
-  assert.match(listener, /restoreDockedMediaManager\s*\(/, 'ssp-pl-dock does not re-dock');
+  assert.match(listener, /onPlaylistDock\s*\(/, 'ssp-pl-dock does not apply the playlist and close');
   assert.doesNotMatch(html, /closePlaylistWebview/);
 }
 
@@ -162,6 +181,40 @@ function assertRustDestroy(lib) {
   assert.doesNotMatch(wait, /thread::sleep/);
   assert.doesNotMatch(open, /thread::sleep/);
   assert.doesNotMatch(lib, /std::thread::sleep\(Duration::from_millis\(20\)\)/);
+  const waitCall = open.indexOf('wait_until_playlist_destroyed(');
+  assert.ok(waitCall > 0, 'open never waits for a leftover playlist window');
+  const someAt = open.lastIndexOf('is_some()', waitCall);
+  assert.ok(someAt > 0, 'the wait is not guarded by a playlist window still existing');
+  assert.doesNotMatch(
+    open.slice(someAt, waitCall),
+    /\|\|\s*playlist_gate\(\)\.closing/,
+    'a stale closing flag still enters the undock wait'
+  );
+  assert.match(open, /stale-closing-flag/);
+  assert.match(lib, /%LOCALAPPDATA%\\com\.johnalindogan\.slideshowpro\\logs\\slidex\.log/);
+  assert.match(lib, /app_log_dir/);
+  assert.match(lib, /slidex\.log/);
+  for (const line of [
+    'open start',
+    'open wait',
+    'open build',
+    'open ready',
+    'dock received',
+    'close called',
+    'destroyed',
+    'stale-closing-flag'
+  ]) {
+    assert.ok(lib.includes(line), 'missing timing log line: ' + line);
+  }
+  assert.match(lib, /WindowEvent::Destroyed/);
+  const destroyedAt = lib.indexOf('WindowEvent::Destroyed');
+  assert.match(lib.slice(destroyedAt, destroyedAt + 400), /closing = false/);
+  assert.match(lib, /fn playlist_log/);
+  const perms = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  assert.match(perms, /identifier = "allow-playlist-log"/);
+  assert.match(perms, /commands\.allow = \["playlist_log"\]/);
+  const cap = fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8');
+  assert.match(cap, /allow-playlist-log/);
 }
 
 function assertDestroyPermission() {
