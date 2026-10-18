@@ -1267,10 +1267,6 @@ const H264_LEVEL_TABLE: &[(u8, u32, u32)] = &[
 
 const UHD_W: u32 = 3840;
 const UHD_H: u32 = 2160;
-const FHD_W: u32 = 1920;
-const FHD_H: u32 = 1080;
-const BITRATE_FHD: u64 = 20_000_000;
-const BITRATE_UHD: u64 = 40_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VisualCodec {
@@ -1410,8 +1406,7 @@ fn decide_cast_video_logged(path: &Path, log: bool) -> CastVideoDecision {
         .bitrate
         .or_else(|| bitrate_from_file(file_len, probe.timescale, probe.duration));
     if let (Some(rate), true) = (bitrate, have_size) {
-        let above_fhd = !fits_box(probe.width, probe.height, FHD_W, FHD_H);
-        let cap = if above_fhd { BITRATE_UHD } else { BITRATE_FHD };
+        let cap = tv_copy::bitrate_tier(probe.width, probe.height).cast_cap_bps;
         if rate > cap {
             parts.push(format_mbit(rate, cap));
         }
@@ -1445,8 +1440,10 @@ fn container_token(path: &Path) -> String {
     }
 }
 
-fn shown_skip(reasons: String, copy_failed: bool) -> String {
-    if copy_failed {
+fn shown_skip(reasons: String, copy_failed: bool, ffmpeg_missing: bool) -> String {
+    if ffmpeg_missing {
+        tv_copy::FFMPEG_MISSING.to_string()
+    } else if copy_failed {
         cast_panel_message(CastPanelCause::CopyFailed)
     } else {
         reasons
@@ -2460,13 +2457,14 @@ impl MediaHttp {
                         derived,
                         reasons,
                         copy_failed,
+                        ffmpeg_missing,
                     } => {
                         log_level_derived(*page, derived.as_deref());
                         cast_log(
                             "video_skipped",
                             &format!("item={} reasons={reasons}", item_log_token(*page)),
                         );
-                        skipped.push(shown_skip(reasons, copy_failed));
+                        skipped.push(shown_skip(reasons, copy_failed, ffmpeg_missing));
                         continue;
                     }
                 }
@@ -5637,6 +5635,7 @@ fn handle_cmd(
                             derived,
                             reasons,
                             copy_failed,
+                            ffmpeg_missing,
                         } => {
                             log_level_derived(item, derived.as_deref());
                             cast_log(
@@ -5644,7 +5643,7 @@ fn handle_cmd(
                                 &format!("item={} reasons={reasons}", item_log_token(item)),
                             );
                             flags.pending_tv = None;
-                            return Err(shown_skip(reasons, copy_failed));
+                            return Err(shown_skip(reasons, copy_failed, ffmpeg_missing));
                         }
                     }
                 }
@@ -6778,6 +6777,105 @@ mod tests {
     }
 
     #[test]
+    fn each_bitrate_tier_passes_the_cast_check() {
+        fn flag<'a>(args: &'a [String], name: &str) -> &'a str {
+            args.windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1].as_str())
+                .unwrap_or("")
+        }
+        let low = tv_copy::bitrate_tier(1920, 1080);
+        assert_eq!(low.max_long_side, 1920);
+        assert_eq!(low.target_bps, 18_000_000);
+        assert_eq!(low.maxrate_bps, 19_000_000);
+        assert_eq!(low.bufsize_bps, 19_000_000);
+        assert_eq!(low.cast_cap_bps, 20_000_000);
+        let high = tv_copy::bitrate_tier(1922, 1080);
+        assert_eq!(tv_copy::bitrate_tier(1921, 1080).target_bps, 35_000_000);
+        assert_eq!(high.target_bps, 35_000_000);
+        assert_eq!(high.maxrate_bps, 36_000_000);
+        assert_eq!(high.bufsize_bps, 36_000_000);
+        assert_eq!(high.cast_cap_bps, 40_000_000);
+        assert!(low.maxrate_bps <= low.cast_cap_bps);
+        assert!(high.maxrate_bps <= high.cast_cap_bps);
+
+        // Source size, then the output size the tier and the cast check share.
+        // 2560×1440 stays 2560×1440. 2560×2560 scales to 2160×2160.
+        let cases = [
+            (1920, 1080, 1920, 1080, "18M", "19M"),
+            (1080, 1920, 1080, 1920, "18M", "19M"),
+            (1920, 1920, 1920, 1920, "18M", "19M"),
+            (1280, 720, 1280, 720, "18M", "19M"),
+            // Odd sides are already rounded down to even, so 1921 encodes as 1920.
+            (1921, 1080, 1920, 1080, "18M", "19M"),
+            (1922, 1080, 1922, 1080, "35M", "36M"),
+            (2560, 1440, 2560, 1440, "35M", "36M"),
+            (3840, 2160, 3840, 2160, "35M", "36M"),
+            (2560, 2560, 2160, 2160, "35M", "36M"),
+        ];
+        for (src_w, src_h, out_w, out_h, target, peak) in cases {
+            let plan = tv_copy::plan_tv(
+                src_w,
+                src_h,
+                30.0,
+                false,
+                tv_copy::AudioIn::Aac,
+                tv_copy::TvEncoder::Libx264,
+            );
+            assert_eq!(
+                (plan.width, plan.height),
+                (out_w, out_h),
+                "{src_w}x{src_h} scaling changed"
+            );
+            let tier = tv_copy::bitrate_tier(plan.width, plan.height);
+            let args = tv_copy::ffmpeg_arguments(&plan, Path::new("in.mp4"), Path::new("out.mp4"));
+            assert_eq!(flag(&args, "-b:v"), target, "{src_w}x{src_h}");
+            assert_eq!(flag(&args, "-maxrate"), peak, "{src_w}x{src_h}");
+            assert_eq!(flag(&args, "-bufsize"), peak, "{src_w}x{src_h}");
+            assert_eq!(flag(&args, "-b:v"), tv_copy::rate_token(tier.target_bps));
+            assert_eq!(flag(&args, "-maxrate"), tv_copy::rate_token(tier.maxrate_bps));
+            assert_eq!(flag(&args, "-bufsize"), tv_copy::rate_token(tier.bufsize_bps));
+            assert!(
+                args.iter().any(|arg| arg.contains(&format!("scale={out_w}:{out_h}"))),
+                "{args:?}"
+            );
+            let at_peak = scratch(
+                "tier.mp4",
+                &h264_clip(
+                    plan.width,
+                    plan.height,
+                    30,
+                    1,
+                    Some(51),
+                    Some(u32::try_from(tier.maxrate_bps).unwrap()),
+                ),
+            );
+            let peak_decision = decide_cast_video(&at_peak);
+            assert!(
+                peak_decision.skip.is_none(),
+                "{out_w}x{out_h} at {} bps failed the cast check: {:?}",
+                tier.maxrate_bps,
+                peak_decision.skip
+            );
+            let over = scratch(
+                "over.mp4",
+                &h264_clip(
+                    plan.width,
+                    plan.height,
+                    30,
+                    1,
+                    Some(51),
+                    Some(u32::try_from(tier.cast_cap_bps).unwrap() + 1),
+                ),
+            );
+            assert!(
+                decide_cast_video(&over).skip.is_some(),
+                "{out_w}x{out_h} one bit over the cap must fail"
+            );
+        }
+    }
+
+    #[test]
     fn each_cast_panel_reason_has_its_own_message() {
         let still = cast_panel_message(CastPanelCause::StillWriting);
         let checked = cast_panel_message(CastPanelCause::CheckFailed("box extends past its parent"));
@@ -6910,11 +7008,9 @@ mod tests {
         assert_eq!(succ.item, 5);
         assert_eq!(succ.media_type, "photo");
         let note = note.expect("skip notes");
-        assert!(note.contains("The TV can't play this MKV as-is."), "{note}");
-        assert!(note.contains("The TV can't play this WEBM as-is."), "{note}");
-        assert!(
-            note.contains("This video is still being written, or it has no moov index yet."),
-            "{note}"
+        assert_eq!(
+            note,
+            "ffmpeg is missing. ffmpeg is missing. ffmpeg is missing"
         );
         assert!(!note.contains("Unsupported media"), "{note}");
         let written = log.text();
@@ -7001,10 +7097,7 @@ mod tests {
         let succ = succ.expect("the photo after the bad video");
         assert_eq!(succ.item, 3);
         assert_eq!(succ.media_type, "photo");
-        assert_eq!(
-            skipped.as_deref(),
-            Some("H.264 level 6.0 may not play on this TV")
-        );
+        assert_eq!(skipped.as_deref(), Some(tv_copy::FFMPEG_MISSING));
         let written = log.text();
         assert!(written.contains("video_skipped"), "{written}");
         assert!(written.contains("item=2"), "{written}");
@@ -7095,7 +7188,7 @@ mod tests {
             &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
         );
         let err = result.expect_err("a missing encoder does not load the original");
-        assert_eq!(err, "H.264 level 5.3 may not play on this TV");
+        assert_eq!(err, tv_copy::FFMPEG_MISSING);
         assert_ne!(err, tv_copy::PREPARING_TV);
         assert_eq!(live.error.as_deref(), Some(err.as_str()));
         let text = fake.trace_text();
@@ -7105,10 +7198,15 @@ mod tests {
         );
         let written = log.text();
         assert!(
-            written.contains("tv_copy fail item=1 err=ffmpeg missing"),
+            written.contains("tv_copy fail item=1 err=ffmpeg is missing"),
             "{written}"
         );
+        assert!(written.contains("encoder=libx264"), "{written}");
         assert!(written.contains("video_skipped"), "{written}");
+        assert!(
+            written.contains("reasons=H.264 level 5.3 may not play on this TV"),
+            "{written}"
+        );
     }
 
     #[test]
@@ -7321,7 +7419,7 @@ mod tests {
             &h264_clip(1920, 1080, 30, 1, Some(53), Some(8_000_000)),
         );
         let err = result.expect_err("a level above 5.2 is not loaded");
-        assert_eq!(err, "H.264 level 5.3 may not play on this TV");
+        assert_eq!(err, tv_copy::FFMPEG_MISSING);
         assert!(live.connected);
         assert_eq!(live.error.as_deref(), Some(err.as_str()));
         let text = fake.trace_text();
@@ -7345,10 +7443,7 @@ mod tests {
             &h264_clip(2560, 2560, 90, 1, Some(51), Some(245_000_000)),
         );
         let err = result.expect_err("over the frame rate, size, and bitrate");
-        assert_eq!(
-            err,
-            "90 fps, 2560x2560 and 245 Mbit/s aren't supported by the TV"
-        );
+        assert_eq!(err, tv_copy::FFMPEG_MISSING);
         let written = log.text();
         assert!(
             written.contains(

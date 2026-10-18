@@ -30,6 +30,60 @@ const UHD_W: u32 = 3840;
 const UHD_H: u32 = 2160;
 const MAX_LONG_SIDE: u32 = 2160;
 
+/// Shown when the bundled ffmpeg.exe is not beside the app. The original
+/// file is not sent.
+pub(crate) const FFMPEG_MISSING: &str = "ffmpeg is missing";
+
+/// Encode rate and the cast-check cap for one output size. Both the ffmpeg
+/// arguments and the cast check read this table. The long side is
+/// `max(width, height)` of the frame that will be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BitrateTier {
+    /// This tier applies when the output's long side is at or below this.
+    pub max_long_side: u32,
+    pub target_bps: u64,
+    pub maxrate_bps: u64,
+    pub bufsize_bps: u64,
+    /// A bitrate above this fails the cast check.
+    pub cast_cap_bps: u64,
+}
+
+const BITRATE_TIERS: &[BitrateTier] = &[
+    BitrateTier {
+        max_long_side: 1920,
+        target_bps: 18_000_000,
+        maxrate_bps: 19_000_000,
+        bufsize_bps: 19_000_000,
+        cast_cap_bps: 20_000_000,
+    },
+    BitrateTier {
+        max_long_side: u32::MAX,
+        target_bps: 35_000_000,
+        maxrate_bps: 36_000_000,
+        bufsize_bps: 36_000_000,
+        cast_cap_bps: 40_000_000,
+    },
+];
+
+pub(crate) fn bitrate_tier(width: u32, height: u32) -> &'static BitrateTier {
+    let long = width.max(height);
+    BITRATE_TIERS
+        .iter()
+        .find(|tier| long <= tier.max_long_side)
+        .unwrap_or(&BITRATE_TIERS[BITRATE_TIERS.len() - 1])
+}
+
+pub(crate) fn rate_token(bps: u64) -> String {
+    format!("{}M", bps / 1_000_000)
+}
+
+/// Media Foundation's `h264_mf` rejects `-profile:v` (`Unable to parse "profile"`).
+/// `libx264`, `h264_qsv`, `h264_nvenc`, and `h264_amf` keep profile and level.
+/// The cast check of the finished file decides pass or fail.
+fn encoder_sets_profile_and_level(encoder: &str) -> bool {
+    encoder != "h264_mf"
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TvEncoder {
     Libx264,
@@ -136,6 +190,15 @@ fn even_down(n: u64) -> u32 {
 /// ffmpeg arguments for one TV copy, not including the executable.
 /// The output path is whatever the caller passes. Callers pass a cache path.
 pub(crate) fn ffmpeg_arguments(plan: &TvPlan, input: &Path, output: &Path) -> Vec<String> {
+    ffmpeg_arguments_for(plan, plan.encoder.as_str(), input, output)
+}
+
+fn ffmpeg_arguments_for(
+    plan: &TvPlan,
+    encoder: &str,
+    input: &Path,
+    output: &Path,
+) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -161,22 +224,27 @@ pub(crate) fn ffmpeg_arguments(plan: &TvPlan, input: &Path, output: &Path) -> Ve
         "0:a:0?".into()
     });
     args.push("-c:v".into());
-    args.push(plan.encoder.as_str().to_string());
+    args.push(encoder.to_string());
+    if encoder_sets_profile_and_level(encoder) {
+        args.extend([
+            "-profile:v".into(),
+            "high".into(),
+            "-level:v".into(),
+            "5.2".into(),
+        ]);
+    }
+    let tier = bitrate_tier(plan.width, plan.height);
     args.extend([
-        "-profile:v".into(),
-        "high".into(),
-        "-level:v".into(),
-        "5.2".into(),
         "-pix_fmt".into(),
         "yuv420p".into(),
         "-vf".into(),
         video_filter(plan),
         "-b:v".into(),
-        "35M".into(),
+        rate_token(tier.target_bps),
         "-maxrate".into(),
-        "36M".into(),
+        rate_token(tier.maxrate_bps),
         "-bufsize".into(),
-        "36M".into(),
+        rate_token(tier.bufsize_bps),
     ]);
     match plan.audio {
         AudioIn::Aac => args.extend(["-c:a".into(), "copy".into()]),
@@ -253,6 +321,9 @@ pub(crate) enum ForCast {
         /// The copy was attempted and failed. The panel says so, and `reasons`
         /// stays the original cast-check sentence for the log.
         copy_failed: bool,
+        /// ffmpeg.exe is not beside the app. The panel says `ffmpeg is missing`,
+        /// and `reasons` stays the original cast-check sentence for the log.
+        ffmpeg_missing: bool,
     },
 }
 
@@ -278,11 +349,13 @@ pub(crate) fn for_cast(path: &Path, item: u32) -> ForCast {
             derived,
             reasons,
             copy_failed: false,
+            ffmpeg_missing: true,
         },
         Ensure::EncodeFailed => ForCast::Skip {
             derived,
             reasons,
             copy_failed: true,
+            ffmpeg_missing: false,
         },
     }
 }
@@ -334,6 +407,17 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
     let part = cache_dir.join(format!("{key}.part.mp4"));
     {
         let mut hub = hub();
+        if matches!(encoder, ActiveEncoder::Missing) {
+            let first = !hub.failed.contains_key(&key);
+            if first {
+                note_failure(&mut hub, key.clone(), retry_unit);
+            }
+            drop(hub);
+            if first {
+                log_fail(item, FFMPEG_MISSING, configured_encoder().as_str());
+            }
+            return Ensure::GiveUp;
+        }
         if let Some(failure) = hub.failed.get(&key).cloned() {
             if Instant::now() < failure.retry_at {
                 return Ensure::EncodeFailed;
@@ -347,12 +431,6 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
         {
             return Ensure::Pending;
         }
-        if matches!(encoder, ActiveEncoder::Missing) {
-            note_failure(&mut hub, key, retry_unit);
-            drop(hub);
-            log_fail(item, "ffmpeg missing");
-            return Ensure::GiveUp;
-        }
         hub.jobs.insert(
             key.clone(),
             JobSlot {
@@ -364,9 +442,13 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
         );
     }
 
+    let encoder_name = configured_encoder().as_str().to_string();
     cast_log(
         "tv_copy",
-        &format!("start item={} reasons={reasons}", item_log_token(item)),
+        &format!(
+            "start item={} reasons={reasons} encoder={encoder_name}",
+            item_log_token(item)
+        ),
     );
     let log_dir = super::cast_log_override_dir();
     let limit = active_limit();
@@ -380,6 +462,7 @@ fn ensure_copy(path: &Path, item: u32, reasons: &str) -> Ensure {
         cache_dir,
         item,
         encoder,
+        encoder_name,
         limit,
         log_dir,
         started: Instant::now(),
@@ -462,7 +545,7 @@ fn fail_once(key: &str, item: u32, err: &str) -> Ensure {
     }
     note_failure(&mut hub, key.to_string(), retry_unit());
     drop(hub);
-    log_fail(item, err);
+    log_fail(item, err, configured_encoder().as_str());
     Ensure::EncodeFailed
 }
 
@@ -488,10 +571,14 @@ fn note_failure(hub: &mut Hub, key: String, unit: Duration) {
     );
 }
 
-fn log_fail(item: u32, err: &str) {
+fn log_fail(item: u32, err: &str, encoder: &str) {
     cast_log(
         "tv_copy",
-        &format!("fail item={} err={}", item_log_token(item), safe_err(err)),
+        &format!(
+            "fail item={} err={} encoder={encoder}",
+            item_log_token(item),
+            safe_err(err)
+        ),
     );
 }
 
@@ -574,6 +661,7 @@ struct JobSpec {
     cache_dir: PathBuf,
     item: u32,
     encoder: ActiveEncoder,
+    encoder_name: String,
     limit: u64,
     log_dir: Option<PathBuf>,
     started: Instant,
@@ -592,15 +680,16 @@ fn run_job(mut spec: JobSpec) {
             cast_log(
                 "tv_copy",
                 &format!(
-                    "done item={} ms={ms} bytes={bytes}",
-                    item_log_token(spec.item)
+                    "done item={} ms={ms} bytes={bytes} encoder={}",
+                    item_log_token(spec.item),
+                    spec.encoder_name
                 ),
             );
         }
         Err(err) => {
             let _ = fs::remove_file(&spec.part);
             let _ = fs::remove_file(&spec.dest);
-            log_fail(spec.item, err);
+            log_fail(spec.item, err, &spec.encoder_name);
         }
     }
     let mut hub = hub();
@@ -634,7 +723,7 @@ fn encode_job(spec: &JobSpec) -> Result<u64, String> {
         return Err("refusing to write next to the original".into());
     }
     match &spec.encoder {
-        ActiveEncoder::Missing => return Err("ffmpeg missing".into()),
+        ActiveEncoder::Missing => return Err(FFMPEG_MISSING.into()),
         ActiveEncoder::Fail(err) => {
             if !spec.encoder_delay().is_zero() {
                 thread::sleep(spec.encoder_delay());
@@ -1928,6 +2017,16 @@ mod tests {
 
         let phone = request(1080, 1920, 30.0, TvEncoder::Libx264);
         assert!(arg_value(&phone, "-vf").contains("scale=1080:1920"));
+        assert!(has_pair(&phone, "-b:v", "18M"));
+        assert!(has_pair(&phone, "-maxrate", "19M"));
+        assert!(has_pair(&phone, "-bufsize", "19M"));
+
+        let qhd = request(2560, 1440, 30.0, TvEncoder::Libx264);
+        assert!(arg_value(&qhd, "-vf").contains("scale=2560:1440"));
+        assert!(has_pair(&qhd, "-b:v", "35M"));
+        assert!(has_pair(&qhd, "-maxrate", "36M"));
+        let qhd_plan = plan_tv(2560, 1440, 30.0, false, AudioIn::Aac, TvEncoder::Libx264);
+        assert_eq!((qhd_plan.width, qhd_plan.height), (2560, 1440));
 
         let tall = request(2304, 4096, 50.0, TvEncoder::Libx264);
         let tall_vf = arg_value(&tall, "-vf");
@@ -1954,7 +2053,13 @@ mod tests {
         for encoder in [TvEncoder::H264Mf, TvEncoder::H264Nvenc, TvEncoder::H264Qsv] {
             let args = request(1280, 720, 30.0, encoder);
             assert!(has_pair(&args, "-c:v", encoder.as_str()), "{args:?}");
+            assert!(has_pair(&args, "-b:v", "18M"), "{args:?}");
         }
+        let mf = request(1920, 1080, 30.0, TvEncoder::H264Mf);
+        assert!(
+            !mf.windows(2).any(|pair| pair[0] == "-profile:v" || pair[0] == "-level:v"),
+            "h264_mf omits profile and level: {mf:?}"
+        );
 
         let ten_bit = plan_tv(1920, 1080, 24.0, true, AudioIn::Other, TvEncoder::H264Nvenc);
         let ten_bit_vf = arg_value(
@@ -1985,6 +2090,70 @@ mod tests {
         assert!(args.iter().any(|arg| arg.contains("anullsrc")));
         assert!(has_pair(&args, "-c:a", "aac"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
+    }
+
+    #[test]
+    fn h264_encoders_other_than_mf_keep_profile_and_level() {
+        let plan = plan_tv(1920, 1080, 24.0, false, AudioIn::Aac, TvEncoder::Libx264);
+        for name in ["libx264", "h264_qsv", "h264_nvenc", "h264_amf"] {
+            let args = ffmpeg_arguments_for(&plan, name, Path::new("in.mkv"), Path::new("out.mp4"));
+            assert!(has_pair(&args, "-c:v", name), "{args:?}");
+            assert!(has_pair(&args, "-profile:v", "high"), "{name}: {args:?}");
+            assert!(has_pair(&args, "-level:v", "5.2"), "{name}: {args:?}");
+        }
+        let mf = ffmpeg_arguments_for(
+            &plan,
+            "h264_mf",
+            Path::new("in.mkv"),
+            Path::new("out.mp4"),
+        );
+        assert!(has_pair(&mf, "-c:v", "h264_mf"));
+        assert!(
+            !mf.windows(2)
+                .any(|pair| pair[0] == "-profile:v" || pair[0] == "-level:v"),
+            "{mf:?}"
+        );
+        assert!(has_pair(&mf, "-b:v", "18M"));
+        assert!(has_pair(&mf, "-maxrate", "19M"));
+    }
+
+    #[test]
+    fn missing_ffmpeg_stays_fail_closed() {
+        let root = std::env::temp_dir().join(format!("slidex-tv-missing-{}", uuid_tail()));
+        let cache = root.join("cache");
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let _log = super::super::push_cast_log_dir(logs.clone());
+        let _scope = TestScope::new(cache, TestEncoder::Missing);
+        let src = root.join("clip.mkv");
+        fs::write(&src, b"\x1a\x45\xdf\xa3").unwrap();
+        let src = src.canonicalize().unwrap_or(src);
+        for _ in 0..2 {
+            match for_cast(&src, 4) {
+                ForCast::Skip {
+                    ffmpeg_missing,
+                    copy_failed,
+                    reasons,
+                    ..
+                } => {
+                    assert!(ffmpeg_missing);
+                    assert!(!copy_failed);
+                    assert!(reasons.contains("MKV"), "{reasons}");
+                }
+                ForCast::Original { .. } | ForCast::Copy { .. } | ForCast::Preparing { .. } => {
+                    panic!("a missing ffmpeg must not cast the original or start a copy");
+                }
+            }
+        }
+        let written = fs::read_to_string(logs.join("cast.log")).unwrap_or_default();
+        assert_eq!(
+            written.matches("tv_copy fail item=4 err=ffmpeg is missing").count(),
+            1,
+            "{written}"
+        );
+        assert!(written.contains("encoder=libx264"), "{written}");
+        assert!(!written.contains("tv_copy start"), "{written}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
