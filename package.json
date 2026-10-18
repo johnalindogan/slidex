@@ -1,11 +1,11 @@
 {
   "name": "slideshowpro",
-  "version": "0.1.13",
+  "version": "0.1.17",
   "private": true,
   "description": "Thin Tauri Windows wrapper + Android TV WebView shell for SlideX",
   "scripts": {
     "check-scripts": "node scripts/check-html-scripts.mjs",
-    "test": "node --test slidex-core.test.mjs",
+    "test": "node scripts/sync-ui.mjs && node --test slidex-core.test.mjs slidex-undock.test.mjs",
     "sync-ui": "node scripts/sync-ui.mjs",
     "sync-android": "node scripts/sync-android-ui.mjs",
     "tauri": "tauri",

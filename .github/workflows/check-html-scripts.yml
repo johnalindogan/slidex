@@ -15,7 +15,7 @@ jobs:
       - name: Syntax-check slideshow HTML inline scripts
         run: node scripts/check-html-scripts.mjs
       - name: Unit tests
-        run: node --test slidex-core.test.mjs
+        run: node scripts/sync-ui.mjs && node --test slidex-core.test.mjs slidex-undock.test.mjs
       - name: Check Cast firewall command quoting
         run: node scripts/cast-firewall-commands.mjs --check
 

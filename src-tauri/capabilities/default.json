@@ -25,6 +25,7 @@
     "allow-open-playlist-window",
     "allow-close-playlist-window",
     "allow-focus-playlist-window",
+    "allow-playlist-log",
     "allow-write-export-file",
     "allow-read-crop-sidecar",
     "allow-write-crop-sidecar",
