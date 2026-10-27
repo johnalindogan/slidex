@@ -409,7 +409,7 @@ body.ssp-main-undocked #media-dock {
 #plundock, #pldockback {
   display: none;
 }
-body.ssp-tauri #plundock {
+body.ssp-tauri.ssp-undock-enabled #plundock {
   display: inline-flex;
 }
 body.ssp-playlist-window #plundock {
@@ -712,6 +712,17 @@ body.ssp-playlist-window #dock-toggle-btn {
 .ctxi.danger{color:rgba(255,90,90,.85);}
 .ctxi.danger:hover{background:rgba(255,60,60,.15);color:rgb(255,100,100);}
 .ctxsep{height:.5px;background:rgba(255,255,255,.1);margin:3px 4px;}
+.ctxkbd{float:right;margin-left:12px;color:rgba(255,255,255,.45);font-size:10px;}
+#delConfirm{display:none;position:fixed;inset:0;z-index:600;background:rgba(0,0,0,.55);align-items:center;justify-content:center;font-family:system-ui,sans-serif;}
+#delConfirm.open{display:flex;}
+#delConfirmBox{width:min(460px,calc(100vw - 32px));background:#141414;border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:20px;color:rgba(255,255,255,.85);box-shadow:0 12px 40px rgba(0,0,0,.5);}
+#delConfirmBox h2{margin:0;font-size:15px;font-weight:700;color:#fff;}
+#delConfirmBody,#delConfirmWarn{margin:8px 0 0;font-size:13px;line-height:1.4;color:rgba(255,255,255,.72);}
+#delConfirmNames{margin-top:10px;font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;background:#0b0b0b;border-radius:6px;padding:8px 10px;color:rgba(255,255,255,.6);}
+#delConfirmActions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap;}
+#delConfirmActions button{background:transparent;border:1px solid rgba(255,255,255,.18);color:rgba(255,255,255,.85);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;}
+#delConfirmActions button:focus{outline:2px solid #fff;outline-offset:2px;}
+#delRecycle{color:#ffc2c2 !important;border-color:rgba(220,60,60,.85) !important;}
 
 /* Future modules */
 #plfuture{padding:12px 14px;border-top:.5px solid rgba(255,255,255,.07);flex-shrink:0;}
@@ -814,6 +825,12 @@ body.ssp-playlist-window #dock-toggle-btn {
 #castPanel input[type="number"]{flex:0 0 84px;min-width:72px;}
 #castPanel .hint{margin:0 0 6px;font-size:11px;color:#8ea0b8;}
 #castStatus{margin-top:8px;font-size:11px;color:#9aa8bc;min-height:2.6em;white-space:pre-wrap;}
+#castSteps,#castFail{margin-top:8px;}
+.cast-step{font-size:12px;color:rgba(255,255,255,.55);margin:3px 0;}
+.cast-step.current{color:#e8eef7;font-weight:700;}
+.cast-step.done{color:rgba(255,255,255,.75);}
+#castFailMsg{color:#ffc2c2;font-size:12px;line-height:1.4;white-space:pre-wrap;}
+#castDetails{font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;background:#0b0b0b;border-radius:6px;padding:8px;margin-top:8px;color:rgba(255,255,255,.6);}
 #castFirewall{margin-top:6px;font-size:11px;color:#b7c4d6;white-space:pre-wrap;}
 #lbcast,#bcast.cast-on{border-color:rgba(90,180,255,.55)!important;color:#9fd0ff!important;}
 #lbcast:disabled{border-color:rgba(255,255,255,.1)!important;color:inherit!important;}
@@ -1159,9 +1176,23 @@ body.ssp-playlist-window #dock-toggle-btn {
 <!-- Context menu -->
 <div id="ctxmenu">
   <div class="ctxi" id="ctx-dup">Duplicate in playlist</div>
-  <div class="ctxsep"></div>
   <div class="ctxi" id="ctx-remove">Remove from playlist</div>
-  <div class="ctxi danger" id="ctx-del">Delete file (clears settings)</div>
+  <div class="ctxsep" id="ctx-del-sep"></div>
+  <div class="ctxi danger" id="ctx-del" aria-keyshortcuts="Shift+Delete">Move file to Recycle Bin… <span class="ctxkbd">Shift+Del</span></div>
+</div>
+
+<div id="delConfirm" role="alertdialog" aria-modal="true" aria-labelledby="delConfirmTitle" aria-describedby="delConfirmBody">
+  <div id="delConfirmBox">
+    <h2 id="delConfirmTitle"></h2>
+    <p id="delConfirmBody"></p>
+    <div id="delConfirmNames"></div>
+    <p id="delConfirmWarn" hidden></p>
+    <div id="delConfirmActions">
+      <button type="button" id="delRemoveOnly">Remove from playlist only</button>
+      <button type="button" id="delCancel">Cancel</button>
+      <button type="button" id="delRecycle">Move to Recycle Bin</button>
+    </div>
+  </div>
 </div>
 
 <!-- Floating restore button -->
@@ -1378,6 +1409,9 @@ let SSP_WINDOW_ROLE = (function () {
   return 'main';
 })();
 let SSP_IS_PLAYLIST_WINDOW = SSP_WINDOW_ROLE === 'playlist';
+/** Undock is off in 0.1.18. The second window is rebuilt in 0.2.0. The code stays. */
+const SSP_UNDOCK_ENABLED = false;
+if (SSP_UNDOCK_ENABLED) document.body.classList.add('ssp-undock-enabled');
 let playlistUndocked = false;
 let plSyncSeq = 0;
 let plSyncApplied = 0;
@@ -1725,6 +1759,7 @@ function applyUndockedMainChrome() {
 }
 
 async function undockPlaylistWindow() {
+  if (!SSP_UNDOCK_ENABLED) return;
   if (SSP_IS_PLAYLIST_WINDOW) return;
   if (!sspIsTauri()) {
     showToast('Undock requires the SlideX desktop app.', 3500);
@@ -3696,45 +3731,61 @@ function removeItem(itemsIdx, clearLS) {
 
 /* ── Context menu ── */
 const ctxmenu = g('ctxmenu');
-stage.addEventListener('contextmenu', e => {
-  e.preventDefault();
-  if (!getMediaItems().length) return;
+let ctxMi = null;
+function positionCtx(e) {
   ctxmenu.style.left = '-9999px'; ctxmenu.style.top = '-9999px';
   ctxmenu.style.display = 'block';
   const r = ctxmenu.getBoundingClientRect();
   ctxmenu.style.left = Math.min(e.clientX, window.innerWidth - r.width - 6) + 'px';
   ctxmenu.style.top = Math.min(e.clientY, window.innerHeight - r.height - 6) + 'px';
+}
+function ctxMediaItem() {
+  const mi = getMediaItems();
+  const idx = ctxMi == null ? cur : ctxMi;
+  return mi[idx] || null;
+}
+stage.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  if (!getMediaItems().length) return;
+  ctxMi = cur;
+  positionCtx(e);
+});
+if (g('pllist')) g('pllist').addEventListener('contextmenu', e => {
+  const row = e.target.closest && e.target.closest('[data-mi]');
+  if (!row) return;
+  e.preventDefault();
+  e.stopPropagation();
+  ctxMi = Number(row.dataset.mi);
+  positionCtx(e);
 });
 document.addEventListener('click', e => {
   if (!ctxmenu.contains(e.target)) ctxmenu.style.display = 'none';
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') ctxmenu.style.display = 'none'; }, true);
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (typeof delConfirmIsOpen === 'function' && delConfirmIsOpen()) {
+    e.preventDefault();
+    e.stopPropagation();
+    closeDelConfirm();
+    return;
+  }
+  ctxmenu.style.display = 'none';
+}, true);
 
 g('ctx-dup').onclick = () => {
   ctxmenu.style.display = 'none';
-  const mi = getMediaItems(), item = mi[cur]; if (!item) return;
+  const item = ctxMediaItem(); if (!item) return;
   const dup = {...item, id: makeItemId(), clr: {...(item.clr || CLR_DEF)}};
   items.splice(items.indexOf(item) + 1, 0, dup);
   rebuildSlides(cur);
 };
 g('ctx-remove').onclick = () => {
   ctxmenu.style.display = 'none';
-  const mi = getMediaItems(), item = mi[cur]; if (!item) return;
+  const item = ctxMediaItem(); if (!item) return;
   removeItem(items.indexOf(item), false);
 };
 g('ctx-del').onclick = () => {
-  ctxmenu.style.display = 'none';
-  const mi = getMediaItems(), item = mi[cur]; if (!item) return;
-  const fname = item.name || '';
-  pendingDeleteItem = item.fileHandle ? item : null;
-  removeItem(items.indexOf(item), true);
-  if (fname) {
-    if (pendingDeleteItem) {
-      showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist.</span><br><button onclick="confirmDeleteFile()">Delete File from Disk</button>`);
-    } else {
-      showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist. To delete the file, remove it from your file system manually.</span>`);
-    }
-  }
+  openRecycleConfirm(ctxMi == null ? cur : ctxMi);
 };
 
 /* ── IndexedDB handle store ── */
@@ -4966,7 +5017,7 @@ function closePL() {
 }
 g('bplt').onclick = togglePL;
 g('dock-toggle-btn').onclick = togglePL;
-if (g('plundock')) g('plundock').onclick = () => undockPlaylistWindow();
+if (g('plundock')) g('plundock').onclick = () => { if (SSP_UNDOCK_ENABLED) undockPlaylistWindow(); };
 if (g('pldockback')) g('pldockback').onclick = () => dockPlaylistWindow();
 g('dock-search').oninput = function() {
   plSearchQuery = this.value;
@@ -6379,6 +6430,18 @@ function runMappedKey(e) {
   return true;
 }
 document.addEventListener('keydown', e => {
+  if (typeof delConfirmIsOpen === 'function' && delConfirmIsOpen()) {
+    const action = (window.SlideXCore && SlideXCore.deleteConfirmKey)
+      ? SlideXCore.deleteConfirmKey({ open: true }, e.key)
+      : (e.key === 'Escape' ? 'cancel' : (e.key === 'Tab' || e.key === 'Enter' || e.key === ' ' ? 'dialog' : 'swallow'));
+    if (action === 'cancel') {
+      e.preventDefault();
+      closeDelConfirm();
+    } else if (action !== 'dialog') {
+      e.preventDefault();
+    }
+    return;
+  }
   /* Key remapper (P4 editor capture) */
   if (listeningEl && listeningId) {
     if (e.key === 'Escape') {
@@ -6435,20 +6498,16 @@ document.addEventListener('keydown', e => {
     return;
   }
 
-  /* Delete / Backspace fixed (not remappable) */
+  /* Delete removes from the playlist. Shift+Delete asks before the Recycle Bin. */
+  if (e.key === 'Delete' && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    openRecycleConfirm(cur);
+    return;
+  }
   if (e.key === 'Delete') {
     e.preventDefault();
     const mi = getMediaItems(), item = mi[cur]; if (!item) return;
-    const fname = item.name || '';
-    pendingDeleteItem = item.fileHandle ? item : null;
-    removeItem(items.indexOf(item), true);
-    if (fname) {
-      if (pendingDeleteItem) {
-        showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist.</span><br><button onclick="confirmDeleteFile()">Delete File from Disk</button>`);
-      } else {
-        showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist. To delete the file, remove it from your file system manually.</span>`);
-      }
-    }
+    removePlaylistFiles([item], false);
     return;
   }
   if (e.key === 'Backspace') {
@@ -6479,18 +6538,99 @@ function showToast(html, dur = 5000) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), dur);
 }
-let pendingDeleteItem = null;
-window.confirmDeleteFile = async function() {
-  const item = pendingDeleteItem; if (!item?.fileHandle) return;
-  pendingDeleteItem = null;
-  g('toast').classList.remove('show');
+let delConfirmFiles = [];
+function delConfirmIsOpen() {
+  return !!(g('delConfirm') && g('delConfirm').classList.contains('open'));
+}
+function closeDelConfirm() {
+  delConfirmFiles = [];
+  const dlg = g('delConfirm');
+  if (dlg) dlg.classList.remove('open');
+}
+function renderDelConfirm(model) {
+  if (!model || !g('delConfirm')) return;
+  g('delConfirmTitle').textContent = model.title || '';
+  g('delConfirmBody').textContent = model.body || '';
+  g('delConfirmNames').textContent = (model.names || []).join('\n');
+  const warn = g('delConfirmWarn');
+  const warnLine = window.SlideXCore && SlideXCore.deleteConfirmWarnLine
+    ? SlideXCore.deleteConfirmWarnLine(model)
+    : [model.playlistWarn, model.shareWarn && model.shareWarn !== model.body ? model.shareWarn : ''].filter(Boolean).join(' ');
+  warn.textContent = warnLine;
+  warn.hidden = !warnLine;
+  g('delRecycle').hidden = !model.recycleOk;
+  g('delConfirm').classList.add('open');
+  g('delCancel').focus();
+}
+function removePlaylistFiles(files, clearLS) {
+  const drop = new Set((files || []).filter(Boolean));
+  if (!drop.size) return;
+  if (clearLS) {
+    drop.forEach(item => {
+      [item.id, item.name].filter(Boolean).forEach(key => {
+        try { localStorage.removeItem(lsKey(key)); } catch (_) {}
+      });
+    });
+  }
+  items = items.filter(it => !drop.has(it));
+  selectedItems.clear();
+  const cnt = getMediaItems().length;
+  if (!cnt) { try { g('bru').click(); } catch (_) {} }
+  else rebuildSlides(Math.min(cur, Math.max(0, cnt - 1)));
+  autoSave();
+}
+async function otherPlaylistNames(files) {
+  if (!sspIsTauri() || typeof tauriInvoke !== 'function' || !window.SlideXCore) return [];
+  let rows = [];
+  try { rows = await tauriInvoke('list_named_playlists') || []; } catch (_) { return []; }
+  const playlists = [];
+  for (const row of rows) {
+    try {
+      const text = await tauriInvoke('read_named_playlist', { name: row.name });
+      const doc = JSON.parse(text);
+      playlists.push({ name: doc.name || row.name, items: doc.items || [] });
+    } catch (_) {}
+  }
+  return SlideXCore.otherSavedPlaylists(files, playlists, namedPlaylistName);
+}
+async function openRecycleConfirm(contextMi) {
+  ctxmenu.style.display = 'none';
+  if (!window.SlideXCore) return;
+  const mi = getMediaItems();
+  const indexes = SlideXCore.deleteTargetIndexes(mi.length, cur, selectedItems, contextMi);
+  const files = indexes.map(i => mi[i]).filter(Boolean);
+  if (!files.length) return;
+  delConfirmFiles = files;
+  const others = await otherPlaylistNames(files);
+  if (!delConfirmFiles.length) return;
+  renderDelConfirm(SlideXCore.deleteConfirmModel(files, { inTauri: sspIsTauri(), otherPlaylists: others }));
+}
+async function commitRecycle() {
+  const files = delConfirmFiles.slice();
+  if (!files.length || !window.SlideXCore) return;
+  const paths = files.map(f => f.path).filter(Boolean);
+  if (paths.length !== files.length) {
+    renderDelConfirm(SlideXCore.deleteConfirmRefused(files, "Couldn't move the file to the Recycle Bin. SlideX doesn't have a path on this PC for it."));
+    return;
+  }
   try {
-    const perm = await item.fileHandle.requestPermission({ mode: 'readwrite' });
-    if (perm !== 'granted') { showToast('Permission denied — delete the file manually.', 4000); return; }
-    await item.fileHandle.remove();
-    showToast(`<b style="color:#fff">${item.name}</b> deleted from disk.`, 3000);
-  } catch(e) { showToast(`Could not delete: ${e.message}`, 4000); }
+    await tauriInvoke('trash_media_files', { paths });
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : String(e);
+    renderDelConfirm(SlideXCore.deleteConfirmRefused(files, msg));
+    return;
+  }
+  removePlaylistFiles(files, true);
+  closeDelConfirm();
+  showToast('Moved to the Recycle Bin. You can restore it from there.', 3500);
+}
+if (g('delCancel')) g('delCancel').onclick = () => closeDelConfirm();
+if (g('delRemoveOnly')) g('delRemoveOnly').onclick = () => {
+  const files = delConfirmFiles.slice();
+  closeDelConfirm();
+  removePlaylistFiles(files, false);
 };
+if (g('delRecycle')) g('delRecycle').onclick = () => { commitRecycle(); };
 
 /* ── SSP Tauri bridge (launch-path ingest + native drag-drop) ── */
 (function sspTauriBridge() {
@@ -7414,6 +7554,24 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="castLog">Copy Cast log path</button>
     <button type="button" id="castClose">Close</button>
   </div>
+  <div id="castSteps" hidden>
+    <div class="cast-step" id="castStepFound"></div>
+    <div class="cast-step" id="castStepLink"></div>
+    <div class="cast-step" id="castStepStream"></div>
+    <div class="row">
+      <span class="hint">If the TV shows a prompt, accept it.</span>
+      <button type="button" id="castCancel">Cancel</button>
+    </div>
+  </div>
+  <div id="castFail" hidden>
+    <div id="castFailMsg" role="alert"></div>
+    <div class="row">
+      <button type="button" id="castRetry">Try again</button>
+      <button type="button" id="castEnterAddr">Enter TV address</button>
+      <button type="button" id="castDetailsToggle" aria-expanded="false" aria-controls="castDetails">Details</button>
+    </div>
+    <div id="castDetails" hidden></div>
+  </div>
   <div id="castStatus">Open Cast to look for a TV. Play, pause, next, and previous on this PC follow on the TV.</div>
   <div id="castFirewall">No Private inbound rule for slideshowpro.exe. Cast needs TCP 47200-47215 and UDP 5353 on private networks. Re-run the installer and accept the Windows prompt.</div>
 </div>
@@ -7774,18 +7932,123 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   document.getElementById("castRescan") && document.getElementById("castRescan").addEventListener("click", function () {
     startScan("rescan");
   });
-  document.getElementById("castStart") && document.getElementById("castStart").addEventListener("click", function () {
-    var manual = manualTarget();
-    var dev = manual || selectedDevice();
-    if (!dev || !dev.host) {
-      setStatus("Choose a TV, or type its IPv4 address.");
+  var connectState = null;
+  var connectTimer = null;
+  var connectGen = 0;
+  var lastConnectDev = null;
+  var Core = window.SlideXCore;
+
+  function renderConnect(state) {
+    var steps = document.getElementById("castSteps");
+    var fail = document.getElementById("castFail");
+    var details = document.getElementById("castDetails");
+    if (!steps || !fail) return;
+    if (!state || state.phase === "idle") {
+      steps.hidden = true;
+      fail.hidden = true;
       return;
     }
-    setStatus("Connecting…");
+    if (state.phase === "connecting") {
+      fail.hidden = true;
+      steps.hidden = false;
+      var texts = Core.castConnectStepTexts(state);
+      var marks = Core.castConnectStepMarks(state);
+      ["castStepFound", "castStepLink", "castStepStream"].forEach(function (id, i) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.textContent = texts[i];
+        el.className = "cast-step " + (marks[i] || "");
+      });
+      return;
+    }
+    steps.hidden = true;
+    fail.hidden = false;
+    var msg = document.getElementById("castFailMsg");
+    if (msg) msg.textContent = state.message || "";
+    if (details) {
+      details.hidden = !state.detailsOpen;
+      details.textContent = state.details || "";
+    }
+    var toggle = document.getElementById("castDetailsToggle");
+    if (toggle) toggle.setAttribute("aria-expanded", state.detailsOpen ? "true" : "false");
+  }
+  function directCancelRust() {
+    if (!sspIsTauri() || typeof tauriInvoke !== "function") return;
+    tauriInvoke("cast_cancel_connect").catch(function () {});
+  }
+  function rememberCastLog(state) {
+    call("cast_log_path").then(function (path) {
+      if (!connectState || connectState.phase !== "failed") return;
+      if (state && connectState.tv !== state.tv) return;
+      connectState = Core.withCastLogPath(connectState, String(path || ""));
+      renderConnect(connectState);
+    }).catch(function () {});
+  }
+  function finishConnectFailure(state) {
+    connectGen++;
+    clearInterval(connectTimer);
+    connectTimer = null;
+    if (castActive) stopLocalCast();
+    castActive = false;
+    window.__sspCastActive = false;
+    directCancelRust();
+    connectState = state;
+    renderConnect(connectState);
+    rememberCastLog(state);
+  }
+  function finishConnectCancel() {
+    connectGen++;
+    clearInterval(connectTimer);
+    connectTimer = null;
+    if (castActive) stopLocalCast();
+    castActive = false;
+    window.__sspCastActive = false;
+    directCancelRust();
+    connectState = Core.cancelCastConnect(connectState);
+    renderConnect(connectState);
+    setStatus("Cast cancelled. You can try again without restarting SlideX.");
+  }
+  function armConnectTimer() {
+    clearInterval(connectTimer);
+    var last = Date.now();
+    connectTimer = setInterval(function () {
+      if (!connectState || connectState.phase !== "connecting") {
+        clearInterval(connectTimer);
+        connectTimer = null;
+        return;
+      }
+      var now = Date.now();
+      var delta = now - last;
+      last = now;
+      connectState = Core.tickCastConnect(connectState, delta);
+      if (connectState.phase === "failed") {
+        finishConnectFailure(connectState);
+        return;
+      }
+      renderConnect(connectState);
+    }, 250);
+  }
+  function beginUiConnect(dev) {
+    if (!Core || !Core.beginCastConnect) return;
+    var manualName = dev.name || dev.host;
+    connectGen++;
+    var gen = connectGen;
+    lastConnectDev = dev;
+    connectState = Core.retryCastConnect
+      ? Core.retryCastConnect(connectState, manualName)
+      : Core.beginCastConnect(manualName);
+    renderConnect(connectState);
+    armConnectTimer();
     var args = { host: dev.host, name: dev.name || null };
     if (dev.port) args.port = dev.port;
     enqueue(function () {
+      if (gen !== connectGen) return Promise.resolve();
       return call("cast_connect", args).then(function (info) {
+        if (gen !== connectGen) return call("cast_disconnect").catch(function () {});
+        connectState = Core.advanceCastConnect(connectState, 2);
+        clearInterval(connectTimer);
+        connectTimer = null;
+        renderConnect(connectState);
         castActive = true;
         window.__sspCastActive = true;
         window.__sspCastGen = (window.__sspCastGen || 0) + 1;
@@ -7796,12 +8059,51 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         setStatus("Connected to " + where + ". Starting the slideshow.");
         return pushPlaylist();
       }).then(function () {
+        if (gen !== connectGen) return;
         return loadCurrent();
+      }).then(function () {
+        if (gen !== connectGen || !castActive) return;
+        clearInterval(connectTimer);
+        connectTimer = null;
+        connectState = null;
+        renderConnect(null);
       }).catch(function (e) {
+        if (gen !== connectGen) return;
+        var raw = (e && e.message) ? e.message : String(e);
         stopLocalCast();
-        setStatus((e && e.message) ? e.message : String(e));
+        finishConnectFailure(Core.failCastConnect(connectState || Core.beginCastConnect(manualName), raw, null, false));
       });
     });
+  }
+  document.getElementById("castStart") && document.getElementById("castStart").addEventListener("click", function () {
+    var manual = manualTarget();
+    var dev = manual || selectedDevice();
+    if (!dev || !dev.host) {
+      setStatus("Choose a TV, or type its IPv4 address.");
+      return;
+    }
+    beginUiConnect(dev);
+  });
+  document.getElementById("castCancel") && document.getElementById("castCancel").addEventListener("click", function () {
+    finishConnectCancel();
+  });
+  document.getElementById("castRetry") && document.getElementById("castRetry").addEventListener("click", function () {
+    if (!lastConnectDev || !lastConnectDev.host) {
+      setStatus("Choose a TV, or type its IPv4 address.");
+      return;
+    }
+    beginUiConnect(lastConnectDev);
+  });
+  document.getElementById("castEnterAddr") && document.getElementById("castEnterAddr").addEventListener("click", function () {
+    if (hostEl) {
+      hostEl.focus();
+      if (hostEl.select) hostEl.select();
+    }
+  });
+  document.getElementById("castDetailsToggle") && document.getElementById("castDetailsToggle").addEventListener("click", function () {
+    if (!connectState || !Core) return;
+    connectState = Core.toggleCastDetails(connectState);
+    renderConnect(connectState);
   });
   document.getElementById("castLog") && document.getElementById("castLog").addEventListener("click", function () {
     call("cast_log_path").then(function (path) {

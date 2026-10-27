@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · SlideX landing (revised)</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#000}
+a{color:rgba(255,255,255,.85)}a:hover{color:#fff}
+.sx{font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;color:#fff;-webkit-font-smoothing:antialiased;font-size:13px;line-height:1.45}
+.sx *{box-sizing:border-box}
+.mono{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.scr{width:1280px;height:800px;position:relative;overflow:hidden;background:#000}
+.stage{position:absolute;inset:0;background:linear-gradient(180deg,#4f8fd6 0%,#9cc6ec 58%,#d3a066 58%,#c08752 74%,#a2683f 100%)}
+.dim{position:absolute;inset:0;background:rgba(0,0,0,.62)}
+.glass{background:rgba(10,10,10,.72);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(18px)}
+.modal{background:#141414;border:1px solid rgba(255,255,255,.08);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6)}
+.card{background:#1a1a1a;border:1px solid rgba(255,255,255,.08);border-radius:8px}
+.btn{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.08)}
+.btn.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff}
+.btn.pri{background:#fff;color:#000;border-color:#fff;font-weight:600}
+.btn.dng{background:rgba(220,60,60,.16);border-color:rgba(220,60,60,.75);color:#ffc2c2}
+.btn.ico{width:32px;padding:0;justify-content:center}
+.btn.sm{height:26px;font-size:12px;padding:0 9px}
+.btn[disabled]{opacity:.4;cursor:default}
+.fv{outline:2px solid #fff;outline-offset:2px}
+.btn:focus-visible,.in:focus-visible{outline:2px solid #fff;outline-offset:2px}
+.kbd{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75)}
+.btn.pri .kbd{color:rgba(0,0,0,.65);border-color:rgba(0,0,0,.3)}
+.t85{color:rgba(255,255,255,.85)}.t55{color:rgba(255,255,255,.6)}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600}
+.h1{font-size:20px;font-weight:700;margin:0}.h2{font-size:15px;font-weight:700;margin:0}
+.in{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:32px;padding:0 10px}
+.seg{display:inline-flex;border:.5px solid rgba(255,255,255,.18);border-radius:7px;padding:2px;gap:2px}
+.seg button{font:inherit;font-size:12px;color:rgba(255,255,255,.75);background:transparent;border:0;border-radius:5px;padding:0 12px;height:28px;cursor:pointer}
+.seg button.on{background:rgba(255,255,255,.15);color:#fff;box-shadow:inset 0 0 0 .5px rgba(255,255,255,.55);font-weight:600}
+.bn{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.18);font-size:13px;color:rgba(255,255,255,.88)}
+.bn.warn{border-color:rgba(232,179,90,.55);background:rgba(232,179,90,.08)}
+.bn.err{border-color:rgba(220,60,60,.65);background:rgba(220,60,60,.1)}
+.bn.live{border-color:rgba(159,208,255,.45);background:rgba(159,208,255,.07)}
+.bn b{color:#fff}
+.prog{height:4px;background:rgba(255,255,255,.12);border-radius:2px;overflow:hidden}.prog>i{display:block;height:100%;background:#fff}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap}
+.chip.live{border-color:rgba(159,208,255,.6);color:#cfe7ff}.chip.warn{border-color:rgba(232,179,90,.6);color:#f3d29b}.chip.err{border-color:rgba(220,60,60,.7);color:#ffc2c2}
+.row{display:flex;align-items:center;gap:10px}.col{display:flex;flex-direction:column;gap:10px}.sp{flex:1}
+.hr{height:1px;background:rgba(255,255,255,.08)}
+.ctrls{position:absolute;left:0;right:0;bottom:0;height:50px;background:rgba(10,10,10,.85);border-top:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:6px;padding:0 12px}
+.vsep{width:1px;height:20px;background:rgba(255,255,255,.12);margin:0 4px}
+.steps{display:flex;gap:2px;list-style:none;margin:0 auto;padding:0}
+.steps li{display:flex;align-items:center;gap:6px;font-size:12px;color:rgba(255,255,255,.6);padding:4px 8px;border-radius:6px}
+.steps li i{font-style:normal;width:18px;height:18px;border-radius:50%;border:1px solid rgba(255,255,255,.35);display:inline-flex;align-items:center;justify-content:center;font-size:10px}
+.steps li.done{color:rgba(255,255,255,.85)}.steps li.done i{background:rgba(255,255,255,.85);color:#000;border-color:transparent}
+.steps li.cur{color:#fff;font-weight:700;background:rgba(255,255,255,.1)}.steps li.cur i{border:2px solid #fff}
+.g1{background:linear-gradient(180deg,#3e2c5a,#a3687a 60%,#2e2346 61%)}.g2{background:linear-gradient(180deg,#8fb3cf,#c7d9e4 55%,#5c7f93 56%)}.g3{background:linear-gradient(180deg,#5596da,#a5cbee 55%,#d3a066 56%,#a2683f)}.g4{background:linear-gradient(180deg,#9fb39c,#c9d4c0 50%,#4f7a52 51%,#2e4c31)}.g5{background:radial-gradient(circle at 30% 40%,#a35bd6,#3a1f6b 60%,#1a1033)}.g6{background:linear-gradient(180deg,#2b2f6b,#c0546a)}.g7{background:linear-gradient(135deg,#1e2c6b,#e88356)}
+.tile{width:168px;height:136px;border-radius:14px;background:#141414;border:1px solid rgba(255,255,255,.1);color:#fff;font:inherit;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;cursor:pointer}
+.tile:hover{background:#1a1a1a;border-color:rgba(255,255,255,.22)}
+.tile .sub{font-size:11px;color:rgba(255,255,255,.6)}
+
+</style>
+</head>
+<body>
+<div id="landing" class="scr sx" style="background: #0a0a0a; display: flex; flex-direction: column; align-items: center; padding-top: 150px">
+  <div style="font-size: 40px; font-weight: 800; letter-spacing: -0.03em">Slide<span style="color: rgba(255,255,255,.45)">X</span></div>
+  <div class="mono t55" style="font-size: 12px; margin-top: 4px">0.2.0</div>
+
+  <div style="display: flex; gap: 14px; margin-top: 40px">
+    <button id="lbopen" class="tile" title="Open files (Ctrl+O)"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="9" cy="10" r="2"></circle><path d="M21 17l-5-5-9 8"></path></svg><span>Open Files</span><span class="kbd">Ctrl O</span></button>
+    <button id="lbfolder" class="tile" title="Open folder, includes subfolders (Ctrl+Shift+O)"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg><span>Open Folder</span><span class="sub">includes subfolders</span></button>
+    <button id="lbcont" class="tile" title="Continue last session (Enter)" style="border-color: rgba(255,255,255,.55); background: #1a1a1a"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 5l12 7-12 7z"></path></svg><span style="font-weight: 700">Continue</span><span class="sub">7 files · just now · <span class="kbd">Enter</span></span></button>
+    <button id="lbplist" class="tile" title="Open a saved playlist (Ctrl+L)"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h7"></path></svg><span>Open Playlist</span><span class="kbd">Ctrl L</span></button>
+    <button id="lbamv" class="tile" title="Make a music video from photos, clips and a song (Ctrl+Shift+M)"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l11-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="17" cy="16" r="3"></circle></svg><span>Make music video</span><span class="chip" style="font-size: 10px">NEW</span></button>
+  </div>
+
+  <div style="width: 896px; margin-top: 28px">
+    <div class="lbl" style="margin-bottom: 8px">Recent playlists</div>
+    <div class="card" style="display: flex; flex-direction: column">
+      <button class="btn" style="border: 0; border-radius: 0; height: 40px; justify-content: flex-start; padding: 0 14px">Weekend trip<span class="t55">42 items · Oct 24, 6:00 PM</span><span class="sp"></span><span class="t55">Load</span></button>
+      <div class="hr"></div>
+      <button class="btn" style="border: 0; border-radius: 0; height: 40px; justify-content: flex-start; padding: 0 14px">Office lobby loop<span class="t55">18 items · Oct 22, 10:30 AM</span><span class="sp"></span><span class="t55">Load</span></button>
+      <div class="hr"></div>
+      <button class="btn" style="border: 0; border-radius: 0; height: 40px; justify-content: flex-start; padding: 0 14px">Family dinner<span class="t55">120 items · Oct 18, 7:15 PM</span><span class="sp"></span><span class="t55">Load</span></button>
+    </div>
+  </div>
+
+  <div style="width: 896px; margin-top: 22px; height: 64px; border: 1px dashed rgba(255,255,255,.22); border-radius: 10px; display: flex; align-items: center; justify-content: center" class="t55">Drop photos, videos or a playlist file anywhere</div>
+
+  <div class="row" style="margin-top: 22px; gap: 18px; font-size: 12px">
+    <button id="lbcast" class="btn sm" title="Cast to a Google TV (Ctrl+Shift+C)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 16a6 6 0 0 1 6 6M2 12a10 10 0 0 1 10 10M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"></path></svg>Cast to TV…</button>
+    <button id="lbsettings" class="btn sm" title="Settings (Ctrl+,)">Settings<span class="kbd">Ctrl ,</span></button>
+    <button class="btn sm" title="Keyboard shortcuts (?)">Shortcuts<span class="kbd">?</span></button>
+  </div>
+</div>
+</body>
+</html>

@@ -38,6 +38,8 @@
     "allow-cast-discover",
     "allow-cast-network-fingerprint",
     "allow-cast-connect",
+    "allow-cast-cancel-connect",
+    "allow-trash-media-files",
     "allow-cast-set-playlist",
     "allow-cast-load",
     "allow-cast-pause",

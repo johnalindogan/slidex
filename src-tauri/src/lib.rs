@@ -1,4 +1,5 @@
 mod cast;
+mod media_trash;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -1135,6 +1136,17 @@ fn cast_connect(
 }
 
 #[tauri::command]
+fn cast_cancel_connect(state: State<'_, cast::CastState>) -> Result<(), String> {
+    state.cancel_connect()
+}
+
+/// Move user media to the Recycle Bin. Refuses a network share. Never deletes outright.
+#[tauri::command]
+fn trash_media_files(paths: Vec<String>) -> Result<(), String> {
+    media_trash::trash_user_media(&paths)
+}
+
+#[tauri::command]
 fn cast_set_playlist(
     state: State<'_, cast::CastState>,
     paths: Vec<String>,
@@ -1320,6 +1332,8 @@ pub fn run() {
             cast_discover,
             cast_network_fingerprint,
             cast_connect,
+            cast_cancel_connect,
+            trash_media_files,
             cast_set_playlist,
             cast_load,
             cast_pause,

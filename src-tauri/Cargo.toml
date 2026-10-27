@@ -1,6 +1,6 @@
 [package]
 name = "slideshowpro"
-version = "0.1.13"
+version = "0.1.18"
 description = "Thin Tauri Windows wrapper for SlideX"
 authors = ["johnalindogan"]
 edition = "2021"
@@ -28,6 +28,8 @@ rustls = "0.23"
 mdns-sd = "0.13"
 if-addrs = "0.13"
 uuid = { version = "1", features = ["v4"] }
+# User media goes to the Recycle Bin. Do not replace this with remove_file.
+trash = "5"
 
 [profile.release]
 panic = "abort"
