@@ -1794,6 +1794,78 @@
     return lastDev && lastDev.host ? lastDev : null;
   }
 
+  function playlistItemId(item) {
+    if (!item || item.id == null || item.id === '') return '';
+    return String(item.id);
+  }
+
+  // A copied confirm row matches the playlist entry by id, or by normalized
+  // path when it has no id. The same path on another id stays in the list.
+  function playlistItemMatches(item, file) {
+    if (!item || !file) return false;
+    var fileId = playlistItemId(file);
+    if (fileId) return playlistItemId(item) === fileId;
+    return !!(file.path && item.path && samePath(file.path, item.path));
+  }
+
+  function isShownMedia(item) {
+    return !!(item && item.type !== 'folder' && !item.unavailable && !item.missing);
+  }
+
+  function removePlaylistMatches(items, files, cur) {
+    var list = (items || []).slice();
+    var drop = (files || []).filter(Boolean);
+    var matched = [];
+    var next = [];
+    list.forEach(function (it) {
+      var hit = drop.some(function (file) { return playlistItemMatches(it, file); });
+      if (hit) matched.push(it);
+      else next.push(it);
+    });
+    var media = list.filter(isShownMedia);
+    var nextMedia = next.filter(isShownMedia);
+    var current = cur > 0 ? (cur | 0) : 0;
+    var showing = media[current] || null;
+    var nextCur = 0;
+    if (nextMedia.length && showing && nextMedia.indexOf(showing) >= 0) {
+      nextCur = nextMedia.indexOf(showing);
+    } else if (nextMedia.length) {
+      var removedBefore = 0;
+      for (var i = 0; i < current && i < media.length; i++) {
+        if (matched.indexOf(media[i]) >= 0) removedBefore++;
+      }
+      nextCur = current - removedBefore;
+      if (nextCur >= nextMedia.length) nextCur = nextMedia.length - 1;
+      if (nextCur < 0) nextCur = 0;
+    }
+    return {
+      items: next,
+      cur: nextCur,
+      removed: matched.length,
+      matched: matched,
+      shown: nextMedia[nextCur] || null,
+      touchedDisk: false
+    };
+  }
+
+  // Recycle may delete on disk first. Remove-only never does.
+  function applyPlaylistRemoval(items, files, cur, action, deleter) {
+    var kind = action === 'recycled' ? 'recycled' : 'remove-only';
+    var touched = false;
+    if (kind === 'recycled' && typeof deleter === 'function') {
+      (files || []).forEach(function (file) {
+        if (file && file.path) {
+          deleter(file.path);
+          touched = true;
+        }
+      });
+    }
+    var plan = removePlaylistMatches(items, files, cur);
+    plan.action = kind;
+    plan.touchedDisk = touched;
+    return plan;
+  }
+
   function applyDeleteChoice(items, indexes, choice) {
     var list = (items || []).slice();
     if (choice !== 'remove-only' && choice !== 'recycled') return list;
@@ -1961,6 +2033,9 @@
     deleteConfirmText: deleteConfirmText,
     deleteConfirmWarnLine: deleteConfirmWarnLine,
     deleteConfirmKey: deleteConfirmKey,
-    applyDeleteChoice: applyDeleteChoice
+    applyDeleteChoice: applyDeleteChoice,
+    playlistItemMatches: playlistItemMatches,
+    removePlaylistMatches: removePlaylistMatches,
+    applyPlaylistRemoval: applyPlaylistRemoval
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

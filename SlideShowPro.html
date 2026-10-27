@@ -6555,20 +6555,22 @@ function renderDelConfirm(model) {
   g('delCancel').focus();
 }
 function removePlaylistFiles(files, clearLS) {
-  const drop = new Set((files || []).filter(Boolean));
-  if (!drop.size) return;
+  if (!window.SlideXCore || !SlideXCore.removePlaylistMatches) return;
+  const plan = SlideXCore.removePlaylistMatches(items, files, cur);
+  if (!plan.removed) return;
   if (clearLS) {
-    drop.forEach(item => {
+    (plan.matched || []).forEach(item => {
       [item.id, item.name].filter(Boolean).forEach(key => {
         try { localStorage.removeItem(lsKey(key)); } catch (_) {}
       });
     });
   }
-  items = items.filter(it => !drop.has(it));
+  items = plan.items;
+  cur = plan.cur;
   selectedItems.clear();
   const cnt = getMediaItems().length;
   if (!cnt) { try { g('bru').click(); } catch (_) {} }
-  else rebuildSlides(Math.min(cur, Math.max(0, cnt - 1)));
+  else rebuildSlides(cur);
   autoSave();
 }
 async function otherPlaylistNames(files) {

@@ -2013,6 +2013,57 @@ test('user media is never permanently deleted and the confirm names files', () =
   assert.doesNotMatch(html, /pllist'\)\.addEventListener\('contextmenu'/);
 });
 
+test('copied recycle and remove-only update the playlist and the view', () => {
+  const playlist = [
+    { id: 'a', name: 'a.jpg', path: 'C:\\Photos\\a.jpg', type: 'image' },
+    { id: 'b', name: 'b.jpg', path: 'C:\\Photos\\same.jpg', type: 'image' },
+    { id: 'c', name: 'c.jpg', path: 'c:/photos/same.jpg', type: 'image' },
+    { id: 'd', name: 'd.jpg', path: 'C:\\Photos\\d.jpg', type: 'image' }
+  ];
+  const copyB = Object.assign({}, playlist[1], { driveType: 3 });
+  assert.notEqual(copyB, playlist[1]);
+  const disk = [];
+  const recycled = C.applyPlaylistRemoval(playlist, [copyB], 1, 'recycled', (p) => disk.push(p));
+  assert.deepEqual(disk, ['C:\\Photos\\same.jpg']);
+  assert.equal(recycled.touchedDisk, true);
+  assert.deepEqual(Array.from(recycled.items).map((it) => it.id), ['a', 'c', 'd']);
+  assert.equal(recycled.cur, 1);
+  assert.equal(recycled.shown.id, 'c');
+  assert.equal(recycled.shown, playlist[2]);
+  const removeDisk = [];
+  const removedOnly = C.applyPlaylistRemoval(playlist, [copyB], 1, 'remove-only', (p) => removeDisk.push(p));
+  assert.deepEqual(removeDisk, []);
+  assert.equal(removedOnly.touchedDisk, false);
+  assert.equal(removedOnly.action, 'remove-only');
+  assert.deepEqual(Array.from(removedOnly.items).map((it) => it.id), ['a', 'c', 'd']);
+  assert.equal(removedOnly.cur, 1);
+  assert.equal(removedOnly.shown.id, 'c');
+  const multi = C.applyPlaylistRemoval(
+    playlist,
+    [Object.assign({}, playlist[1]), Object.assign({}, playlist[3])],
+    2,
+    'remove-only',
+    (p) => removeDisk.push(p)
+  );
+  assert.deepEqual(removeDisk, []);
+  assert.deepEqual(Array.from(multi.items).map((it) => it.id), ['a', 'c']);
+  assert.equal(multi.cur, 1);
+  assert.equal(multi.shown.id, 'c');
+  const byPath = C.applyPlaylistRemoval(playlist, [{ name: 'a.jpg', path: 'c:/photos/a.jpg' }], 0, 'remove-only');
+  assert.deepEqual(Array.from(byPath.items).map((it) => it.id), ['b', 'c', 'd']);
+  assert.equal(byPath.cur, 0);
+  assert.equal(byPath.shown.id, 'b');
+  const last = C.applyPlaylistRemoval(playlist, [Object.assign({}, playlist[3])], 3, 'recycled', () => {});
+  assert.deepEqual(Array.from(last.items).map((it) => it.id), ['a', 'b', 'c']);
+  assert.equal(last.cur, 2);
+  assert.equal(last.shown.id, 'c');
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const removal = html.slice(html.indexOf('function removePlaylistFiles'), html.indexOf('async function otherPlaylistNames'));
+  assert.match(removal, /removePlaylistMatches/);
+  assert.doesNotMatch(removal, /new Set\(\s*\(?files/);
+  assert.doesNotMatch(removal, /drop\.has/);
+});
+
 test('cast connect shows the three steps, then timeout, cancel, and retry reset it', () => {
   const tv = 'Living Room TV';
   let state = C.beginCastConnect(tv);
