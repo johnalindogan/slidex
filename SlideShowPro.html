@@ -7942,8 +7942,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   };
 
   if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
-    window.__TAURI__.event.listen("cast://link-open", function () {
-      if (!connectState || connectState.phase !== "connecting" || !Core) return;
+    window.__TAURI__.event.listen("cast://link-open", function (ev) {
+      var eventGen = ev && ev.payload ? ev.payload.gen : null;
+      if (!Core || !Core.castLinkOpenApplies(eventGen, connectGen, connectState)) return;
       connectState = Core.advanceCastConnect(connectState, 2);
       clearInterval(connectTimer);
       connectTimer = null;
@@ -8065,7 +8066,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       : Core.beginCastConnect(manualName);
     renderConnect(connectState);
     armConnectTimer();
-    var args = { host: dev.host, name: dev.name || null };
+    var args = { host: dev.host, name: dev.name || null, gen: gen };
     if (dev.port) args.port = dev.port;
     enqueue(function () {
       if (gen !== connectGen) return Promise.resolve();

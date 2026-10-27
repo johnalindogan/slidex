@@ -82,11 +82,31 @@ pub fn recycle_bin_unavailable(path: &str) -> bool {
 
 /// `subst` and mapped devices that point at a share even if the drive type is wrong.
 pub fn device_target_is_network(target: &str) -> bool {
-    let lower = target.trim().to_ascii_lowercase();
-    lower.contains(r"unc\")
+    let lower = target.trim().to_ascii_lowercase().replace('/', "\\");
+    // `\unc\` is the UNC component. A folder named Func (`C:\Func\`) must not match.
+    lower.contains(r"\unc\")
         || lower.contains(r"\device\mup")
         || lower.contains("lanmanredirector")
         || lower.starts_with(r"\\")
+}
+
+/// Non-extended paths longer than `MAX_PATH` (260, including the NUL) cannot be recycled.
+/// Extended `\\?\` paths use the documented 32,767 UTF-16 limit.
+pub fn recycle_path_too_long(path: &str) -> bool {
+    let normalized = path.trim().replace('/', "\\");
+    if normalized.is_empty() {
+        return false;
+    }
+    let extended = normalized.starts_with(r"\\?\");
+    let limit = if extended { 32_767 } else { 259 };
+    normalized.chars().count() > limit
+}
+
+fn path_too_long_message(path: &str) -> String {
+    let name = file_label(path);
+    format!(
+        "Couldn't move {name} to the Recycle Bin. The path is too long for Windows to recycle. It was left in place."
+    )
 }
 
 fn file_label(path: &str) -> String {
@@ -211,6 +231,10 @@ pub fn trash_user_media_with(
             failed.push(reason);
             continue;
         }
+        if recycle_path_too_long(path) {
+            failed.push(path_too_long_message(path));
+            continue;
+        }
         match delete(path) {
             Ok(()) => moved.push(path.clone()),
             Err(err) => {
@@ -274,17 +298,16 @@ mod windows_bin {
     use windows::{
         core::{implement, HRESULT, PCWSTR},
         Win32::{
-            Foundation::E_ABORT,
-            Storage::FileSystem::{
-                GetDriveTypeW, GetVolumePathNameW, QueryDosDeviceW,
-            },
+            Foundation::{E_ABORT, RPC_E_CHANGED_MODE, S_OK},
+            Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW, QueryDosDeviceW},
             System::Com::{
-                CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+                CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
+                COINIT_APARTMENTTHREADED,
             },
             UI::Shell::{
                 FileOperation, IFileOperation, IFileOperationProgressSink,
                 IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
-                FOF_ALLOWUNDO, FOF_NO_UI, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+                FOF_ALLOWUNDO, FOF_NO_UI, FOFX_RECYCLEONDELETE, TSF_DELETE_RECYCLE_IF_POSSIBLE,
             },
         },
     };
@@ -471,37 +494,58 @@ mod windows_bin {
     }
 
     /// Recycle `path` or return an error. Never calls a permanent delete.
-    pub fn recycle_or_abort(path: &str) -> Result<(), String> {
+    /// COM is initialized on this thread and released before the thread ends.
+    fn recycle_on_com_thread(path: &str) -> Result<(), String> {
         let name = Path::new(path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("this file");
         let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        if hr.is_err() && hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE {
+        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
             return Err(format!(
                 "Couldn't move {name} to the Recycle Bin ({hr}). It was left in place."
             ));
         }
         let parsing = wide(&path.replace('/', "\\"));
-        let outcome = unsafe {
-            let pfo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
-                .map_err(|err| err.to_string())?;
-            pfo.SetOperationFlags(FOF_ALLOWUNDO | FOF_NO_UI)
-                .map_err(|err| err.to_string())?;
-            let item: IShellItem =
-                SHCreateItemFromParsingName(PCWSTR(parsing.as_ptr()), None).map_err(|err| err.to_string())?;
-            let sink: IFileOperationProgressSink = RecycleOnlySink.into();
-            pfo.DeleteItem(&item, &sink).map_err(|err| err.to_string())?;
-            pfo.PerformOperations().map_err(|err| err.to_string())?;
-            pfo.GetAnyOperationsAborted()
-                .map_err(|err| err.to_string())?
-        };
+        let outcome = (|| {
+            unsafe {
+                let pfo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
+                    .map_err(|err| err.to_string())?;
+                pfo.SetOperationFlags(FOF_ALLOWUNDO | FOF_NO_UI | FOFX_RECYCLEONDELETE)
+                    .map_err(|err| err.to_string())?;
+                let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(parsing.as_ptr()), None)
+                    .map_err(|err| err.to_string())?;
+                let sink: IFileOperationProgressSink = RecycleOnlySink.into();
+                pfo.DeleteItem(&item, &sink).map_err(|err| err.to_string())?;
+                pfo.PerformOperations().map_err(|err| err.to_string())?;
+                pfo.GetAnyOperationsAborted().map_err(|err| err.to_string())
+            }
+        })();
+        if hr == S_OK {
+            unsafe { CoUninitialize() };
+        }
+        let outcome = outcome?;
         if outcome.as_bool() {
             return Err(format!(
                 "Couldn't move {name} to the Recycle Bin. Windows would not recycle it, so SlideX left it in place."
             ));
         }
         Ok(())
+    }
+
+    /// One short-lived thread per file so COM apartment state stays off the caller.
+    pub fn recycle_or_abort(path: &str) -> Result<(), String> {
+        let path = path.to_string();
+        std::thread::Builder::new()
+            .name("slidex-recycle".into())
+            .spawn(move || recycle_on_com_thread(&path))
+            .map_err(|err| {
+                format!("Couldn't start the Recycle Bin thread ({err}). The file was left in place.")
+            })?
+            .join()
+            .unwrap_or_else(|_| {
+                Err("The Recycle Bin thread stopped. The file was left in place.".into())
+            })
     }
 }
 
@@ -646,10 +690,53 @@ mod tests {
     }
 
     #[test]
+    fn a_local_folder_named_func_is_not_treated_as_unc() {
+        assert!(!device_target_is_network(r"\??\C:\Func\"));
+        assert!(!device_target_is_network(r"C:\Func\"));
+        assert!(device_target_is_network(r"\??\UNC\nas\media"));
+        let report = trash_user_media_with(
+            &[r"C:\Func\clip.mp4".to_string()],
+            |_path| DriveFacts {
+                drive_type: DRIVE_FIXED,
+                device_target: r"\??\C:\Func\".into(),
+            },
+            |_path| Ok(()),
+        );
+        assert_eq!(report.moved.len(), 1, "{}", report.message);
+        assert!(
+            !report.message.to_ascii_lowercase().contains("network"),
+            "{}",
+            report.message
+        );
+    }
+
+    #[test]
+    fn an_overlong_path_says_it_is_too_long_and_is_left_in_place() {
+        let calls = AtomicUsize::new(0);
+        let long = format!(r"C:\Photos\{}\clip.mp4", "a".repeat(300));
+        assert!(recycle_path_too_long(&long));
+        let report = trash_user_media_with(
+            &[long],
+            fixed,
+            |_path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(report.moved.is_empty());
+        assert!(report.message.contains("too long"), "{}", report.message);
+        assert!(report.message.contains("left in place"), "{}", report.message);
+        assert!(!recycle_path_too_long(r"C:\Photos\lake.jpg"));
+    }
+
+    #[test]
     fn this_module_never_permanently_deletes() {
         let src = include_str!("media_trash.rs");
         let impl_src = src.split("#[cfg(test)]").next().expect("impl");
         assert!(impl_src.contains("FOF_ALLOWUNDO"));
+        assert!(impl_src.contains("FOFX_RECYCLEONDELETE"));
+        assert!(impl_src.contains("slidex-recycle"));
         assert!(impl_src.contains("TSF_DELETE_RECYCLE_IF_POSSIBLE"));
         assert!(impl_src.contains("E_ABORT"));
         assert!(!impl_src.contains("trash::delete"));

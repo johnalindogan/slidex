@@ -4963,6 +4963,18 @@ fn reject_cancelled(cmd: CastCmd) {
     }
 }
 
+/// Shut down an attempt that must not become the live session.
+fn abandon_attempt(session: LiveSession) {
+    let LiveSession { cmd_tx, worker, .. } = session;
+    let _ = cmd_tx.send(CastCmd::Disconnect {
+        origin: CastOrigin::User,
+        reply: mpsc::channel().0,
+    });
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+}
+
 struct LiveSession {
     cmd_tx: Sender<CastCmd>,
     status: Arc<Mutex<CastLiveStatus>>,
@@ -5164,38 +5176,61 @@ impl CastState {
             }
         };
 
-        let flight = self
-            .inflight
+        // This attempt's own flag. A newer Try again replaces `inflight`, so
+        // reading that slot would let a cancelled attempt save itself on top.
+        self.store_connected_session(
+            &cancel,
+            LiveSession {
+                cmd_tx,
+                status,
+                remote_event,
+                worker: Some(worker),
+                cancel: Arc::clone(&cancel),
+                disconnect_logged,
+            },
+        )?;
+        Ok(info)
+    }
+
+    /// True when this attempt was cancelled or superseded. Does not look at
+    /// whichever attempt currently sits in `inflight`.
+    fn attempt_cancelled(own: &AtomicBool) -> bool {
+        own.load(Ordering::SeqCst)
+    }
+
+    /// How many live sessions are stored. A connect leaves at most one.
+    fn session_count(&self) -> usize {
+        self.inner
             .lock()
-            .map_err(|_| "cast state lock".to_string())?;
-        let cancelled = flight
-            .as_ref()
-            .map(|flag| flag.load(Ordering::SeqCst))
-            .unwrap_or(false);
-        if cancelled {
-            drop(flight);
-            let _ = cmd_tx.send(CastCmd::Disconnect {
-                origin: CastOrigin::User,
-                reply: mpsc::channel().0,
-            });
-            let _ = worker.join();
+            .map(|guard| usize::from(guard.is_some()))
+            .unwrap_or(0)
+    }
+
+    /// Save `session` only if this attempt is still the one that finished.
+    /// An existing session is disconnected first so the new one cannot orphan it.
+    fn store_connected_session(
+        &self,
+        own_cancel: &AtomicBool,
+        session: LiveSession,
+    ) -> Result<(), String> {
+        if Self::attempt_cancelled(own_cancel) {
+            abandon_attempt(session);
+            return Err(CAST_CANCELLED.to_string());
+        }
+        if let Err(err) = self.disconnect_session() {
+            abandon_attempt(session);
+            return Err(err);
+        }
+        if Self::attempt_cancelled(own_cancel) {
+            abandon_attempt(session);
             return Err(CAST_CANCELLED.to_string());
         }
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| "cast state lock".to_string())?;
-        *guard = Some(LiveSession {
-            cmd_tx,
-            status,
-            remote_event,
-            worker: Some(worker),
-            cancel,
-            disconnect_logged,
-        });
-        drop(guard);
-        drop(flight);
-        Ok(info)
+        *guard = Some(session);
+        Ok(())
     }
 
     pub fn set_playlist(&self, paths: Vec<String>) -> Result<PlaylistUpdate, String> {
@@ -10360,6 +10395,82 @@ mod tests {
             .filter(|l| l.contains(" disconnect "))
             .collect();
         assert_eq!(lines.len(), 1, "{after}");
+    }
+
+    #[test]
+    fn cancel_then_retry_leaves_exactly_one_session() {
+        fn parked(tx: Sender<CastCmd>, cancel: Arc<AtomicBool>) -> LiveSession {
+            LiveSession {
+                cmd_tx: tx,
+                status: Arc::new(Mutex::new(CastLiveStatus {
+                    connected: true,
+                    player_state: "idle".into(),
+                    remote_event: None,
+                    error: None,
+                    media_kind: String::new(),
+                    http_port: 0,
+                    bind_ip: String::new(),
+                    item_index: 0,
+                })),
+                remote_event: Arc::new(Mutex::new(None)),
+                worker: None,
+                cancel,
+                disconnect_logged: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        let state = CastState::default();
+        let attempt_a = Arc::new(AtomicBool::new(true));
+        let attempt_b = Arc::new(AtomicBool::new(false));
+        // Try again has already replaced the in-flight slot. The cancelled
+        // attempt must not treat that newer flag as its own.
+        *state.inflight.lock().expect("inflight") = Some(Arc::clone(&attempt_b));
+        assert!(
+            !state
+                .inflight
+                .lock()
+                .expect("inflight")
+                .as_ref()
+                .expect("newer attempt")
+                .load(Ordering::SeqCst)
+        );
+
+        let (old_tx, old_rx) = mpsc::channel();
+        let old_reply = thread::spawn(move || {
+            if let Ok(CastCmd::Disconnect { reply, .. }) = old_rx.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        {
+            let mut guard = state.inner.lock().expect("session");
+            *guard = Some(parked(old_tx, Arc::clone(&attempt_a)));
+        }
+        assert_eq!(state.session_count(), 1);
+
+        let (a_tx, a_rx) = mpsc::channel();
+        let err = state
+            .store_connected_session(&attempt_a, parked(a_tx, Arc::clone(&attempt_a)))
+            .expect_err("a cancelled attempt must not save");
+        assert_eq!(err, CAST_CANCELLED);
+        assert!(matches!(a_rx.try_recv(), Ok(CastCmd::Disconnect { .. })));
+        assert_eq!(state.session_count(), 1, "cancel must not add a second session");
+
+        let (b_tx, b_rx) = mpsc::channel();
+        state
+            .store_connected_session(&attempt_b, parked(b_tx, Arc::clone(&attempt_b)))
+            .expect("retry saves one session");
+        old_reply.join().expect("old session disconnects");
+        assert!(b_rx.try_recv().is_err(), "the retry session stays connected");
+        assert_eq!(state.session_count(), 1);
+        let stored = state
+            .inner
+            .lock()
+            .expect("session")
+            .as_ref()
+            .expect("one session")
+            .cancel
+            .clone();
+        assert!(Arc::ptr_eq(&stored, &attempt_b));
     }
 
     #[test]

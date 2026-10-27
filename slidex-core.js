@@ -1589,6 +1589,11 @@
     return next;
   }
 
+  function castLinkOpenApplies(eventGen, currentGen, state) {
+    if (eventGen !== currentGen) return false;
+    return !!(state && state.phase === 'connecting');
+  }
+
   function advanceCastConnect(state, step) {
     if (!state || state.phase !== 'connecting') return state;
     var next = {};
@@ -1662,7 +1667,9 @@
 
   function deviceTargetIsNetwork(target) {
     var lower = String(target || '').toLowerCase();
-    return lower.indexOf('unc\\') >= 0 || lower.indexOf('\\device\\mup') >= 0 || lower.indexOf('lanmanredirector') >= 0 || lower.indexOf('\\\\') === 0;
+    var slash = lower.replace(/\//g, '\\');
+    // `\\unc\\` is the UNC component. A folder named Func must not match.
+    return slash.indexOf('\\unc\\') >= 0 || slash.indexOf('\\device\\mup') >= 0 || slash.indexOf('lanmanredirector') >= 0 || slash.indexOf('\\\\') === 0;
   }
 
   function driveRefuseMessage(file) {
@@ -2027,6 +2034,7 @@
     deviceTargetIsNetwork: deviceTargetIsNetwork,
     driveRefuseMessage: driveRefuseMessage,
     retryCastTarget: retryCastTarget,
+    castLinkOpenApplies: castLinkOpenApplies,
     otherSavedPlaylists: otherSavedPlaylists,
     deleteConfirmModel: deleteConfirmModel,
     deleteConfirmRefused: deleteConfirmRefused,
