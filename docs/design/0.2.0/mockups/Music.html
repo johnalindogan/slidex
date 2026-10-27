@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · Music tab and beat sync</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#000}
+a{color:rgba(255,255,255,.85)}a:hover{color:#fff}
+.sx{font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;color:#fff;-webkit-font-smoothing:antialiased;font-size:13px;line-height:1.45}
+.sx *{box-sizing:border-box}
+.mono{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.scr{width:1280px;height:800px;position:relative;overflow:hidden;background:#000}
+.btn{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.08)}
+.btn.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff}
+.btn.pri{background:#fff;color:#000;border-color:#fff;font-weight:600}
+.btn.ico{width:32px;padding:0;justify-content:center}
+.btn.sm{height:28px;font-size:12px;padding:0 9px}
+.btn.ico.sm{width:28px;padding:0}
+.kbd{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75)}
+.t85{color:rgba(255,255,255,.85)}.t55{color:rgba(255,255,255,.6)}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600}
+.in{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:28px;padding:0 8px}
+.seg{display:inline-flex;border:.5px solid rgba(255,255,255,.18);border-radius:7px;padding:2px;gap:2px;align-items:center}
+.seg button{font:inherit;font-size:12px;color:rgba(255,255,255,.75);background:transparent;border:0;border-radius:5px;padding:0 10px;height:26px;cursor:pointer}
+.seg button.on{background:rgba(255,255,255,.15);color:#fff;box-shadow:inset 0 0 0 .5px rgba(255,255,255,.55);font-weight:600}
+.bn{display:flex;gap:10px;align-items:flex-start;padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.18);font-size:12px;color:rgba(255,255,255,.88)}
+.bn.warn{border-color:rgba(232,179,90,.55);background:rgba(232,179,90,.08)}
+.bn b{color:#fff}
+.prog{height:4px;background:rgba(255,255,255,.12);border-radius:2px;overflow:hidden}.prog>i{display:block;height:100%;background:#fff}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap}
+.chip.live{border-color:rgba(159,208,255,.6);color:#cfe7ff}.chip.warn{border-color:rgba(232,179,90,.6);color:#f3d29b}.chip.err{border-color:rgba(220,60,60,.7);color:#ffc2c2}
+.row{display:flex;align-items:center;gap:10px}.col{display:flex;flex-direction:column;gap:10px}.sp{flex:1}
+.hr{height:1px;background:rgba(255,255,255,.08)}
+.vsep{width:1px;height:20px;background:rgba(255,255,255,.12);margin:0 4px}
+.ctrls{position:absolute;left:0;right:0;height:50px;background:#0a0a0a;border-top:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:6px;padding:0 12px}
+.tab{font:inherit;font-size:13px;color:rgba(255,255,255,.65);background:transparent;border:0;height:44px;padding:0 4px;cursor:pointer;border-bottom:2px solid transparent}
+.tab.on{color:#fff;font-weight:700;border-bottom-color:#fff}
+.song{display:grid;grid-template-columns:18px 1fr 64px 120px;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;border:1px solid transparent}
+.song.now{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.4)}
+.g4{background:linear-gradient(180deg,#9fb39c,#c9d4c0 50%,#4f7a52 51%,#2e4c31)}
+.bs{display:grid;grid-template-columns:150px 1fr;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.sw{width:36px;height:20px;border-radius:999px;background:rgba(255,255,255,.85);position:relative;border:0}
+.sw::after{content:"";position:absolute;right:3px;top:3px;width:14px;height:14px;border-radius:50%;background:#000}
+
+</style>
+</head>
+<body>
+<div class="scr sx">
+  <div class="g4" style="position: absolute; left: 345px; top: 0; width: 590px; height: 330px"></div>
+  <div aria-hidden="true" style="position: absolute; left: 20px; top: 20px; display: flex; gap: 4px"><span style="width: 8px; height: 8px; border-radius: 50%; background: #fff"></span><span style="width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.3)"></span><span style="width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.3)"></span><span style="width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.3)"></span></div>
+  <nav class="ctrls" style="top: 330px" aria-label="Playback controls">
+    <button class="btn ico" aria-label="Previous (←)">‹</button><button class="btn ico" aria-label="Pause (Space)">❚❚</button><button class="btn ico" aria-label="Next (→)">›</button>
+    <span class="mono t85" style="font-size: 12px; margin-left: 6px">4 / 7</span>
+    <div class="vsep"></div>
+    <span class="t55" style="font-size: 12px">Slides follow the music: every 4 beats</span>
+    <span class="sp"></span>
+    <button id="bmusic" class="btn on" title="Music (Ctrl+Shift+L)"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 50%; background: #fff"></span>Golden Hour<span class="mono t55" style="font-size: 11px">124 BPM</span></button>
+    <button class="btn" style="border-color: rgba(159,208,255,.6); color: #cfe7ff"><span aria-hidden="true">●</span>Casting</button>
+    <button class="btn">Tools</button>
+  </nav>
+
+  <section id="media-dock" style="position: absolute; left: 0; right: 0; top: 380px; bottom: 0; background: #0d0d0d; border-top: 1px solid rgba(255,255,255,.1)">
+    <header class="row" style="padding: 0 16px; border-bottom: 1px solid rgba(255,255,255,.08); gap: 14px">
+      <div class="row" role="tablist" style="gap: 18px"><button class="tab" role="tab">Media <span class="t55" style="font-weight: 400">7</span></button><button id="musicTab" class="tab on" role="tab" aria-selected="true">Music <span class="t55" style="font-weight: 400">4</span></button></div>
+      <span class="sp"></span>
+      <button class="btn sm">+ Songs</button><button class="btn sm">+ Folder</button><button class="btn sm">Save as…</button>
+    </header>
+    <div style="display: flex; height: 374px">
+      <div id="musicPane" class="col" style="width: 560px; padding: 10px 12px; gap: 2px; border-right: 1px solid rgba(255,255,255,.08)">
+        <div class="song t55" style="font-size: 11px; padding-top: 0; padding-bottom: 2px"><span></span><span>SONG</span><span>LENGTH</span><span>BEATS</span></div>
+        <div id="musicList" role="listbox" aria-label="Music playlist" class="col" style="gap: 2px">
+          <div class="song now" role="option" aria-selected="true"><span aria-hidden="true">▶</span><span><b>Golden Hour</b> <span class="t55">· Night Drive</span></span><span class="mono t85">3:12</span><span class="chip live"><span aria-hidden="true">✓</span>124 BPM</span></div>
+          <div class="song" role="option"><span class="t55">2</span><span>Low Tide <span class="t55">· Harbor</span></span><span class="mono t85">4:05</span><span class="chip">Cached · 92 BPM</span></div>
+          <div class="song" role="option"><span class="t55">3</span><span>City Lights (Extended)</span><span class="mono t85">11:40</span><span class="col" style="gap: 3px"><span class="t55" style="font-size: 11px">Analyzing 40%</span><span class="prog"><i style="width: 40%"></i></span></span></div>
+          <div class="song" role="option"><span class="t55">4</span><span>Rain Study</span><span class="mono t85">2:48</span><span class="chip warn">! Tempo unclear</span></div>
+          <div class="song" role="option"><span class="t55">5</span><span>low_tide_demo.mp3</span><span class="mono t85">—</span><span class="chip err">✕ Can't read</span></div>
+        </div>
+        <span class="sp"></span>
+        <div class="t55" style="font-size: 12px">Drag to reorder. Select a song and press <span class="kbd">G</span> to fix its beat grid.</div>
+      </div>
+
+      <div id="musicNow" class="col" style="flex: 1; padding: 12px 18px; gap: 8px">
+        <div class="row">
+          <button class="btn ico sm" aria-label="Previous song (Ctrl+←)" title="Previous song (Ctrl+←)">«</button>
+          <button class="btn ico" aria-label="Pause music (Shift+Space)" title="Pause music (Shift+Space)">❚❚</button>
+          <button class="btn ico sm" aria-label="Next song (Ctrl+→)" title="Next song (Ctrl+→)">»</button>
+          <span class="mono" style="font-size: 12px">1:24 / 3:12</span>
+          <div style="flex: 1; height: 14px; position: relative; background-image: repeating-linear-gradient(90deg, rgba(255,255,255,.35) 0 1px, transparent 1px 8px); border-radius: 3px" role="slider" aria-label="Song position" aria-valuetext="1:24"><div style="position: absolute; left: 0; top: 5px; height: 4px; width: 44%; background: #fff; border-radius: 2px"></div></div>
+          <button class="btn sm on" aria-pressed="true">Shuffle</button>
+          <button class="btn sm on" aria-pressed="true">Repeat: all</button>
+          <input type="range" aria-label="Music volume" style="width: 80px; accent-color: #fff">
+        </div>
+        <div class="hr"></div>
+        <div class="row"><span class="lbl">Beat sync</span><span class="sp"></span><button class="btn sm">Beat grid…<span class="kbd">G</span></button></div>
+        <div class="bs"><span>Change slides</span><div class="row"><div class="seg" role="radiogroup" aria-label="Pacing"><button class="on" role="radio" aria-checked="true">Every N beats</button><button role="radio">Every bar</button></div><input class="in mono" style="width: 52px" value="4" aria-label="Beats per slide"><span class="t55">beats · about 1.9 s</span></div></div>
+        <div class="bs"><span>Transitions</span><div class="row"><button class="sw" role="switch" aria-checked="true" aria-label="Stronger on loud parts"></button><span class="t85">Stronger on loud parts</span></div></div>
+        <div class="bs" style="border: 0"><span>Sync offset</span><div class="row"><input type="range" aria-label="Sync offset in milliseconds" style="flex: 1; accent-color: #fff"><span class="mono" style="width: 70px; text-align: right">+120 ms</span><span class="t55" style="font-size: 12px">Saved · use if speakers or HDMI lag</span></div></div>
+        <div class="bn warn" role="status"><span aria-hidden="true">!</span><div><b>Casting to Living Room TV.</b> Beat sync covers this PC's screens only. For a beat-synced show on the TV, export a music video and cast the file. <a href="#">Export music video…</a></div></div>
+      </div>
+    </div>
+  </section>
+</div>
+</body>
+</html>

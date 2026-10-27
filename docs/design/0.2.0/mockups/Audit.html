@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · SlideX UX audit</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#0b0b0b}
+a{color:#cfe7ff}a:hover{color:#fff}
+.doc{width:1280px;min-height:2100px;box-sizing:border-box;padding:56px 64px;background:#0b0b0b;color:#fff;font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;font-size:14px;line-height:1.5}
+.doc h1{font-size:34px;margin:0 0 6px;letter-spacing:-.02em}
+.doc h2{font-size:18px;margin:34px 0 10px}
+.doc p{margin:0;color:rgba(255,255,255,.75)}
+.doc table{width:100%;border-collapse:collapse;font-size:13px}
+.doc th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.2)}
+.doc td{vertical-align:top;padding:10px;border-bottom:1px solid rgba(255,255,255,.08);color:rgba(255,255,255,.85)}
+.doc td:first-child{white-space:nowrap}
+.p{display:inline-block;font-weight:800;font-size:11px;padding:2px 7px;border-radius:4px;font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.p0{background:#fff;color:#000}.p1{border:1px solid #fff;color:#fff}.p2{border:1px dashed rgba(255,255,255,.6);color:rgba(255,255,255,.8)}
+.see{font-size:12px;color:rgba(255,255,255,.6)}
+
+</style>
+</head>
+<body>
+<div class="doc">
+  <h1>UX audit · SlideX 0.1.13</h1>
+  <p>Ranked by harm. <span class="p p0">P0</span> loses data or breaks a core task · <span class="p p1">P1</span> slows you down daily · <span class="p p2">P2</span> polish. "See" points to the artboard with the fix.</p>
+
+  <h2>P0</h2>
+  <table>
+    <tr><th style="width: 60px">#</th><th style="width: 150px">Screen</th><th>Problem</th><th>Why it hurts</th><th>Fix</th></tr>
+    <tr><td><span class="p p0">P0-1</span></td><td>Media Manager · right-click</td><td>"Delete file" sits in the same list as Duplicate and Remove, same weight, one click away.</td><td>A slip deletes the original from disk. On a network share there is no Recycle Bin, so it is gone.</td><td>Split the menu; "Move file to Recycle Bin…" in red, below a divider, on Shift+Del. Confirm dialog names the files, says it affects other playlists, warns about shares, offers "Remove from playlist only", focus starts on Cancel. <span class="see">See: Media Manager</span></td></tr>
+    <tr><td><span class="p p0">P0-2</span></td><td>Undocked window</td><td>Opened black; order wrong after Dock; nothing shows whether it is linked.</td><td>The second screen shows nothing or the wrong list, and you can't tell which.</td><td>Main window owns the state; the second window shows a skeleton until the first snapshot, a link chip at all times, pauses edits when the link drops, and Dock confirms "order kept". <span class="see">See: D · Second window</span></td></tr>
+    <tr><td><span class="p p0">P0-3</span></td><td>Cast panel</td><td>"Connecting…" can sit with no time, step or cancel; failure is "Could not open a secure connection to the TV." with no next step.</td><td>Casting is a core feature and the panel leaves you guessing whether to wait, retry or fix the firewall.</td><td>Three named steps with a timer and Cancel; time out at 15 s; plain error with the firewall hint inline; Try again / Enter TV address; raw error and log path under Details. <span class="see">See: Cast</span></td></tr>
+  </table>
+
+  <h2>P1</h2>
+  <table>
+    <tr><th style="width: 60px">#</th><th style="width: 150px">Screen</th><th>Problem</th><th>Why it hurts</th><th>Fix</th></tr>
+    <tr><td><span class="p p1">P1-1</span></td><td>Controls · More tools</td><td>About 20 icon-only controls in one unlabeled row, mixing actions (screenshot) with settings (duration, transition).</td><td>You hunt by hovering. Similar icons (mirror H/V, max modes, export graded/cropped) are easy to mix up.</td><td>Replace the row with a Tools sheet: 4 labeled groups, type-to-find, key shown on every row. Settings-type controls also live in Settings. Bottom bar keeps about 12 primaries plus Music and Settings. <span class="see">See: Controls</span></td></tr>
+    <tr><td><span class="p p1">P1-2</span></td><td>Settings (4 places)</td><td>Settings are split across More tools, Ken Burns, the shortcut editor and Cast.</td><td>No single place to check how the app is set up; 0.2.0 adds music and render settings with nowhere to go.</td><td>One Settings modal (Ctrl+,) with sections: Playback, Ken Burns, Music &amp; beat sync, Music video, Cast, Second window, Keyboard shortcuts, Advanced. Existing modals become sections. <span class="see">See: Settings</span></td></tr>
+    <tr><td><span class="p p1">P1-3</span></td><td>Media Manager header</td><td>Emoji icon buttons (shuffle, new folder, save, load) with no labels; two folder emoji mean different things.</td><td>Emoji render differently across Windows fonts and can't be read at a glance.</td><td>Short text buttons with tooltips and keys, grouped Add · Organize · Window. <span class="see">See: Media Manager</span></td></tr>
+    <tr><td><span class="p p1">P1-4</span></td><td>Undock / Dock</td><td>"Undock" is jargon; the toast "Media Manager undocked." doesn't say where it went.</td><td>If the window opens on the other monitor, it looks like the panel just vanished.</td><td>"Open in window" / "Dock back", same key both ways (Ctrl+Shift+U), and the main window shows a "Media Manager is in its own window · Bring back" stub where the dock was.</td></tr>
+    <tr><td><span class="p p1">P1-5</span></td><td>Cast panel style</td><td>Its own blue palette and system font, and raw encoder names (libx264, h264_mf, h264_nvenc, h264_qsv).</td><td>It looks like another app, and encoder names mean nothing without lookup.</td><td>Unify on the glass tokens. Keep the blue (#9fd0ff) only as the app-wide "live / connected" accent, always with a dot and a word. Encoders become Auto / Compatible / Windows built-in / NVIDIA / Intel, with the raw name in small mono below. <span class="see">See: Cast</span></td></tr>
+    <tr><td><span class="p p1">P1-6</span></td><td>Landing</td><td>Cast is outlined in blue, so it reads as the default, though it's the least likely first step; Continue isn't emphasised; "Image Updates · advanced" is unclear.</td><td>The most common action (Continue) takes a mouse hunt; the blue tile pulls the eye to the wrong place.</td><td>Continue is the default (Enter); recent playlists listed inline; Make music video added; Cast, Settings, Shortcuts move to a quiet row; Image Updates moves to Settings › Advanced. <span class="see">See: Landing</span></td></tr>
+    <tr><td><span class="p p1">P1-7</span></td><td>Keyboard shortcuts</td><td>Keys are only discoverable through the shortcut editor; tooltips don't show them.</td><td>For a keyboard-driven app, you only learn keys by opening a modal.</td><td>Every tooltip ends with its key; Tools sheet shows keys; ? opens a read-only cheat sheet; the editor moves into Settings.</td></tr>
+    <tr><td><span class="p p1">P1-8</span></td><td>All screens</td><td>Text at .3 and .45 white on #000/#141414 is about 2.4:1 and 4.4:1 (version line, "or drop files here", filename overlay, "reset" buttons).</td><td>Fails 4.5:1; hard to read on a dim room monitor or a TV.</td><td>Any readable text at .6 or more; keep .3 for decoration and disabled only. Mockups follow this.</td></tr>
+    <tr><td><span class="p p1">P1-10</span></td><td>Media Manager · edits</td><td>Remove from playlist, Shuffle and drag-reorder can't be undone.</td><td>One stray Shuffle scrambles a hand-ordered playlist with no way back.</td><td>Ctrl+Z / Ctrl+Y for playlist edits (same history model as the timeline), plus an "Undo" button on the toast after Remove and Shuffle. Deleting files stays on the Recycle Bin, not undo.</td></tr>
+    <tr><td><span class="p p1">P1-9</span></td><td>Modals</td><td>No visible focus ring in the screenshots; unclear which control has focus.</td><td>Breaks keyboard use, which is the main way you drive the app.</td><td>2 px white :focus-visible ring everywhere; trap focus in modals; Esc closes the topmost layer only; Enter runs the primary button.</td></tr>
+  </table>
+
+  <h2>P2</h2>
+  <table>
+    <tr><th style="width: 60px">#</th><th style="width: 150px">Screen</th><th>Problem</th><th>Why it hurts</th><th>Fix</th></tr>
+    <tr><td><span class="p p2">P2-1</span></td><td>Playlist library</td><td>Dates as "10/24/2026, 6:00:00 PM"; Delete as prominent as Load.</td><td>Seconds are noise; the destructive button draws the eye.</td><td>"Oct 24, 6:00 PM"; Delete stays confirmed but moves right and quieter. Recent playlists also appear on Landing.</td></tr>
+    <tr><td><span class="p p2">P2-2</span></td><td>Toast</td><td>Red action buttons on neutral messages.</td><td>Red should mean "this destroys something".</td><td>Neutral buttons; red only for destructive actions.</td></tr>
+    <tr><td><span class="p p2">P2-3</span></td><td>Ken Burns modal</td><td>"400%" intensity with no reference point; long per-slide list without search.</td><td>Hard to predict the result.</td><td>Label slider ends (Subtle / Strong) and add the same filter field as the shortcut editor.</td></tr>
+    <tr><td><span class="p p2">P2-4</span></td><td>Bottom bar</td><td>"1/7" with no spacing; seek bar has no label or time.</td><td>Hard to read; not accessible to the keyboard.</td><td>"3 / 7", seek is a labelled slider with arrow keys.</td></tr>
+    <tr><td><span class="p p2">P2-5</span></td><td>Fonts</td><td>Plus Jakarta Sans and JetBrains Mono come from Google Fonts.</td><td>Offline, the fallback font swaps in and layouts shift.</td><td>Bundle the woff2 files with the app (see Porting note).</td></tr>
+    <tr><td><span class="p p2">P2-6</span></td><td>Media Manager</td><td>"3 selected" badge doesn't say what an action will affect.</td><td>Unclear whether Delete or Shuffle hits the selection or the whole list.</td><td>Actions that use the selection say so: "Remove 3", "Move 3 files to Recycle Bin…".</td></tr>
+  </table>
+</div>
+</body>
+</html>
