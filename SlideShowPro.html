@@ -3750,14 +3750,6 @@ stage.addEventListener('contextmenu', e => {
   ctxMi = cur;
   positionCtx(e);
 });
-if (g('pllist')) g('pllist').addEventListener('contextmenu', e => {
-  const row = e.target.closest && e.target.closest('[data-mi]');
-  if (!row) return;
-  e.preventDefault();
-  e.stopPropagation();
-  ctxMi = Number(row.dataset.mi);
-  positionCtx(e);
-});
 document.addEventListener('click', e => {
   if (!ctxmenu.contains(e.target)) ctxmenu.style.display = 'none';
 });
@@ -6507,7 +6499,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Delete') {
     e.preventDefault();
     const mi = getMediaItems(), item = mi[cur]; if (!item) return;
-    removePlaylistFiles([item], false);
+    removeItem(items.indexOf(item), true);
     return;
   }
   if (e.key === 'Backspace') {
@@ -6597,9 +6589,23 @@ async function openRecycleConfirm(contextMi) {
   ctxmenu.style.display = 'none';
   if (!window.SlideXCore) return;
   const mi = getMediaItems();
-  const indexes = SlideXCore.deleteTargetIndexes(mi.length, cur, selectedItems, contextMi);
-  const files = indexes.map(i => mi[i]).filter(Boolean);
-  if (!files.length) return;
+  const idx = (contextMi == null || contextMi !== contextMi) ? cur : contextMi;
+  const file = mi[idx];
+  if (!file) return;
+  let shown = file;
+  if (sspIsTauri() && file.path && typeof tauriInvoke === 'function') {
+    try {
+      const rows = await tauriInvoke('classify_media_drives', { paths: [file.path] }) || [];
+      const row = rows[0];
+      if (row) {
+        shown = Object.assign({}, file, {
+          driveType: row.driveType != null ? row.driveType : row.drive_type,
+          deviceTarget: row.deviceTarget || row.device_target || ''
+        });
+      }
+    } catch (_) {}
+  }
+  const files = [shown];
   delConfirmFiles = files;
   const others = await otherPlaylistNames(files);
   if (!delConfirmFiles.length) return;
@@ -6613,14 +6619,23 @@ async function commitRecycle() {
     renderDelConfirm(SlideXCore.deleteConfirmRefused(files, "Couldn't move the file to the Recycle Bin. SlideX doesn't have a path on this PC for it."));
     return;
   }
+  let report;
   try {
-    await tauriInvoke('trash_media_files', { paths });
+    report = await tauriInvoke('trash_media_files', { paths });
   } catch (e) {
     const msg = (e && e.message) ? e.message : String(e);
     renderDelConfirm(SlideXCore.deleteConfirmRefused(files, msg));
     return;
   }
-  removePlaylistFiles(files, true);
+  const moved = new Set((report && (report.moved || [])) || []);
+  const movedFiles = files.filter(f => moved.has(f.path));
+  if (movedFiles.length) removePlaylistFiles(movedFiles, true);
+  const failed = (report && report.failed) || [];
+  if (failed.length) {
+    const left = files.filter(f => !moved.has(f.path));
+    renderDelConfirm(SlideXCore.deleteConfirmRefused(left.length ? left : files, report.message || failed.join(' '), movedFiles.length > 0));
+    return;
+  }
   closeDelConfirm();
   showToast('Moved to the Recycle Bin. You can restore it from there.', 3500);
 }
@@ -7924,6 +7939,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     playlist: function () { enqueue(function () { return pushPlaylist(); }); }
   };
 
+  if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen) {
+    window.__TAURI__.event.listen("cast://link-open", function () {
+      if (!connectState || connectState.phase !== "connecting" || !Core) return;
+      connectState = Core.advanceCastConnect(connectState, 2);
+      clearInterval(connectTimer);
+      connectTimer = null;
+      renderConnect(connectState);
+    });
+  }
   document.getElementById("lbcast") && document.getElementById("lbcast").addEventListener("click", openPanel);
   document.getElementById("bcast") && document.getElementById("bcast").addEventListener("click", openPanel);
   document.getElementById("castClose") && document.getElementById("castClose").addEventListener("click", function () {
@@ -8088,11 +8112,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     finishConnectCancel();
   });
   document.getElementById("castRetry") && document.getElementById("castRetry").addEventListener("click", function () {
-    if (!lastConnectDev || !lastConnectDev.host) {
+    var manual = manualTarget();
+    var dev = (Core && Core.retryCastTarget)
+      ? Core.retryCastTarget(manual && manual.host, manual && manual.port, lastConnectDev)
+      : (manual || lastConnectDev);
+    if (!dev || !dev.host) {
       setStatus("Choose a TV, or type its IPv4 address.");
       return;
     }
-    beginUiConnect(lastConnectDev);
+    beginUiConnect(dev);
   });
   document.getElementById("castEnterAddr") && document.getElementById("castEnterAddr").addEventListener("click", function () {
     if (hostEl) {
@@ -8132,7 +8160,13 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     });
   });
   document.getElementById("castDisconnect") && document.getElementById("castDisconnect").addEventListener("click", function () {
+    connectGen++;
+    clearInterval(connectTimer);
+    connectTimer = null;
+    directCancelRust();
     stopLocalCast();
+    connectState = null;
+    renderConnect(null);
     enqueue(function () {
       return call("cast_disconnect").then(function () {
         setStatus("Cast stopped. The media server is closed. You can cast again without restarting SlideX.");

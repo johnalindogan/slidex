@@ -1891,9 +1891,16 @@ test('user media is never permanently deleted and the confirm names files', () =
     assert.doesNotMatch(text, /\brm(?:Sync)?\s*\(/);
   });
   const trashImpl = trash.split('#[cfg(test)]')[0];
-  assert.match(trashImpl, /trash::delete/);
+  assert.match(trashImpl, /FOF_ALLOWUNDO/);
+  assert.match(trashImpl, /TSF_DELETE_RECYCLE_IF_POSSIBLE/);
+  assert.match(trashImpl, /DRIVE_FIXED/);
+  assert.doesNotMatch(trashImpl, /trash::delete/);
   assert.doesNotMatch(trashImpl, /remove_file|remove_dir|std::fs::remove/);
+  assert.doesNotMatch(trashImpl, /FOF_WANTNUKEWARNING/);
   const cmd = lib.slice(lib.indexOf('fn trash_media_files'), lib.indexOf('fn cast_set_playlist'));
+  assert.match(lib.slice(lib.lastIndexOf('fn trash_media_files') - 80, lib.indexOf('fn trash_media_files')), /#\[tauri::command\(async\)\]/);
+  assert.match(lib.slice(lib.indexOf('fn cast_connect') - 80, lib.indexOf('fn cast_connect')), /#\[tauri::command\(async\)\]/);
+  assert.match(lib.slice(lib.indexOf('fn cast_cancel_connect') - 80, lib.indexOf('fn cast_cancel_connect')), /#\[tauri::command\(async\)\]/);
   assert.match(cmd, /media_trash::trash_user_media/);
   assert.doesNotMatch(cmd, /remove_file|remove_dir/);
   assert.match(html, /trash_media_files/);
@@ -1972,6 +1979,38 @@ test('user media is never permanently deleted and the confirm names files', () =
     'Current'
   );
   assert.deepEqual(Array.from(others), ['Weekend']);
+
+  const mapped = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4', driveType: C.DRIVE_REMOTE }],
+    { inTauri: true }
+  );
+  assert.equal(mapped.recycleOk, false);
+  assert.match(mapped.body, /network drive/);
+  assert.match(mapped.body, /Nothing was deleted/);
+  const usb = C.deleteConfirmModel(
+    [{ name: 'photo.jpg', path: 'E:\\DCIM\\photo.jpg', driveType: C.DRIVE_REMOVABLE }],
+    { inTauri: true }
+  );
+  assert.equal(usb.recycleOk, false);
+  assert.match(usb.body, /removable drive/);
+  const subst = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4', driveType: C.DRIVE_FIXED, deviceTarget: '\\\\?\\UNC\\nas\\media' }],
+    { inTauri: true }
+  );
+  assert.equal(subst.recycleOk, false);
+  assert.match(subst.body, /network share/);
+  const partial = C.deleteConfirmRefused(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4' }],
+    "Moved lake.jpg to the Recycle Bin. Couldn't move clip.mp4 to the Recycle Bin. It's on a network drive, which has no Recycle Bin.",
+    true
+  );
+  assert.match(partial.body, /lake\.jpg/);
+  assert.match(partial.body, /clip\.mp4/);
+  assert.doesNotMatch(partial.body, /Nothing was deleted/);
+  const delHandler = html.slice(html.indexOf("if (e.key === 'Delete')"), html.indexOf("if (e.key === 'Backspace')"));
+  assert.match(delHandler, /removeItem\(items\.indexOf\(item\), true\)/);
+  assert.doesNotMatch(html, /deleteTargetIndexes/);
+  assert.doesNotMatch(html, /pllist'\)\.addEventListener\('contextmenu'/);
 });
 
 test('cast connect shows the three steps, then timeout, cancel, and retry reset it', () => {
@@ -2043,6 +2082,12 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.match(C.toggleCastDetails(failed).details, /cast\.log/);
   assert.equal(C.retryCastConnect(failed).phase, 'connecting');
   assert.equal(C.CAST_CONNECT_TIMEOUT_MS, 15000);
+  const typedRetry = C.retryCastTarget('192.0.2.20', 8009, { host: '192.0.2.10', port: 8009, name: 'Old TV' });
+  assert.equal(typedRetry.host, '192.0.2.20');
+  assert.equal(typedRetry.port, 8009);
+  assert.equal(typedRetry.name, 'TV');
+  assert.equal(C.retryCastTarget('', null, { host: '192.0.2.10', name: 'Old TV' }).host, '192.0.2.10');
+  assert.equal(C.retryCastTarget('   ', null, null), null);
 
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   assert.match(html, /id="castSteps"/);
@@ -2056,7 +2101,20 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.match(html, /cancelCastConnect/);
   assert.match(html, /failCastConnect/);
   assert.match(html, /retryCastConnect/);
+  assert.match(html, /retryCastTarget/);
+  assert.match(html, /cast:\/\/link-open/);
   assert.match(html, /cast_cancel_connect/);
+  const retry = html.slice(html.indexOf('getElementById("castRetry")'), html.indexOf('getElementById("castEnterAddr")'));
+  assert.match(retry, /manualTarget\(\)/);
+  assert.match(retry, /retryCastTarget/);
+  const disconnect = html.slice(html.indexOf('getElementById("castDisconnect")'), html.indexOf('setInterval(watchNetwork'));
+  assert.match(disconnect, /connectGen\+\+/);
+  assert.match(disconnect, /renderConnect\(null\)/);
+  assert.match(disconnect, /directCancelRust\(\)/);
+  assert.match(html.slice(html.indexOf('function directCancelRust'), html.indexOf('function rememberCastLog')), /cast_cancel_connect/);
+  const rust = fs.readFileSync(new URL('./src-tauri/src/cast.rs', import.meta.url), 'utf8');
+  assert.match(rust, /fn cancel_during_connect_resets_so_cast_can_be_retried/);
+  assert.match(rust, /CONNECT_READY_WAIT/);
   const beginUi = html.slice(html.indexOf('function beginUiConnect'), html.indexOf('document.getElementById("castStart")'));
   const openedLink = beginUi.indexOf('advanceCastConnect(connectState, 2)');
   const stoppedClock = beginUi.indexOf('clearInterval(connectTimer)', openedLink);
@@ -2079,4 +2137,8 @@ test('the Undock button stays in the code and is not shown in 0.1.18', () => {
   assert.match(undockFn, /if \(!SSP_UNDOCK_ENABLED\) return/);
   assert.match(html, /function undockPlaylistWindow/);
   assert.match(html, /open_playlist_window/);
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
+  assert.match(open, /undock_blocked_reason/);
+  assert.match(lib, /Undock is off in 0\.1\.18/);
 });

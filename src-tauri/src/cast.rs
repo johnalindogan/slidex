@@ -57,7 +57,12 @@ const LINK_DEAD_AFTER: Duration = Duration::from_secs(15);
 /// Launch can use the full 15s, plus TCP and TLS. Tests may wait this long.
 const SESSION_READY_WAIT: Duration = Duration::from_secs(20);
 /// The Cast panel gives up while opening a secure link, then Cast can be retried.
+/// This budget is TCP + TLS only. The TV accept prompt and receiver launch use
+/// `LAUNCH_DEADLINE` after the link is open, so a prompt is not cut off at 15 s.
 pub const CONNECT_ATTEMPT_WAIT: Duration = Duration::from_secs(15);
+/// Link budget plus the launch/prompt budget. The UI stops its 15 s clock when
+/// `cast://link-open` fires, which is before `launch_receiver`.
+pub const CONNECT_READY_WAIT: Duration = Duration::from_secs(30);
 const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
 const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
 const CAST_LOG_MAX: u64 = 1_000_000;
@@ -5011,7 +5016,23 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
     ) -> Result<CastConnectInfo, String> {
-        self.connect_wait(host, port, name, CONNECT_ATTEMPT_WAIT)
+        self.connect_linking(host, port, name, None)
+    }
+
+    /// Like `connect`, and `link_open` is signalled once the secure link is up,
+    /// before the receiver launch and any TV accept prompt.
+    pub fn connect_linking(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        name: Option<String>,
+        link_open: Option<mpsc::Sender<()>>,
+    ) -> Result<CastConnectInfo, String> {
+        debug_assert_eq!(
+            CONNECT_READY_WAIT,
+            CONNECT_ATTEMPT_WAIT + LAUNCH_DEADLINE
+        );
+        self.connect_wait_inner(host, port, name, CONNECT_READY_WAIT, link_open)
     }
 
     /// Stop an attempt that has not finished, and drop a live session.
@@ -5036,7 +5057,7 @@ impl CastState {
         name: Option<String>,
         ready_wait: Duration,
     ) -> Result<CastConnectInfo, String> {
-        match self.connect_wait_inner(host, port, name, ready_wait) {
+        match self.connect_wait_inner(host, port, name, ready_wait, None) {
             Ok(info) => {
                 if let Ok(mut slot) = self.last_error.lock() {
                     *slot = None;
@@ -5060,6 +5081,7 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
         ready_wait: Duration,
+        link_open: Option<mpsc::Sender<()>>,
     ) -> Result<CastConnectInfo, String> {
         // The profile query runs on its own thread. Do not wait for it here.
         let _ = lan_category_now();
@@ -5111,7 +5133,7 @@ impl CastState {
             .spawn(move || {
                 run_session(
                     ip, port, friendly, bind.ip, cmd_rx, ready_tx, status_t, remote_t, cancel_t,
-                    logged_t,
+                    logged_t, link_open,
                 );
             })
             .map_err(|e| format!("cast thread: {e}"))?;
@@ -5418,6 +5440,7 @@ fn run_session(
     remote_event: Arc<Mutex<Option<String>>>,
     cancel: Arc<AtomicBool>,
     disconnect_logged: Arc<AtomicBool>,
+    link_open: Option<Sender<()>>,
 ) {
     // Start the profile query without waiting. A later load timeout only reads the cache.
     let _ = lan_category_now();
@@ -5439,6 +5462,9 @@ fn run_session(
             return;
         }
     };
+    if let Some(tx) = link_open {
+        let _ = tx.send(());
+    }
     if let Err(e) = link.launch_receiver() {
         http.shutdown();
         let _ = ready_tx.send(Err(e));
@@ -10337,6 +10363,12 @@ mod tests {
     #[test]
     fn connect_attempt_is_fifteen_seconds_and_idle_cancel_leaves_cast_idle() {
         assert_eq!(CONNECT_ATTEMPT_WAIT, Duration::from_secs(15));
+        assert_eq!(CONNECT_READY_WAIT, CONNECT_ATTEMPT_WAIT + LAUNCH_DEADLINE);
+        let src = include_str!("cast.rs");
+        let body = src.split("fn run_session").nth(1).expect("run_session");
+        let link_at = body.find("if let Some(tx) = link_open").expect("link signal");
+        let launch_at = body.find("link.launch_receiver()").expect("launch");
+        assert!(link_at < launch_at, "the 15 s link clock must stop before launch");
         let state = CastState::default();
         state.cancel_connect().unwrap();
         assert!(!state.status().connected);

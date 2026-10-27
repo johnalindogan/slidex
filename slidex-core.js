@@ -1643,6 +1643,10 @@
     return enabled === true;
   }
 
+  var DRIVE_REMOVABLE = 2;
+  var DRIVE_FIXED = 3;
+  var DRIVE_REMOTE = 4;
+
   function isNetworkSharePath(path) {
     var trimmed = String(path || '').trim();
     if (!trimmed) return false;
@@ -1656,20 +1660,27 @@
     return slash.indexOf('\\\\') === 0;
   }
 
-  function deleteTargetIndexes(mediaCount, cur, selected, contextMi) {
-    var sel = [];
-    if (selected && typeof selected.forEach === 'function') {
-      selected.forEach(function (n) { sel.push(n); });
+  function deviceTargetIsNetwork(target) {
+    var lower = String(target || '').toLowerCase();
+    return lower.indexOf('unc\\') >= 0 || lower.indexOf('\\device\\mup') >= 0 || lower.indexOf('lanmanredirector') >= 0 || lower.indexOf('\\\\') === 0;
+  }
+
+  function driveRefuseMessage(file) {
+    var name = (file && file.name) || 'this file';
+    if (file && deviceTargetIsNetwork(file.deviceTarget)) {
+      return "Couldn't move " + name + " to the Recycle Bin. The drive is a substitute for a network share, which has no Recycle Bin. Nothing was deleted.";
     }
-    var count = mediaCount | 0;
-    sel = sel.filter(function (n) { return n >= 0 && n < count; });
-    var ctx = contextMi == null || contextMi !== contextMi ? cur : contextMi;
-    if (ctx != null && sel.indexOf(ctx) === -1) {
-      return ctx >= 0 && ctx < count ? [ctx] : [];
+    var kind = file && file.driveType;
+    if (kind === DRIVE_REMOTE) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's on a network drive, which has no Recycle Bin. Nothing was deleted.";
     }
-    if (sel.length) return sel.slice().sort(function (a, b) { return a - b; });
-    if (ctx != null && ctx >= 0 && ctx < count) return [ctx];
-    return [];
+    if (kind === DRIVE_REMOVABLE) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's on a removable drive, which has no Recycle Bin. Nothing was deleted.";
+    }
+    if (kind != null && kind !== DRIVE_FIXED) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's not on a fixed drive on this PC. Nothing was deleted.";
+    }
+    return '';
   }
 
   function playlistDeleteWarning(names) {
@@ -1701,8 +1712,9 @@
     var count = names.length;
     var inTauri = opts.inTauri !== false;
     var shares = list.filter(function (f) { return !!(f && f.path && isNetworkSharePath(f.path)); });
+    var unfixed = list.filter(function (f) { return !isNetworkSharePath(f && f.path) && driveRefuseMessage(f); });
     var missingPath = list.filter(function (f) { return !f || !f.path; });
-    var recycleOk = !!(inTauri && count > 0 && !shares.length && !missingPath.length);
+    var recycleOk = !!(inTauri && count > 0 && !shares.length && !unfixed.length && !missingPath.length);
     var shareWarn = '';
     if (!inTauri) {
       shareWarn = "The Recycle Bin isn't available here. Nothing was deleted.";
@@ -1710,6 +1722,8 @@
       shareWarn = count === 1
         ? "Couldn't move " + names[0] + " to the Recycle Bin. It's on a network share, which has no Recycle Bin. Nothing was deleted."
         : "Couldn't move these files to the Recycle Bin. A network share has no Recycle Bin, so SlideX won't delete them. Nothing was deleted.";
+    } else if (unfixed.length) {
+      shareWarn = driveRefuseMessage(unfixed[0]);
     } else if (missingPath.length) {
       shareWarn = "Couldn't move " + (names[0] || 'this file') + " to the Recycle Bin. SlideX doesn't have a path on this PC for it. Nothing was deleted.";
     }
@@ -1734,10 +1748,10 @@
     };
   }
 
-  function deleteConfirmRefused(files, message) {
+  function deleteConfirmRefused(files, message, partial) {
     var model = deleteConfirmModel(files, { inTauri: true, otherPlaylists: [] });
     var plain = message ? String(message) : model.shareWarn;
-    if (plain && plain.indexOf('Nothing was deleted') < 0) plain += ' Nothing was deleted.';
+    if (!partial && plain && plain.indexOf('Nothing was deleted') < 0) plain += ' Nothing was deleted.';
     model.recycleOk = false;
     model.actions = ['remove-only', 'cancel'];
     model.focus = 'cancel';
@@ -1769,6 +1783,15 @@
     if (key === 'Escape') return 'cancel';
     if (key === 'Tab' || key === 'Enter' || key === ' ') return 'dialog';
     return 'swallow';
+  }
+
+  function retryCastTarget(typedHost, typedPort, lastDev) {
+    var host = String(typedHost || '').trim();
+    if (host) {
+      var port = typedPort > 0 ? typedPort : null;
+      return { host: host, port: port, name: 'TV' };
+    }
+    return lastDev && lastDev.host ? lastDev : null;
   }
 
   function applyDeleteChoice(items, indexes, choice) {
@@ -1925,8 +1948,13 @@
     castConnectStepTexts: castConnectStepTexts,
     castConnectStepMarks: castConnectStepMarks,
     undockControlShown: undockControlShown,
+    DRIVE_FIXED: DRIVE_FIXED,
+    DRIVE_REMOVABLE: DRIVE_REMOVABLE,
+    DRIVE_REMOTE: DRIVE_REMOTE,
     isNetworkSharePath: isNetworkSharePath,
-    deleteTargetIndexes: deleteTargetIndexes,
+    deviceTargetIsNetwork: deviceTargetIsNetwork,
+    driveRefuseMessage: driveRefuseMessage,
+    retryCastTarget: retryCastTarget,
     otherSavedPlaylists: otherSavedPlaylists,
     deleteConfirmModel: deleteConfirmModel,
     deleteConfirmRefused: deleteConfirmRefused,

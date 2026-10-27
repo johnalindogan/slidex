@@ -28,8 +28,17 @@ rustls = "0.23"
 mdns-sd = "0.13"
 if-addrs = "0.13"
 uuid = { version = "1", features = ["v4"] }
-# User media goes to the Recycle Bin. Do not replace this with remove_file.
-trash = "5"
+
+[target.'cfg(windows)'.dependencies]
+# Recycle-or-abort. Not the `trash` crate: that one can permanently delete.
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+] }
+# The `implement` macro names the `windows_core` crate, so it has to be a direct dependency.
+windows-core = "0.61.2"
 
 [profile.release]
 panic = "abort"
