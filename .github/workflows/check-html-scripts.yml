@@ -34,7 +34,7 @@ jobs:
           SLIDEX_REQUIRE_FFMPEG: "1"
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib "cast::"
       - name: Recycle Bin unit tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib media_trash::
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib "media_trash::"
       - name: Run the installer firewall commands
         run: node scripts/cast-firewall-commands.mjs --apply
 
