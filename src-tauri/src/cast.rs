@@ -5032,7 +5032,7 @@ impl CastState {
             CONNECT_READY_WAIT,
             CONNECT_ATTEMPT_WAIT + LAUNCH_DEADLINE
         );
-        self.connect_wait_inner(host, port, name, CONNECT_READY_WAIT, link_open)
+        self.connect_wait(host, port, name, CONNECT_READY_WAIT, link_open)
     }
 
     /// Stop an attempt that has not finished, and drop a live session.
@@ -5056,8 +5056,9 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
         ready_wait: Duration,
+        link_open: Option<mpsc::Sender<()>>,
     ) -> Result<CastConnectInfo, String> {
-        match self.connect_wait_inner(host, port, name, ready_wait, None) {
+        match self.connect_wait_inner(host, port, name, ready_wait, link_open) {
             Ok(info) => {
                 if let Ok(mut slot) = self.last_error.lock() {
                     *slot = None;
@@ -10330,6 +10331,7 @@ mod tests {
                 Some(port),
                 None,
                 Duration::from_millis(400),
+                None,
             )
             .expect_err("a peer that accepts and stays silent must time out");
         let elapsed = started.elapsed();
@@ -10425,6 +10427,7 @@ mod tests {
                 Some(port),
                 Some("Living Room TV".into()),
                 Duration::from_secs(30),
+                None,
             )
         });
         thread::sleep(Duration::from_millis(200));
@@ -10451,6 +10454,7 @@ mod tests {
             Some(port),
             Some("Living Room TV".into()),
             Duration::from_millis(300),
+            None,
         );
         let retry_elapsed = retry_started.elapsed();
         stop.store(true, Ordering::SeqCst);
