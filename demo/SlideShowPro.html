@@ -475,9 +475,7 @@ html,body{background:#000;height:100%;overflow:hidden;}
 <!-- Context menu -->
 <div id="ctxmenu">
   <div class="ctxi" id="ctx-dup">Duplicate in playlist</div>
-  <div class="ctxsep"></div>
   <div class="ctxi" id="ctx-remove">Remove from playlist</div>
-  <div class="ctxi danger" id="ctx-del">Delete file (clears settings)</div>
 </div>
 
 <!-- Floating restore button -->
@@ -1343,20 +1341,6 @@ g('ctx-remove').onclick = () => {
   const mi = getMediaItems(), item = mi[cur]; if (!item) return;
   removeItem(items.indexOf(item), false);
 };
-g('ctx-del').onclick = () => {
-  ctxmenu.style.display = 'none';
-  const mi = getMediaItems(), item = mi[cur]; if (!item) return;
-  const fname = item.name || '';
-  pendingDeleteItem = item.fileHandle ? item : null;
-  removeItem(items.indexOf(item), true);
-  if (fname) {
-    if (pendingDeleteItem) {
-      showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist.</span><br><button onclick="confirmDeleteFile()">Delete File from Disk</button>`);
-    } else {
-      showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist. To delete the file, remove it from your file system manually.</span>`);
-    }
-  }
-};
 
 /* ── IndexedDB handle store ── */
 function openHandleDB() {
@@ -2219,20 +2203,10 @@ document.addEventListener('keydown', e => {
   const t = e.target.tagName;
   if (t === 'SELECT' || t === 'INPUT' || t === 'TEXTAREA') return;
 
-  /* Delete = remove from playlist + clear LS, then offer file deletion */
   if (e.key === 'Delete') {
     e.preventDefault();
     const mi = getMediaItems(), item = mi[cur]; if (!item) return;
-    const fname = item.name || '';
-    pendingDeleteItem = item.fileHandle ? item : null;
-    removeItem(items.indexOf(item), true);
-    if (fname) {
-      if (pendingDeleteItem) {
-        showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist.</span><br><button onclick="confirmDeleteFile()">Delete File from Disk</button>`);
-      } else {
-        showToast(`<b style="color:#fff">${fname}</b><br><span style="color:rgba(255,255,255,.5);font-size:11px">Removed from playlist. To delete the file, remove it from your file system manually.</span>`);
-      }
-    }
+    removeItem(items.indexOf(item), false);
     return;
   }
   if (e.key === 'Backspace') {
@@ -2282,18 +2256,6 @@ function showToast(html, dur = 5000) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), dur);
 }
-let pendingDeleteItem = null;
-window.confirmDeleteFile = async function() {
-  const item = pendingDeleteItem; if (!item?.fileHandle) return;
-  pendingDeleteItem = null;
-  g('toast').classList.remove('show');
-  try {
-    const perm = await item.fileHandle.requestPermission({ mode: 'readwrite' });
-    if (perm !== 'granted') { showToast('Permission denied — delete the file manually.', 4000); return; }
-    await item.fileHandle.remove();
-    showToast(`<b style="color:#fff">${item.name}</b> deleted from disk.`, 3000);
-  } catch(e) { showToast(`Could not delete: ${e.message}`, 4000); }
-};
 </script>
 <div id="toast"></div>
 </body>

@@ -745,19 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.13 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.18 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.13');
-  assert.equal(tauri.version, '0.1.13');
+  assert.equal(pkg.version, '0.1.18');
+  assert.equal(tauri.version, '0.1.18');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.13"/m);
-  assert.match(lock, /"version": "0\.1\.13"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.13"/);
+  assert.match(cargo, /^version = "0\.1\.18"/m);
+  assert.match(lock, /"version": "0\.1\.18"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.18"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -1876,4 +1876,320 @@ test('dropping files from Explorer still works', () => {
   const empty = C.planExplorerFileDrop([], { viewerOpen: true, itemCount: 3 });
   assert.equal(empty.media.length, 0);
   assert.equal(empty.append, true);
+});
+
+test('user media is never permanently deleted and the confirm names files', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const demo = fs.readFileSync(new URL('./demo/SlideShowPro.html', import.meta.url), 'utf8');
+  const core = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+  const trash = fs.readFileSync(new URL('./src-tauri/src/media_trash.rs', import.meta.url), 'utf8');
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  [html, demo, core].forEach((text) => {
+    assert.doesNotMatch(text, /fileHandle\.remove\s*\(/);
+    assert.doesNotMatch(text, /confirmDeleteFile/);
+    assert.doesNotMatch(text, /\bunlink(?:Sync)?\s*\(/);
+    assert.doesNotMatch(text, /\brm(?:Sync)?\s*\(/);
+  });
+  const trashImpl = trash.split('#[cfg(test)]')[0];
+  assert.match(trashImpl, /FOF_ALLOWUNDO/);
+  assert.match(trashImpl, /TSF_DELETE_RECYCLE_IF_POSSIBLE/);
+  assert.match(trashImpl, /DRIVE_FIXED/);
+  assert.doesNotMatch(trashImpl, /trash::delete/);
+  assert.doesNotMatch(trashImpl, /remove_file|remove_dir|std::fs::remove/);
+  assert.doesNotMatch(trashImpl, /FOF_WANTNUKEWARNING/);
+  const cmd = lib.slice(lib.indexOf('fn trash_media_files'), lib.indexOf('fn cast_set_playlist'));
+  assert.match(lib.slice(lib.lastIndexOf('fn trash_media_files') - 80, lib.indexOf('fn trash_media_files')), /#\[tauri::command\(async\)\]/);
+  assert.match(lib.slice(lib.indexOf('fn cast_connect') - 80, lib.indexOf('fn cast_connect')), /#\[tauri::command\(async\)\]/);
+  assert.match(lib.slice(lib.indexOf('fn cast_cancel_connect') - 80, lib.indexOf('fn cast_cancel_connect')), /#\[tauri::command\(async\)\]/);
+  assert.match(cmd, /media_trash::trash_user_media/);
+  assert.doesNotMatch(cmd, /remove_file|remove_dir/);
+  assert.match(html, /trash_media_files/);
+  assert.match(html, /id="delConfirm"/);
+  assert.match(html, /id="ctx-del-sep"/);
+  assert.match(html, /Move file to Recycle Bin…/);
+  assert.match(html, /Shift\+Del/);
+  assert.match(html, /Remove from playlist only/);
+  assert.match(html, /g\('delCancel'\)\.focus\(\)/);
+  assert.match(html, /SlideXCore\.deleteConfirmKey/);
+  assert.match(html, /SlideXCore\.deleteConfirmWarnLine/);
+  const menu = html.slice(html.indexOf('id="ctxmenu"'), html.indexOf('id="delConfirm"'));
+  assert.ok(menu.indexOf('id="ctx-remove"') < menu.indexOf('id="ctx-del-sep"'));
+  assert.ok(menu.indexOf('id="ctx-del-sep"') < menu.indexOf('id="ctx-del"'));
+  assert.match(menu, /class="ctxi danger"/);
+
+  const files = [
+    { name: 'desert_noon_03.jpg', path: 'C:\\Photos\\desert_noon_03.jpg' },
+    { name: 'forest_ridge_04.jpg', path: 'C:\\Photos\\forest_ridge_04.jpg' },
+    { name: 'abstract_glow_05.jpg', path: 'D:\\Clips\\abstract_glow_05.jpg' }
+  ];
+  const model = C.deleteConfirmModel(files, {
+    inTauri: true,
+    otherPlaylists: ['Beach', 'Weekend']
+  });
+  assert.equal(model.count, 3);
+  assert.equal(model.focus, 'cancel');
+  assert.deepEqual(model.names, files.map((f) => f.name));
+  assert.equal(model.recycleOk, true);
+  assert.deepEqual(Array.from(model.actions), ['remove-only', 'cancel', 'recycle']);
+  const shown = C.deleteConfirmText(model);
+  files.forEach((f) => assert.match(shown, new RegExp(f.name)));
+  assert.match(shown, /Move 3 files/);
+  assert.match(shown, /Beach/);
+  assert.match(shown, /Weekend/);
+  assert.equal(C.deleteConfirmKey(model, 'Escape'), 'cancel');
+  assert.equal(C.deleteConfirmKey(model, 'Enter'), 'dialog');
+  assert.equal(C.deleteConfirmKey(model, ' '), 'dialog');
+  assert.equal(C.deleteConfirmKey(model, 'Tab'), 'dialog');
+  assert.equal(C.deleteConfirmKey(model, 'Delete'), 'swallow');
+  assert.match(C.deleteConfirmWarnLine(model), /Beach/);
+  assert.doesNotMatch(C.deleteConfirmWarnLine(model), /Recycle Bin/);
+  const kept = C.applyDeleteChoice(files, [0, 1, 2], 'cancel');
+  assert.deepEqual(kept.map((f) => f.name), files.map((f) => f.name));
+  const removed = C.applyDeleteChoice(files, [0, 1, 2], 'remove-only');
+  assert.equal(removed.length, 0);
+
+  const share = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: '\\\\nas\\media\\clip.mp4' }],
+    { inTauri: true }
+  );
+  assert.equal(share.recycleOk, false);
+  assert.deepEqual(Array.from(share.actions), ['remove-only', 'cancel']);
+  assert.match(share.body, /clip\.mp4/);
+  assert.match(share.body, /network share/);
+  assert.match(share.body, /Nothing was deleted/);
+  assert.equal(C.deleteConfirmWarnLine(share), '');
+  assert.equal(C.deleteConfirmKey(share, 'Escape'), 'cancel');
+  assert.equal(C.isNetworkSharePath('\\\\?\\UNC\\nas\\media\\still.jpg'), true);
+  assert.equal(C.isNetworkSharePath('//nas/media/other.png'), true);
+  assert.equal(C.isNetworkSharePath('C:\\Photos\\lake.jpg'), false);
+  assert.equal(C.isNetworkSharePath('\\\\?\\D:\\Videos\\clip.mp4'), false);
+  const extended = C.deleteConfirmModel(
+    [{ name: 'still.jpg', path: '\\\\?\\UNC\\nas\\media\\still.jpg' }],
+    { inTauri: true }
+  );
+  assert.equal(extended.recycleOk, false);
+  assert.match(C.deleteConfirmText(extended), /still\.jpg/);
+  const others = C.otherSavedPlaylists(
+    files,
+    [
+      { name: 'Weekend', items: [{ path: 'C:\\Photos\\desert_noon_03.jpg' }] },
+      { name: 'Current', items: [{ path: 'C:\\Photos\\desert_noon_03.jpg' }] },
+      { name: 'Empty', items: [{ path: 'C:\\Other\\nope.jpg' }] }
+    ],
+    'Current'
+  );
+  assert.deepEqual(Array.from(others), ['Weekend']);
+
+  const mapped = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4', driveType: C.DRIVE_REMOTE }],
+    { inTauri: true }
+  );
+  assert.equal(mapped.recycleOk, false);
+  assert.match(mapped.body, /network drive/);
+  assert.match(mapped.body, /Nothing was deleted/);
+  const usb = C.deleteConfirmModel(
+    [{ name: 'photo.jpg', path: 'E:\\DCIM\\photo.jpg', driveType: C.DRIVE_REMOVABLE }],
+    { inTauri: true }
+  );
+  assert.equal(usb.recycleOk, false);
+  assert.match(usb.body, /removable drive/);
+  const subst = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4', driveType: C.DRIVE_FIXED, deviceTarget: '\\\\?\\UNC\\nas\\media' }],
+    { inTauri: true }
+  );
+  assert.equal(subst.recycleOk, false);
+  assert.match(subst.body, /network share/);
+  const partial = C.deleteConfirmRefused(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4' }],
+    "Moved lake.jpg to the Recycle Bin. Couldn't move clip.mp4 to the Recycle Bin. It's on a network drive, which has no Recycle Bin.",
+    true
+  );
+  assert.match(partial.body, /lake\.jpg/);
+  assert.match(partial.body, /clip\.mp4/);
+  assert.doesNotMatch(partial.body, /Nothing was deleted/);
+  const delHandler = html.slice(html.indexOf("if (e.key === 'Delete')"), html.indexOf("if (e.key === 'Backspace')"));
+  assert.match(delHandler, /removeItem\(items\.indexOf\(item\), true\)/);
+  assert.doesNotMatch(html, /deleteTargetIndexes/);
+  assert.doesNotMatch(html, /pllist'\)\.addEventListener\('contextmenu'/);
+});
+
+test('copied recycle and remove-only update the playlist and the view', () => {
+  const playlist = [
+    { id: 'a', name: 'a.jpg', path: 'C:\\Photos\\a.jpg', type: 'image' },
+    { id: 'b', name: 'b.jpg', path: 'C:\\Photos\\same.jpg', type: 'image' },
+    { id: 'c', name: 'c.jpg', path: 'c:/photos/same.jpg', type: 'image' },
+    { id: 'd', name: 'd.jpg', path: 'C:\\Photos\\d.jpg', type: 'image' }
+  ];
+  const copyB = Object.assign({}, playlist[1], { driveType: 3 });
+  assert.notEqual(copyB, playlist[1]);
+  const disk = [];
+  const recycled = C.applyPlaylistRemoval(playlist, [copyB], 1, 'recycled', (p) => disk.push(p));
+  assert.deepEqual(disk, ['C:\\Photos\\same.jpg']);
+  assert.equal(recycled.touchedDisk, true);
+  assert.deepEqual(Array.from(recycled.items).map((it) => it.id), ['a', 'c', 'd']);
+  assert.equal(recycled.cur, 1);
+  assert.equal(recycled.shown.id, 'c');
+  assert.equal(recycled.shown, playlist[2]);
+  const removeDisk = [];
+  const removedOnly = C.applyPlaylistRemoval(playlist, [copyB], 1, 'remove-only', (p) => removeDisk.push(p));
+  assert.deepEqual(removeDisk, []);
+  assert.equal(removedOnly.touchedDisk, false);
+  assert.equal(removedOnly.action, 'remove-only');
+  assert.deepEqual(Array.from(removedOnly.items).map((it) => it.id), ['a', 'c', 'd']);
+  assert.equal(removedOnly.cur, 1);
+  assert.equal(removedOnly.shown.id, 'c');
+  const multi = C.applyPlaylistRemoval(
+    playlist,
+    [Object.assign({}, playlist[1]), Object.assign({}, playlist[3])],
+    2,
+    'remove-only',
+    (p) => removeDisk.push(p)
+  );
+  assert.deepEqual(removeDisk, []);
+  assert.deepEqual(Array.from(multi.items).map((it) => it.id), ['a', 'c']);
+  assert.equal(multi.cur, 1);
+  assert.equal(multi.shown.id, 'c');
+  const byPath = C.applyPlaylistRemoval(playlist, [{ name: 'a.jpg', path: 'c:/photos/a.jpg' }], 0, 'remove-only');
+  assert.deepEqual(Array.from(byPath.items).map((it) => it.id), ['b', 'c', 'd']);
+  assert.equal(byPath.cur, 0);
+  assert.equal(byPath.shown.id, 'b');
+  const last = C.applyPlaylistRemoval(playlist, [Object.assign({}, playlist[3])], 3, 'recycled', () => {});
+  assert.deepEqual(Array.from(last.items).map((it) => it.id), ['a', 'b', 'c']);
+  assert.equal(last.cur, 2);
+  assert.equal(last.shown.id, 'c');
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const removal = html.slice(html.indexOf('function removePlaylistFiles'), html.indexOf('async function otherPlaylistNames'));
+  assert.match(removal, /removePlaylistMatches/);
+  assert.doesNotMatch(removal, /new Set\(\s*\(?files/);
+  assert.doesNotMatch(removal, /drop\.has/);
+});
+
+test('cast connect shows the three steps, then timeout, cancel, and retry reset it', () => {
+  const tv = 'Living Room TV';
+  let state = C.beginCastConnect(tv);
+  assert.equal(state.phase, 'connecting');
+  assert.equal(state.connected, false);
+  assert.deepEqual(Array.from(C.castConnectStepTexts(state)), [
+    'Found Living Room TV',
+    'Opening a secure link to the TV… 0 s',
+    'Starting the stream'
+  ]);
+  state = C.tickCastConnect(state, 6000);
+  assert.equal(state.phase, 'connecting');
+  assert.match(C.castConnectStepTexts(state)[1], /6 s/);
+  state = C.advanceCastConnect(state, 2);
+  assert.equal(C.castConnectStepMarks(state)[2], 'current');
+  const streaming = C.tickCastConnect(state, 20000);
+  assert.equal(streaming.phase, 'connecting');
+  assert.equal(streaming.step, 2);
+  assert.equal(streaming.timedOut, false);
+  state = C.tickCastConnect(C.beginCastConnect(tv), 14999);
+  assert.equal(state.phase, 'connecting');
+  state = C.tickCastConnect(state, 1);
+  assert.equal(state.phase, 'failed');
+  assert.equal(state.timedOut, true);
+  assert.equal(state.connected, false);
+  assert.equal(state.active, false);
+  assert.equal(state.canRetry, true);
+  assert.equal(state.detailsOpen, false);
+  assert.equal(
+    state.message,
+    "Couldn't connect to Living Room TV. Make sure the TV is on and on the same Wi-Fi. If Windows asked about the firewall, allow SlideX on Private networks."
+  );
+  assert.match(state.details, /timed out \(15 s\)/);
+  const opened = C.toggleCastDetails(state);
+  assert.equal(opened.detailsOpen, true);
+  assert.match(opened.details, /timed out \(15 s\)/);
+  const logged = C.withCastLogPath(opened, 'C:\\Users\\me\\AppData\\Local\\SlideX\\logs\\cast.log');
+  assert.match(logged.details, /cast\.log/);
+  const again = C.retryCastConnect(logged, tv);
+  assert.equal(again.phase, 'connecting');
+  assert.equal(again.seconds, 0);
+  assert.equal(again.connected, false);
+  assert.equal(again.rawError, null);
+  assert.equal(again.canRetry, false);
+
+  const cancelled = C.cancelCastConnect(C.tickCastConnect(C.beginCastConnect(tv), 4000));
+  assert.equal(cancelled.phase, 'idle');
+  assert.equal(cancelled.cancelled, true);
+  assert.equal(cancelled.connected, false);
+  assert.equal(cancelled.active, false);
+  assert.equal(cancelled.canRetry, true);
+  assert.equal(cancelled.seconds, 0);
+  const retried = C.retryCastConnect(cancelled);
+  assert.equal(retried.phase, 'connecting');
+  assert.equal(retried.tv, tv);
+  assert.equal(retried.elapsedMs, 0);
+
+  const failed = C.failCastConnect(
+    C.beginCastConnect(tv),
+    'TLS handshake to 192.0.2.10:8009 timed out',
+    'C:\\Users\\me\\AppData\\Local\\SlideX\\logs\\cast.log',
+    false
+  );
+  assert.equal(failed.detailsOpen, false);
+  assert.match(failed.message, /Private networks/);
+  assert.match(C.toggleCastDetails(failed).details, /TLS handshake/);
+  assert.match(C.toggleCastDetails(failed).details, /cast\.log/);
+  assert.equal(C.retryCastConnect(failed).phase, 'connecting');
+  assert.equal(C.CAST_CONNECT_TIMEOUT_MS, 15000);
+  const typedRetry = C.retryCastTarget('192.0.2.20', 8009, { host: '192.0.2.10', port: 8009, name: 'Old TV' });
+  assert.equal(typedRetry.host, '192.0.2.20');
+  assert.equal(typedRetry.port, 8009);
+  assert.equal(typedRetry.name, 'TV');
+  assert.equal(C.retryCastTarget('', null, { host: '192.0.2.10', name: 'Old TV' }).host, '192.0.2.10');
+  assert.equal(C.retryCastTarget('   ', null, null), null);
+
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /id="castSteps"/);
+  assert.match(html, /id="castDetails"/);
+  assert.match(html, /id="castCancel"/);
+  assert.match(html, /id="castRetry"/);
+  assert.match(html, /id="castEnterAddr"/);
+  assert.match(html, /If the TV shows a prompt, accept it\./);
+  assert.match(html, /SlideXCore\.beginCastConnect|Core\.beginCastConnect/);
+  assert.match(html, /tickCastConnect/);
+  assert.match(html, /cancelCastConnect/);
+  assert.match(html, /failCastConnect/);
+  assert.match(html, /retryCastConnect/);
+  assert.match(html, /retryCastTarget/);
+  assert.match(html, /cast:\/\/link-open/);
+  assert.match(html, /cast_cancel_connect/);
+  const retry = html.slice(html.indexOf('getElementById("castRetry")'), html.indexOf('getElementById("castEnterAddr")'));
+  assert.match(retry, /manualTarget\(\)/);
+  assert.match(retry, /retryCastTarget/);
+  const disconnect = html.slice(html.indexOf('getElementById("castDisconnect")'), html.indexOf('setInterval(watchNetwork'));
+  assert.match(disconnect, /connectGen\+\+/);
+  assert.match(disconnect, /renderConnect\(null\)/);
+  assert.match(disconnect, /directCancelRust\(\)/);
+  assert.match(html.slice(html.indexOf('function directCancelRust'), html.indexOf('function rememberCastLog')), /cast_cancel_connect/);
+  const rust = fs.readFileSync(new URL('./src-tauri/src/cast.rs', import.meta.url), 'utf8');
+  assert.match(rust, /fn cancel_during_connect_resets_so_cast_can_be_retried/);
+  assert.match(rust, /CONNECT_READY_WAIT/);
+  const beginUi = html.slice(html.indexOf('function beginUiConnect'), html.indexOf('document.getElementById("castStart")'));
+  const openedLink = beginUi.indexOf('advanceCastConnect(connectState, 2)');
+  const stoppedClock = beginUi.indexOf('clearInterval(connectTimer)', openedLink);
+  assert.ok(openedLink !== -1 && stoppedClock !== -1 && stoppedClock - openedLink < 180);
+  assert.doesNotMatch(html, /Connecting…/);
+  assert.equal(C.castFailureMessage('Living Room TV'), failed.message);
+});
+
+test('the Undock button stays in the code and is not shown in 0.1.18', () => {
+  assert.equal(C.UNDOCK_MAIN_WINDOW, false);
+  assert.equal(C.undockControlShown(false), false);
+  assert.equal(C.undockControlShown(true), true);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /id="plundock"/);
+  assert.match(html, /const SSP_UNDOCK_ENABLED = false/);
+  assert.match(html, /if \(SSP_UNDOCK_ENABLED\) document\.body\.classList\.add\('ssp-undock-enabled'\)/);
+  assert.match(html, /body\.ssp-tauri\.ssp-undock-enabled #plundock/);
+  assert.doesNotMatch(html, /body\.ssp-tauri #plundock \{/);
+  const undockFn = html.slice(html.indexOf('async function undockPlaylistWindow'), html.indexOf('let _plCloseBound'));
+  assert.match(undockFn, /if \(!SSP_UNDOCK_ENABLED\) return/);
+  assert.match(html, /function undockPlaylistWindow/);
+  assert.match(html, /open_playlist_window/);
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
+  assert.match(open, /undock_blocked_reason/);
+  assert.match(lib, /Undock is off in 0\.1\.18/);
 });

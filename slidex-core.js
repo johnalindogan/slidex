@@ -1490,6 +1490,390 @@
     return out;
   }
 
+  var CAST_CONNECT_TIMEOUT_MS = 15000;
+  /** 0.1.18 keeps Undock off. The second window is rebuilt in 0.2.0. */
+  var UNDOCK_MAIN_WINDOW = false;
+
+  function castFailureMessage(tv) {
+    var name = tv ? String(tv) : 'the TV';
+    return "Couldn't connect to " + name + ". Make sure the TV is on and on the same Wi-Fi. If Windows asked about the firewall, allow SlideX on Private networks.";
+  }
+
+  function castDetailsText(rawError, logPath) {
+    var lines = [];
+    if (rawError) lines.push(String(rawError));
+    if (logPath) lines.push('Log: ' + logPath);
+    return lines.join('\n');
+  }
+
+  function beginCastConnect(tv) {
+    return {
+      phase: 'connecting',
+      tv: String(tv || 'the TV'),
+      elapsedMs: 0,
+      seconds: 0,
+      step: 1,
+      connected: false,
+      active: false,
+      canRetry: false,
+      cancelled: false,
+      timedOut: false,
+      message: '',
+      rawError: null,
+      logPath: null,
+      details: '',
+      detailsOpen: false
+    };
+  }
+
+  function castConnectStepTexts(state) {
+    var tv = (state && state.tv) || 'the TV';
+    var seconds = state && state.seconds ? state.seconds : 0;
+    return [
+      'Found ' + tv,
+      'Opening a secure link to the TV… ' + seconds + ' s',
+      'Starting the stream'
+    ];
+  }
+
+  function castConnectStepMarks(state) {
+    var step = state && state.step ? state.step : 1;
+    return [
+      'done',
+      step > 1 ? 'done' : 'current',
+      step >= 2 ? 'current' : 'wait'
+    ];
+  }
+
+  function failCastConnect(state, rawError, logPath, timedOut) {
+    var tv = (state && state.tv) || '';
+    var raw = rawError == null ? '' : String(rawError);
+    var path = logPath || (state && state.logPath) || '';
+    return {
+      phase: 'failed',
+      tv: tv,
+      elapsedMs: state && state.elapsedMs ? state.elapsedMs : CAST_CONNECT_TIMEOUT_MS,
+      seconds: state && state.seconds ? state.seconds : Math.floor(CAST_CONNECT_TIMEOUT_MS / 1000),
+      step: state && state.step ? state.step : 1,
+      connected: false,
+      active: false,
+      canRetry: true,
+      cancelled: false,
+      timedOut: !!timedOut,
+      message: castFailureMessage(tv),
+      rawError: raw,
+      logPath: path,
+      details: castDetailsText(raw, path),
+      detailsOpen: false
+    };
+  }
+
+  function tickCastConnect(state, deltaMs) {
+    if (!state || state.phase !== 'connecting') return state;
+    // The 15 s budget is only for opening the secure link (step 1).
+    // Starting the stream is a separate step and must not be cancelled by that clock.
+    if ((state.step || 1) >= 2) return state;
+    var elapsed = (state.elapsedMs || 0) + (deltaMs > 0 ? deltaMs : 0);
+    if (elapsed >= CAST_CONNECT_TIMEOUT_MS) {
+      var failed = failCastConnect(state, 'Opening a secure link to the TV timed out (15 s)', state.logPath, true);
+      failed.elapsedMs = CAST_CONNECT_TIMEOUT_MS;
+      failed.seconds = 15;
+      return failed;
+    }
+    var next = {};
+    Object.keys(state).forEach(function (k) { next[k] = state[k]; });
+    next.elapsedMs = elapsed;
+    next.seconds = Math.floor(elapsed / 1000);
+    next.connected = false;
+    next.active = false;
+    return next;
+  }
+
+  function advanceCastConnect(state, step) {
+    if (!state || state.phase !== 'connecting') return state;
+    var next = {};
+    Object.keys(state).forEach(function (k) { next[k] = state[k]; });
+    next.step = step;
+    return next;
+  }
+
+  function cancelCastConnect(state) {
+    return {
+      phase: 'idle',
+      tv: state && state.tv ? state.tv : '',
+      elapsedMs: 0,
+      seconds: 0,
+      step: 0,
+      connected: false,
+      active: false,
+      canRetry: true,
+      cancelled: true,
+      timedOut: false,
+      message: '',
+      rawError: null,
+      logPath: null,
+      details: '',
+      detailsOpen: false
+    };
+  }
+
+  function retryCastConnect(state, tv) {
+    return beginCastConnect(tv || (state && state.tv) || '');
+  }
+
+  function toggleCastDetails(state) {
+    if (!state || state.phase !== 'failed') return state;
+    var next = {};
+    Object.keys(state).forEach(function (k) { next[k] = state[k]; });
+    next.detailsOpen = !state.detailsOpen;
+    next.details = castDetailsText(state.rawError, state.logPath);
+    return next;
+  }
+
+  function withCastLogPath(state, logPath) {
+    if (!state) return state;
+    var next = {};
+    Object.keys(state).forEach(function (k) { next[k] = state[k]; });
+    next.logPath = logPath || '';
+    next.details = castDetailsText(next.rawError, next.logPath);
+    return next;
+  }
+
+  function undockControlShown(enabled) {
+    return enabled === true;
+  }
+
+  var DRIVE_REMOVABLE = 2;
+  var DRIVE_FIXED = 3;
+  var DRIVE_REMOTE = 4;
+
+  function isNetworkSharePath(path) {
+    var trimmed = String(path || '').trim();
+    if (!trimmed) return false;
+    var slash = trimmed.replace(/\//g, '\\');
+    var lower = slash.toLowerCase();
+    if (lower.indexOf('\\\\?\\unc\\') === 0) return true;
+    if (lower.indexOf('\\\\?\\') === 0) {
+      var rest = slash.slice(4);
+      return !/^[a-zA-Z]:\\/.test(rest);
+    }
+    return slash.indexOf('\\\\') === 0;
+  }
+
+  function deviceTargetIsNetwork(target) {
+    var lower = String(target || '').toLowerCase();
+    return lower.indexOf('unc\\') >= 0 || lower.indexOf('\\device\\mup') >= 0 || lower.indexOf('lanmanredirector') >= 0 || lower.indexOf('\\\\') === 0;
+  }
+
+  function driveRefuseMessage(file) {
+    var name = (file && file.name) || 'this file';
+    if (file && deviceTargetIsNetwork(file.deviceTarget)) {
+      return "Couldn't move " + name + " to the Recycle Bin. The drive is a substitute for a network share, which has no Recycle Bin. Nothing was deleted.";
+    }
+    var kind = file && file.driveType;
+    if (kind === DRIVE_REMOTE) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's on a network drive, which has no Recycle Bin. Nothing was deleted.";
+    }
+    if (kind === DRIVE_REMOVABLE) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's on a removable drive, which has no Recycle Bin. Nothing was deleted.";
+    }
+    if (kind != null && kind !== DRIVE_FIXED) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's not on a fixed drive on this PC. Nothing was deleted.";
+    }
+    return '';
+  }
+
+  function playlistDeleteWarning(names) {
+    var list = (names || []).filter(Boolean);
+    if (!list.length) return '';
+    if (list.length === 1) {
+      return 'Also in the saved playlist ' + list[0] + '. That playlist will show the file as missing.';
+    }
+    return 'Also in saved playlists ' + list.join(', ') + '. Those playlists will show the file as missing.';
+  }
+
+  function otherSavedPlaylists(files, playlists, currentName) {
+    var paths = (files || []).map(function (f) { return f && f.path; }).filter(Boolean);
+    var hits = [];
+    (playlists || []).forEach(function (pl) {
+      if (!pl || playlistNamesMatch(pl.name, currentName)) return;
+      var used = (pl.items || []).some(function (it) {
+        return paths.some(function (p) { return samePath(p, it && it.path); });
+      });
+      if (used) hits.push(pl.name);
+    });
+    return hits;
+  }
+
+  function deleteConfirmModel(files, opts) {
+    opts = opts || {};
+    var list = (files || []).filter(Boolean);
+    var names = list.map(function (f) { return String((f && f.name) || 'file'); });
+    var count = names.length;
+    var inTauri = opts.inTauri !== false;
+    var shares = list.filter(function (f) { return !!(f && f.path && isNetworkSharePath(f.path)); });
+    var unfixed = list.filter(function (f) { return !isNetworkSharePath(f && f.path) && driveRefuseMessage(f); });
+    var missingPath = list.filter(function (f) { return !f || !f.path; });
+    var recycleOk = !!(inTauri && count > 0 && !shares.length && !unfixed.length && !missingPath.length);
+    var shareWarn = '';
+    if (!inTauri) {
+      shareWarn = "The Recycle Bin isn't available here. Nothing was deleted.";
+    } else if (shares.length) {
+      shareWarn = count === 1
+        ? "Couldn't move " + names[0] + " to the Recycle Bin. It's on a network share, which has no Recycle Bin. Nothing was deleted."
+        : "Couldn't move these files to the Recycle Bin. A network share has no Recycle Bin, so SlideX won't delete them. Nothing was deleted.";
+    } else if (unfixed.length) {
+      shareWarn = driveRefuseMessage(unfixed[0]);
+    } else if (missingPath.length) {
+      shareWarn = "Couldn't move " + (names[0] || 'this file') + " to the Recycle Bin. SlideX doesn't have a path on this PC for it. Nothing was deleted.";
+    }
+    var playlistWarn = playlistDeleteWarning(opts.otherPlaylists || []);
+    var title = recycleOk
+      ? (count === 1 ? 'Move ' + names[0] + ' to the Recycle Bin?' : 'Move ' + count + ' files to the Recycle Bin?')
+      : (count === 1 ? "Can't move " + (names[0] || 'this file') + " to the Recycle Bin" : "Can't move these files to the Recycle Bin");
+    var body = recycleOk
+      ? 'This deletes the files from your PC, not just from this playlist. You can restore them from the Recycle Bin.'
+      : shareWarn;
+    return {
+      open: true,
+      title: title,
+      body: body,
+      names: names,
+      count: count,
+      playlistWarn: playlistWarn,
+      shareWarn: recycleOk ? '' : shareWarn,
+      recycleOk: recycleOk,
+      focus: 'cancel',
+      actions: recycleOk ? ['remove-only', 'cancel', 'recycle'] : ['remove-only', 'cancel']
+    };
+  }
+
+  function deleteConfirmRefused(files, message, partial) {
+    var model = deleteConfirmModel(files, { inTauri: true, otherPlaylists: [] });
+    var plain = message ? String(message) : model.shareWarn;
+    if (!partial && plain && plain.indexOf('Nothing was deleted') < 0) plain += ' Nothing was deleted.';
+    model.recycleOk = false;
+    model.actions = ['remove-only', 'cancel'];
+    model.focus = 'cancel';
+    model.shareWarn = plain;
+    model.body = plain;
+    model.title = model.count === 1
+      ? "Can't move " + (model.names[0] || 'this file') + " to the Recycle Bin"
+      : "Can't move these files to the Recycle Bin";
+    return model;
+  }
+
+  function deleteConfirmText(model) {
+    if (!model) return '';
+    return [model.title, model.body, model.playlistWarn, (model.names || []).join('\n'), String(model.count)]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  function deleteConfirmWarnLine(model) {
+    if (!model) return '';
+    var bits = [];
+    if (model.playlistWarn) bits.push(model.playlistWarn);
+    if (model.shareWarn && model.shareWarn !== model.body) bits.push(model.shareWarn);
+    return bits.join(' ');
+  }
+
+  function deleteConfirmKey(model, key) {
+    if (!model || model.open === false) return null;
+    if (key === 'Escape') return 'cancel';
+    if (key === 'Tab' || key === 'Enter' || key === ' ') return 'dialog';
+    return 'swallow';
+  }
+
+  function retryCastTarget(typedHost, typedPort, lastDev) {
+    var host = String(typedHost || '').trim();
+    if (host) {
+      var port = typedPort > 0 ? typedPort : null;
+      return { host: host, port: port, name: 'TV' };
+    }
+    return lastDev && lastDev.host ? lastDev : null;
+  }
+
+  function playlistItemId(item) {
+    if (!item || item.id == null || item.id === '') return '';
+    return String(item.id);
+  }
+
+  // A copied confirm row matches the playlist entry by id, or by normalized
+  // path when it has no id. The same path on another id stays in the list.
+  function playlistItemMatches(item, file) {
+    if (!item || !file) return false;
+    var fileId = playlistItemId(file);
+    if (fileId) return playlistItemId(item) === fileId;
+    return !!(file.path && item.path && samePath(file.path, item.path));
+  }
+
+  function isShownMedia(item) {
+    return !!(item && item.type !== 'folder' && !item.unavailable && !item.missing);
+  }
+
+  function removePlaylistMatches(items, files, cur) {
+    var list = (items || []).slice();
+    var drop = (files || []).filter(Boolean);
+    var matched = [];
+    var next = [];
+    list.forEach(function (it) {
+      var hit = drop.some(function (file) { return playlistItemMatches(it, file); });
+      if (hit) matched.push(it);
+      else next.push(it);
+    });
+    var media = list.filter(isShownMedia);
+    var nextMedia = next.filter(isShownMedia);
+    var current = cur > 0 ? (cur | 0) : 0;
+    var showing = media[current] || null;
+    var nextCur = 0;
+    if (nextMedia.length && showing && nextMedia.indexOf(showing) >= 0) {
+      nextCur = nextMedia.indexOf(showing);
+    } else if (nextMedia.length) {
+      var removedBefore = 0;
+      for (var i = 0; i < current && i < media.length; i++) {
+        if (matched.indexOf(media[i]) >= 0) removedBefore++;
+      }
+      nextCur = current - removedBefore;
+      if (nextCur >= nextMedia.length) nextCur = nextMedia.length - 1;
+      if (nextCur < 0) nextCur = 0;
+    }
+    return {
+      items: next,
+      cur: nextCur,
+      removed: matched.length,
+      matched: matched,
+      shown: nextMedia[nextCur] || null,
+      touchedDisk: false
+    };
+  }
+
+  // Recycle may delete on disk first. Remove-only never does.
+  function applyPlaylistRemoval(items, files, cur, action, deleter) {
+    var kind = action === 'recycled' ? 'recycled' : 'remove-only';
+    var touched = false;
+    if (kind === 'recycled' && typeof deleter === 'function') {
+      (files || []).forEach(function (file) {
+        if (file && file.path) {
+          deleter(file.path);
+          touched = true;
+        }
+      });
+    }
+    var plan = removePlaylistMatches(items, files, cur);
+    plan.action = kind;
+    plan.touchedDisk = touched;
+    return plan;
+  }
+
+  function applyDeleteChoice(items, indexes, choice) {
+    var list = (items || []).slice();
+    if (choice !== 'remove-only' && choice !== 'recycled') return list;
+    var drop = {};
+    (indexes || []).forEach(function (i) { drop[i] = true; });
+    return list.filter(function (_, i) { return !drop[i]; });
+  }
+
   function planExplorerFileDrop(paths, state) {
     var media = [];
     var skipped = [];
@@ -1621,6 +2005,37 @@
     stepMediaIndex: stepMediaIndex,
     playbackIndexAfterReorder: playbackIndexAfterReorder,
     playbackNames: playbackNames,
-    planExplorerFileDrop: planExplorerFileDrop
+    planExplorerFileDrop: planExplorerFileDrop,
+    CAST_CONNECT_TIMEOUT_MS: CAST_CONNECT_TIMEOUT_MS,
+    UNDOCK_MAIN_WINDOW: UNDOCK_MAIN_WINDOW,
+    castFailureMessage: castFailureMessage,
+    beginCastConnect: beginCastConnect,
+    tickCastConnect: tickCastConnect,
+    advanceCastConnect: advanceCastConnect,
+    cancelCastConnect: cancelCastConnect,
+    failCastConnect: failCastConnect,
+    retryCastConnect: retryCastConnect,
+    toggleCastDetails: toggleCastDetails,
+    withCastLogPath: withCastLogPath,
+    castConnectStepTexts: castConnectStepTexts,
+    castConnectStepMarks: castConnectStepMarks,
+    undockControlShown: undockControlShown,
+    DRIVE_FIXED: DRIVE_FIXED,
+    DRIVE_REMOVABLE: DRIVE_REMOVABLE,
+    DRIVE_REMOTE: DRIVE_REMOTE,
+    isNetworkSharePath: isNetworkSharePath,
+    deviceTargetIsNetwork: deviceTargetIsNetwork,
+    driveRefuseMessage: driveRefuseMessage,
+    retryCastTarget: retryCastTarget,
+    otherSavedPlaylists: otherSavedPlaylists,
+    deleteConfirmModel: deleteConfirmModel,
+    deleteConfirmRefused: deleteConfirmRefused,
+    deleteConfirmText: deleteConfirmText,
+    deleteConfirmWarnLine: deleteConfirmWarnLine,
+    deleteConfirmKey: deleteConfirmKey,
+    applyDeleteChoice: applyDeleteChoice,
+    playlistItemMatches: playlistItemMatches,
+    removePlaylistMatches: removePlaylistMatches,
+    applyPlaylistRemoval: applyPlaylistRemoval
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

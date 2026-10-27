@@ -54,8 +54,15 @@ const DEFAULT_PHOTO_TIMER_MS: u64 = 10_000;
 /// Our heartbeat. The TV is treated as gone after `LINK_DEAD_AFTER` of silence.
 const PING_EVERY: Duration = Duration::from_secs(5);
 const LINK_DEAD_AFTER: Duration = Duration::from_secs(15);
-/// Launch can use the full 15s, plus TCP and TLS.
+/// Launch can use the full 15s, plus TCP and TLS. Tests may wait this long.
 const SESSION_READY_WAIT: Duration = Duration::from_secs(20);
+/// The Cast panel gives up while opening a secure link, then Cast can be retried.
+/// This budget is TCP + TLS only. The TV accept prompt and receiver launch use
+/// `LAUNCH_DEADLINE` after the link is open, so a prompt is not cut off at 15 s.
+pub const CONNECT_ATTEMPT_WAIT: Duration = Duration::from_secs(15);
+/// Link budget plus the launch/prompt budget. The UI stops its 15 s clock when
+/// `cast://link-open` fires, which is before `launch_receiver`.
+pub const CONNECT_READY_WAIT: Duration = Duration::from_secs(30);
 const NS_RECEIVER: &str = "urn:x-cast:com.google.cast.receiver";
 const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
 const CAST_LOG_MAX: u64 = 1_000_000;
@@ -3488,6 +3495,14 @@ impl CastLink {
     /// TCP + TLS only. Does not send the virtual CONNECT. Tests use this to prove
     /// the receiver ignores everything that arrives before CONNECT.
     fn open_tls(host: Ipv4Addr, port: u16) -> Result<Self, String> {
+        Self::open_tls_with(host, port, None)
+    }
+
+    fn open_tls_with(
+        host: Ipv4Addr,
+        port: u16,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self, String> {
         cast_log("connect", &format!("{host}:{port}"));
         let addr = SocketAddr::from((host, port));
         let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
@@ -3520,7 +3535,7 @@ impl CastLink {
             .to_owned();
         let mut conn = ClientConnection::new(Arc::new(config), name)
             .map_err(|e| connect_fail(format!("cast tls: {e}")))?;
-        drive_tls(&mut conn, &mut tcp).map_err(connect_fail)?;
+        drive_tls_cancellable(&mut conn, &mut tcp, cancel).map_err(connect_fail)?;
         let pace = Arc::new(Mutex::new(READ_SLICE));
         let stream = CastPlain::new(
             StreamOwned::new(conn, IdleSocket { inner: tcp }),
@@ -3567,7 +3582,18 @@ impl CastLink {
     }
 
     fn connect(host: Ipv4Addr, port: u16) -> Result<Self, String> {
-        let link = Self::open_tls(host, port)?;
+        Self::connect_with(host, port, None)
+    }
+
+    fn connect_with(
+        host: Ipv4Addr,
+        port: u16,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, String> {
+        let mut link = Self::open_tls_with(host, port, cancel.as_deref())?;
+        if let Some(flag) = cancel {
+            link.use_cancel(flag);
+        }
         link.connection
             .connect("receiver-0")
             .map_err(|e| connect_fail(format!("Could not connect to the TV ({e}).")))?;
@@ -4149,10 +4175,18 @@ impl WaitMsg<'_> {
 }
 
 /// Finish TLS on a non-blocking socket. `complete_io` returns `WouldBlock`
-/// (or Windows `TimedOut`) while the peer has not answered yet.
-fn drive_tls(conn: &mut ClientConnection, tcp: &mut TcpStream) -> Result<(), String> {
+/// (or Windows `TimedOut`) while the peer has not answered yet. `cancel`
+/// aborts a hung handshake so Cast can be retried without restarting.
+fn drive_tls_cancellable(
+    conn: &mut ClientConnection,
+    tcp: &mut TcpStream,
+    cancel: Option<&AtomicBool>,
+) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(4);
     while conn.is_handshaking() {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return Err(CAST_CANCELLED.to_string());
+        }
         match conn.complete_io(tcp) {
             Ok((0, 0)) => {
                 if Instant::now() >= deadline {
@@ -4942,6 +4976,8 @@ pub struct CastState {
     inner: Mutex<Option<LiveSession>>,
     /// Connect failures are not stored as a session. status() still reports them.
     last_error: Mutex<Option<String>>,
+    /// Set while `connect_wait` is blocked, so Cancel can stop that attempt.
+    inflight: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Default for CastState {
@@ -4949,6 +4985,26 @@ impl Default for CastState {
         Self {
             inner: Mutex::new(None),
             last_error: Mutex::new(None),
+            inflight: Mutex::new(None),
+        }
+    }
+}
+
+/// Clears the in-flight cancel flag when a connect attempt returns.
+struct ClearInflight<'a> {
+    slot: &'a Mutex<Option<Arc<AtomicBool>>>,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for ClearInflight<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            let same = slot
+                .as_ref()
+                .is_some_and(|flag| Arc::ptr_eq(flag, &self.flag));
+            if same {
+                *slot = None;
+            }
         }
     }
 }
@@ -4960,7 +5016,38 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
     ) -> Result<CastConnectInfo, String> {
-        self.connect_wait(host, port, name, SESSION_READY_WAIT)
+        self.connect_linking(host, port, name, None)
+    }
+
+    /// Like `connect`, and `link_open` is signalled once the secure link is up,
+    /// before the receiver launch and any TV accept prompt.
+    pub fn connect_linking(
+        &self,
+        host: &str,
+        port: Option<u16>,
+        name: Option<String>,
+        link_open: Option<mpsc::Sender<()>>,
+    ) -> Result<CastConnectInfo, String> {
+        debug_assert_eq!(
+            CONNECT_READY_WAIT,
+            CONNECT_ATTEMPT_WAIT + LAUNCH_DEADLINE
+        );
+        self.connect_wait(host, port, name, CONNECT_READY_WAIT, link_open)
+    }
+
+    /// Stop an attempt that has not finished, and drop a live session.
+    /// Afterwards Cast can connect again without restarting.
+    pub fn cancel_connect(&self) -> Result<(), String> {
+        if let Ok(guard) = self.inflight.lock() {
+            if let Some(flag) = guard.as_ref() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        self.disconnect_session()?;
+        if let Ok(mut slot) = self.last_error.lock() {
+            *slot = None;
+        }
+        Ok(())
     }
 
     fn connect_wait(
@@ -4969,8 +5056,9 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
         ready_wait: Duration,
+        link_open: Option<mpsc::Sender<()>>,
     ) -> Result<CastConnectInfo, String> {
-        match self.connect_wait_inner(host, port, name, ready_wait) {
+        match self.connect_wait_inner(host, port, name, ready_wait, link_open) {
             Ok(info) => {
                 if let Ok(mut slot) = self.last_error.lock() {
                     *slot = None;
@@ -4978,8 +5066,10 @@ impl CastState {
                 Ok(info)
             }
             Err(err) => {
-                if let Ok(mut slot) = self.last_error.lock() {
-                    *slot = Some(err.clone());
+                if err != CAST_CANCELLED {
+                    if let Ok(mut slot) = self.last_error.lock() {
+                        *slot = Some(err.clone());
+                    }
                 }
                 Err(err)
             }
@@ -4992,6 +5082,7 @@ impl CastState {
         port: Option<u16>,
         name: Option<String>,
         ready_wait: Duration,
+        link_open: Option<mpsc::Sender<()>>,
     ) -> Result<CastConnectInfo, String> {
         // The profile query runs on its own thread. Do not wait for it here.
         let _ = lan_category_now();
@@ -5020,6 +5111,20 @@ impl CastState {
         let status_t = Arc::clone(&status);
         let remote_t = Arc::clone(&remote_event);
         let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut slot = self
+                .inflight
+                .lock()
+                .map_err(|_| "cast state lock".to_string())?;
+            if let Some(old) = slot.as_ref() {
+                old.store(true, Ordering::SeqCst);
+            }
+            *slot = Some(Arc::clone(&cancel));
+        }
+        let _clear_inflight = ClearInflight {
+            slot: &self.inflight,
+            flag: Arc::clone(&cancel),
+        };
         let cancel_t = Arc::clone(&cancel);
         let disconnect_logged = Arc::new(AtomicBool::new(false));
         let logged_t = Arc::clone(&disconnect_logged);
@@ -5029,7 +5134,7 @@ impl CastState {
             .spawn(move || {
                 run_session(
                     ip, port, friendly, bind.ip, cmd_rx, ready_tx, status_t, remote_t, cancel_t,
-                    logged_t,
+                    logged_t, link_open,
                 );
             })
             .map_err(|e| format!("cast thread: {e}"))?;
@@ -5038,6 +5143,9 @@ impl CastState {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
                 let _ = worker.join();
+                if e == CAST_CANCELLED {
+                    return Err(e);
+                }
                 return Err(with_public_network(e));
             }
             Err(_) => {
@@ -5056,6 +5164,23 @@ impl CastState {
             }
         };
 
+        let flight = self
+            .inflight
+            .lock()
+            .map_err(|_| "cast state lock".to_string())?;
+        let cancelled = flight
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        if cancelled {
+            drop(flight);
+            let _ = cmd_tx.send(CastCmd::Disconnect {
+                origin: CastOrigin::User,
+                reply: mpsc::channel().0,
+            });
+            let _ = worker.join();
+            return Err(CAST_CANCELLED.to_string());
+        }
         let mut guard = self
             .inner
             .lock()
@@ -5068,6 +5193,8 @@ impl CastState {
             cancel,
             disconnect_logged,
         });
+        drop(guard);
+        drop(flight);
         Ok(info)
     }
 
@@ -5314,6 +5441,7 @@ fn run_session(
     remote_event: Arc<Mutex<Option<String>>>,
     cancel: Arc<AtomicBool>,
     disconnect_logged: Arc<AtomicBool>,
+    link_open: Option<Sender<()>>,
 ) {
     // Start the profile query without waiting. A later load timeout only reads the cache.
     let _ = lan_category_now();
@@ -5324,9 +5452,8 @@ fn run_session(
             return;
         }
     };
-    let mut link = match CastLink::connect(host, port) {
+    let mut link = match CastLink::connect_with(host, port, Some(Arc::clone(&cancel))) {
         Ok(mut l) => {
-            l.use_cancel(cancel);
             l.use_disconnect_logged(disconnect_logged);
             l
         }
@@ -5336,6 +5463,9 @@ fn run_session(
             return;
         }
     };
+    if let Some(tx) = link_open {
+        let _ = tx.send(());
+    }
     if let Err(e) = link.launch_receiver() {
         http.shutdown();
         let _ = ready_tx.send(Err(e));
@@ -10201,6 +10331,7 @@ mod tests {
                 Some(port),
                 None,
                 Duration::from_millis(400),
+                None,
             )
             .expect_err("a peer that accepts and stays silent must time out");
         let elapsed = started.elapsed();
@@ -10229,6 +10360,113 @@ mod tests {
             .filter(|l| l.contains(" disconnect "))
             .collect();
         assert_eq!(lines.len(), 1, "{after}");
+    }
+
+    #[test]
+    fn connect_attempt_is_fifteen_seconds_and_idle_cancel_leaves_cast_idle() {
+        assert_eq!(CONNECT_ATTEMPT_WAIT, Duration::from_secs(15));
+        assert_eq!(CONNECT_READY_WAIT, CONNECT_ATTEMPT_WAIT + LAUNCH_DEADLINE);
+        let src = include_str!("cast.rs");
+        let body = src.split("fn run_session").nth(1).expect("run_session");
+        let link_at = body.find("if let Some(tx) = link_open").expect("link signal");
+        let launch_at = body.find("link.launch_receiver()").expect("launch");
+        assert!(link_at < launch_at, "the 15 s link clock must stop before launch");
+        let state = CastState::default();
+        state.cancel_connect().unwrap();
+        assert!(!state.status().connected);
+        assert!(state.status().error.is_none());
+        state.cancel_connect().unwrap();
+        assert!(!state.status().connected);
+    }
+
+    #[test]
+    fn cancel_during_connect_resets_so_cast_can_be_retried() {
+        let _log = LogDir::new();
+        let snap = snapshot_ifaces();
+        let iface = snap
+            .bind
+            .clone()
+            .or_else(|| snap.preferred.first().cloned())
+            .expect("a home-LAN address is required to start a cast");
+        let listener = TcpListener::bind((iface.ip, 0)).expect("bind stalling peer");
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        thread::spawn(move || {
+            listener.set_nonblocking(true).ok();
+            while !stop_t.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                        let mut buf = [0u8; 256];
+                        while !stop_t.load(Ordering::SeqCst) {
+                            match sock.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(err)
+                                    if err.kind() == ErrorKind::WouldBlock
+                                        || err.kind() == ErrorKind::TimedOut => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let state = Arc::new(CastState::default());
+        let state_t = Arc::clone(&state);
+        let host = iface.ip.to_string();
+        let started = Instant::now();
+        let attempt = thread::spawn(move || {
+            state_t.connect_wait(
+                &host,
+                Some(port),
+                Some("Living Room TV".into()),
+                Duration::from_secs(30),
+                None,
+            )
+        });
+        thread::sleep(Duration::from_millis(200));
+        state.cancel_connect().unwrap();
+        let err = attempt
+            .join()
+            .expect("connect thread")
+            .expect_err("cancel ends the attempt");
+        let elapsed = started.elapsed();
+        assert!(
+            err == CAST_CANCELLED,
+            "cancel must not look like a successful session: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "cancel should not wait out the 30s attempt, got {elapsed:?}"
+        );
+        assert!(!state.status().connected);
+        assert!(state.status().error.is_none(), "{:?}", state.status().error);
+
+        let retry_started = Instant::now();
+        let retry = state.connect_wait(
+            &iface.ip.to_string(),
+            Some(port),
+            Some("Living Room TV".into()),
+            Duration::from_millis(300),
+            None,
+        );
+        let retry_elapsed = retry_started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        assert!(retry.is_err(), "a retry must run instead of staying stuck");
+        assert!(
+            retry_elapsed < Duration::from_secs(3),
+            "retry should honor its own deadline, got {retry_elapsed:?}"
+        );
+        assert!(!state.status().connected);
+        state.cancel_connect().unwrap();
+        assert!(!state.status().connected);
+        assert!(state.status().error.is_none());
     }
 
     #[test]
