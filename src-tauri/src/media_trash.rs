@@ -90,16 +90,31 @@ pub fn device_target_is_network(target: &str) -> bool {
         || lower.starts_with(r"\\")
 }
 
-/// Non-extended paths longer than `MAX_PATH` (260, including the NUL) cannot be recycled.
-/// Extended `\\?\` paths use the documented 32,767 UTF-16 limit.
+/// The Shell's Recycle Bin call rejects the `\\?\` prefix (0x80070057), so a
+/// local `\\?\C:\...` path is handed over as plain `C:\...`. Other paths are
+/// returned with forward slashes turned into backslashes.
+pub fn shell_recycle_path(path: &str) -> String {
+    let slash = path.trim().replace('/', "\\");
+    if let Some(rest) = slash.strip_prefix(r"\\?\") {
+        let mut chars = rest.chars();
+        if let (Some(drive), Some(':')) = (chars.next(), chars.next()) {
+            if drive.is_ascii_alphabetic() {
+                return rest.to_string();
+            }
+        }
+    }
+    slash
+}
+
+/// Paths longer than `MAX_PATH` (260, including the NUL) cannot be recycled
+/// through the Shell, which also needs the plain form of an extended path.
+/// Length is counted in UTF-16 units, as Windows counts it.
 pub fn recycle_path_too_long(path: &str) -> bool {
-    let normalized = path.trim().replace('/', "\\");
-    if normalized.is_empty() {
+    let plain = shell_recycle_path(path);
+    if plain.is_empty() {
         return false;
     }
-    let extended = normalized.starts_with(r"\\?\");
-    let limit = if extended { 32_767 } else { 259 };
-    normalized.chars().count() > limit
+    plain.encode_utf16().count() > 259
 }
 
 fn path_too_long_message(path: &str) -> String {
@@ -235,7 +250,7 @@ pub fn trash_user_media_with(
             failed.push(path_too_long_message(path));
             continue;
         }
-        match delete(path) {
+        match delete(&shell_recycle_path(path)) {
             Ok(()) => moved.push(path.clone()),
             Err(err) => {
                 let name = file_label(path);
@@ -506,7 +521,7 @@ mod windows_bin {
                 "Couldn't move {name} to the Recycle Bin ({hr}). It was left in place."
             ));
         }
-        let parsing = wide(&path.replace('/', "\\"));
+        let parsing = wide(&super::shell_recycle_path(path));
         let outcome = (|| {
             unsafe {
                 let pfo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
@@ -728,6 +743,23 @@ mod tests {
         assert!(report.message.contains("too long"), "{}", report.message);
         assert!(report.message.contains("left in place"), "{}", report.message);
         assert!(!recycle_path_too_long(r"C:\Photos\lake.jpg"));
+    }
+
+    #[test]
+    fn a_folder_opened_path_is_recycled_without_the_extended_prefix() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let opened = r"\\?\C:\Func\clip.mp4".to_string();
+        let report = trash_user_media_with(&[opened.clone()], fixed, |path| {
+            seen.borrow_mut().push(path.to_string());
+            Ok(())
+        });
+        assert_eq!(seen.borrow().as_slice(), [r"C:\Func\clip.mp4".to_string()]);
+        assert_eq!(report.moved, vec![opened], "{}", report.message);
+        assert_eq!(shell_recycle_path(r"C:/Func/a.jpg"), r"C:\Func\a.jpg");
+        assert_eq!(shell_recycle_path(r"\\?\UNC\nas\a.jpg"), r"\\?\UNC\nas\a.jpg");
+        let long = format!(r"\\?\C:\Photos\{}\clip.mp4", "a".repeat(300));
+        assert!(recycle_path_too_long(&long));
+        assert!(recycle_path_too_long(&format!(r"C:\{}", "\u{1F600}".repeat(130))));
     }
 
     #[test]
