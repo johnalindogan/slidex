@@ -104,9 +104,24 @@ description = "Allow reading the home-LAN adapter fingerprint so Cast can rescan
 commands.allow = ["cast_network_fingerprint"]
 
 [[permission]]
+identifier = "allow-trash-media-files"
+description = "Allow moving user media to the Recycle Bin. Never a permanent delete."
+commands.allow = ["trash_media_files"]
+
+[[permission]]
+identifier = "allow-classify-media-drives"
+description = "Allow reading whether a path is on a fixed local drive before a Recycle Bin confirm"
+commands.allow = ["classify_media_drives"]
+
+[[permission]]
 identifier = "allow-cast-connect"
 description = "Allow connecting a Cast session to a LAN receiver"
 commands.allow = ["cast_connect"]
+
+[[permission]]
+identifier = "allow-cast-cancel-connect"
+description = "Allow cancelling an in-progress Cast connect so it can be retried"
+commands.allow = ["cast_cancel_connect"]
 
 [[permission]]
 identifier = "allow-cast-set-playlist"

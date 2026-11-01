@@ -1,4 +1,5 @@
 mod cast;
+mod media_trash;
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -1052,6 +1053,18 @@ fn read_text_file(path: String, allowed: State<'_, AllowedMedia>) -> Result<Stri
 }
 
 
+/// 0.1.18 keeps the second window off. The JS flag hides the button; this
+/// command is the gate that nothing else can skip.
+const UNDOCK_MAIN_WINDOW: bool = false;
+
+pub fn undock_blocked_reason() -> Option<&'static str> {
+    if UNDOCK_MAIN_WINDOW {
+        None
+    } else {
+        Some("Undock is off in 0.1.18")
+    }
+}
+
 /// Open (or focus) the undocked Media Manager window.
 ///
 /// Must return promptly: on Windows, calling `WebviewWindowBuilder::build()`
@@ -1061,6 +1074,9 @@ fn read_text_file(path: String, allowed: State<'_, AllowedMedia>) -> Result<Stri
 /// `playlistUndocked` / hide the dock without waiting for the child to load.
 #[tauri::command]
 async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
+    if let Some(reason) = undock_blocked_reason() {
+        return Err(reason.to_string());
+    }
     if let Some(w) = app.get_webview_window("playlist") {
         let _ = w.show();
         let _ = w.set_focus();
@@ -1124,14 +1140,42 @@ fn cast_network_fingerprint() -> Result<String, String> {
     Ok(cast::network_fingerprint())
 }
 
-#[tauri::command]
+/// `async` runs this off the main thread so Cancel can interrupt the attempt.
+#[tauri::command(async)]
 fn cast_connect(
+    app: AppHandle,
     state: State<'_, cast::CastState>,
     host: String,
     port: Option<u16>,
     name: Option<String>,
 ) -> Result<cast::CastConnectInfo, String> {
-    state.connect(&host, port, name)
+    let (tx, rx) = std::sync::mpsc::channel();
+    let watcher = std::thread::spawn(move || {
+        if rx.recv().is_ok() {
+            let _ = app.emit("cast://link-open", ());
+        }
+    });
+    let result = state.connect_linking(&host, port, name, Some(tx));
+    let _ = watcher.join();
+    result
+}
+
+/// `async` so this is not queued behind a connect that is still on the main thread.
+#[tauri::command(async)]
+fn cast_cancel_connect(state: State<'_, cast::CastState>) -> Result<(), String> {
+    state.cancel_connect()
+}
+
+/// Move user media to the Recycle Bin. Refuses anything that is not a fixed drive.
+/// `async` because the shell COM call must not block the main thread.
+#[tauri::command(async)]
+fn trash_media_files(paths: Vec<String>) -> media_trash::TrashReport {
+    media_trash::trash_user_media(&paths)
+}
+
+#[tauri::command(async)]
+fn classify_media_drives(paths: Vec<String>) -> Vec<media_trash::DriveClass> {
+    media_trash::classify_media_drives(&paths)
 }
 
 #[tauri::command]
@@ -1320,6 +1364,9 @@ pub fn run() {
             cast_discover,
             cast_network_fingerprint,
             cast_connect,
+            cast_cancel_connect,
+            trash_media_files,
+            classify_media_drives,
             cast_set_playlist,
             cast_load,
             cast_pause,
