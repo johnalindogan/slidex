@@ -2026,10 +2026,10 @@ test('copied recycle and remove-only update the playlist and the view', () => {
   const recycled = C.applyPlaylistRemoval(playlist, [copyB], 1, 'recycled', (p) => disk.push(p));
   assert.deepEqual(disk, ['C:\\Photos\\same.jpg']);
   assert.equal(recycled.touchedDisk, true);
-  assert.deepEqual(Array.from(recycled.items).map((it) => it.id), ['a', 'c', 'd']);
+  assert.deepEqual(Array.from(recycled.items).map((it) => it.id), ['a', 'd']);
   assert.equal(recycled.cur, 1);
-  assert.equal(recycled.shown.id, 'c');
-  assert.equal(recycled.shown, playlist[2]);
+  assert.equal(recycled.shown.id, 'd');
+  assert.equal(recycled.shown, playlist[3]);
   const removeDisk = [];
   const removedOnly = C.applyPlaylistRemoval(playlist, [copyB], 1, 'remove-only', (p) => removeDisk.push(p));
   assert.deepEqual(removeDisk, []);
@@ -2059,9 +2059,47 @@ test('copied recycle and remove-only update the playlist and the view', () => {
   assert.equal(last.shown.id, 'c');
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const removal = html.slice(html.indexOf('function removePlaylistFiles'), html.indexOf('async function otherPlaylistNames'));
-  assert.match(removal, /removePlaylistMatches/);
+  assert.match(removal, /removePlaylistMatches\(items, files, cur, !!byPath\)/);
+  assert.match(html, /removePlaylistFiles\(movedFiles, true, true\)/);
+  assert.match(html, /removePlaylistFiles\(files, false\);/);
   assert.doesNotMatch(removal, /new Set\(\s*\(?files/);
   assert.doesNotMatch(removal, /drop\.has/);
+});
+
+test('recycling a file drops every row with that path, remove-only keeps duplicates', () => {
+  const pl = [
+    { id: 'x', name: 'x.jpg', path: 'C:\\P\\x.jpg', type: 'image' },
+    { id: 'd1', name: 'dup.jpg', path: 'C:\\P\\dup.jpg', type: 'image' },
+    { id: 'y', name: 'y.jpg', path: 'C:\\P\\y.jpg', type: 'image' },
+    { id: 'd2', name: 'dup.jpg', path: 'C:\\P\\dup.jpg', type: 'image' },
+    { id: 'd3', name: 'DUP.JPG', path: 'c:/p/DUP.jpg', type: 'image' },
+    { id: 'z', name: 'z.jpg', path: 'C:\\P\\z.jpg', type: 'image' }
+  ];
+  // Different ids, same path: both removed after recycle; case/slash variant too.
+  const r = C.applyPlaylistRemoval(pl, [Object.assign({}, pl[1])], 1, 'recycled', () => {});
+  assert.deepEqual(Array.from(r.items).map((it) => it.id), ['x', 'y', 'z']);
+  assert.equal(r.removed, 3);
+  assert.equal(r.cur, 1);
+  assert.equal(r.shown.id, 'y');
+  // Current after the removed rows: index shifts back by the rows removed before it.
+  const r2 = C.applyPlaylistRemoval(pl, [Object.assign({}, pl[3])], 5, 'recycled', () => {});
+  assert.deepEqual(Array.from(r2.items).map((it) => it.id), ['x', 'y', 'z']);
+  assert.equal(r2.cur, 2);
+  assert.equal(r2.shown.id, 'z');
+  // Current before: unchanged.
+  const r3 = C.applyPlaylistRemoval(pl, [Object.assign({}, pl[4])], 0, 'recycled', () => {});
+  assert.equal(r3.cur, 0);
+  assert.equal(r3.shown.id, 'x');
+  // Remove-only keeps the duplicates.
+  const k = C.applyPlaylistRemoval(pl, [Object.assign({}, pl[1])], 1, 'remove-only', () => {});
+  assert.deepEqual(Array.from(k.items).map((it) => it.id), ['x', 'y', 'd2', 'd3', 'z']);
+  assert.equal(k.cur, 1);
+  assert.equal(k.shown.id, 'y');
+  // Only rows were duplicates: recycle empties the list.
+  const only = C.applyPlaylistRemoval([pl[1], pl[3]], [Object.assign({}, pl[1])], 1, 'recycled', () => {});
+  assert.equal(only.items.length, 0);
+  assert.equal(only.shown, null);
+  assert.equal(only.cur, 0);
 });
 
 test('cast connect shows the three steps, then timeout, cancel, and retry reset it', () => {
