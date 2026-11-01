@@ -6554,9 +6554,9 @@ function renderDelConfirm(model) {
   g('delConfirm').classList.add('open');
   g('delCancel').focus();
 }
-function removePlaylistFiles(files, clearLS) {
+function removePlaylistFiles(files, clearLS, byPath) {
   if (!window.SlideXCore || !SlideXCore.removePlaylistMatches) return;
-  const plan = SlideXCore.removePlaylistMatches(items, files, cur);
+  const plan = SlideXCore.removePlaylistMatches(items, files, cur, !!byPath);
   if (!plan.removed) return;
   if (clearLS) {
     (plan.matched || []).forEach(item => {
@@ -6631,7 +6631,7 @@ async function commitRecycle() {
   }
   const moved = new Set((report && (report.moved || [])) || []);
   const movedFiles = files.filter(f => moved.has(f.path));
-  if (movedFiles.length) removePlaylistFiles(movedFiles, true);
+  if (movedFiles.length) removePlaylistFiles(movedFiles, true, true);
   const failed = (report && report.failed) || [];
   if (failed.length) {
     const left = files.filter(f => !moved.has(f.path));

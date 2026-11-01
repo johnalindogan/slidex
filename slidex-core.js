@@ -1819,13 +1819,18 @@
     return !!(item && item.type !== 'folder' && !item.unavailable && !item.missing);
   }
 
-  function removePlaylistMatches(items, files, cur) {
+  // byPath (after a recycle): the file is gone from disk, so every row with
+  // the same normalized path is dropped too, whatever its id.
+  function removePlaylistMatches(items, files, cur, byPath) {
     var list = (items || []).slice();
     var drop = (files || []).filter(Boolean);
     var matched = [];
     var next = [];
     list.forEach(function (it) {
-      var hit = drop.some(function (file) { return playlistItemMatches(it, file); });
+      var hit = drop.some(function (file) {
+        if (byPath && file.path && it && it.path && samePath(file.path, it.path)) return true;
+        return playlistItemMatches(it, file);
+      });
       if (hit) matched.push(it);
       else next.push(it);
     });
@@ -1867,7 +1872,7 @@
         }
       });
     }
-    var plan = removePlaylistMatches(items, files, cur);
+    var plan = removePlaylistMatches(items, files, cur, kind === 'recycled');
     plan.action = kind;
     plan.touchedDisk = touched;
     return plan;
