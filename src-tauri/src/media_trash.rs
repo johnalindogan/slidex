@@ -763,6 +763,51 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_local_path_reaches_the_recycle_bin_unchanged() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let plain = r"C:\Photos\lake.jpg".to_string();
+        assert_eq!(shell_recycle_path(&plain), plain);
+        let report = trash_user_media_with(&[plain.clone()], fixed, |path| {
+            seen.borrow_mut().push(path.to_string());
+            Ok(())
+        });
+        assert_eq!(seen.borrow().as_slice(), [plain.clone()]);
+        assert_eq!(report.moved, vec![plain], "{}", report.message);
+    }
+
+    #[test]
+    fn an_extended_unc_path_keeps_its_prefix_and_is_never_recycled() {
+        let unc = r"\\?\UNC\nas\media\still.jpg";
+        assert_eq!(shell_recycle_path(unc), unc);
+        assert!(recycle_bin_unavailable(unc));
+        let calls = AtomicUsize::new(0);
+        let report = trash_user_media_with(&[unc.to_string()], fixed, |_path| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(report.moved.is_empty());
+        assert_eq!(report.failed.len(), 1, "{}", report.message);
+        assert!(report.message.contains("network share"), "{}", report.message);
+    }
+
+    #[test]
+    fn a_long_extended_path_is_left_in_place_with_its_prefix() {
+        let long = format!(r"\\?\C:\Photos\{}\clip.mp4", "a".repeat(300));
+        assert!(recycle_path_too_long(&long));
+        let calls = AtomicUsize::new(0);
+        let report = trash_user_media_with(&[long], fixed, |_path| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(report.moved.is_empty());
+        assert_eq!(report.failed.len(), 1, "{}", report.message);
+        assert!(report.message.contains("too long"), "{}", report.message);
+        assert!(report.message.contains("left in place"), "{}", report.message);
+    }
+
+    #[test]
     fn this_module_never_permanently_deletes() {
         let src = include_str!("media_trash.rs");
         let impl_src = src.split("#[cfg(test)]").next().expect("impl");
