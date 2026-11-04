@@ -1892,6 +1892,8 @@ test('user media is never permanently deleted and the confirm names files', () =
   });
   const trashImpl = trash.split('#[cfg(test)]')[0];
   assert.match(trashImpl, /FOF_ALLOWUNDO/);
+  assert.match(trashImpl, /FOFX_RECYCLEONDELETE/);
+  assert.match(trashImpl, /slidex-recycle/);
   assert.match(trashImpl, /TSF_DELETE_RECYCLE_IF_POSSIBLE/);
   assert.match(trashImpl, /DRIVE_FIXED/);
   assert.doesNotMatch(trashImpl, /trash::delete/);
@@ -2066,6 +2068,16 @@ test('copied recycle and remove-only update the playlist and the view', () => {
   assert.doesNotMatch(removal, /drop\.has/);
 });
 
+test('a stale link-open does not stop the new attempt clock', () => {
+  const connecting = C.beginCastConnect('Living Room TV');
+  assert.equal(C.castLinkOpenApplies(4, 4, connecting), true);
+  assert.equal(C.castLinkOpenApplies(3, 4, connecting), false);
+  assert.equal(C.castLinkOpenApplies(null, 4, connecting), false);
+  assert.equal(C.castLinkOpenApplies(4, 4, C.cancelCastConnect(connecting)), false);
+  assert.equal(C.deviceTargetIsNetwork('\\??\\C:\\Func\\'), false);
+  assert.equal(C.deviceTargetIsNetwork('\\??\\UNC\\nas\\media'), true);
+});
+
 test('recycling a file drops every row with that path, remove-only keeps duplicates', () => {
   const pl = [
     { id: 'x', name: 'x.jpg', path: 'C:\\P\\x.jpg', type: 'image' },
@@ -2192,6 +2204,8 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.match(html, /retryCastConnect/);
   assert.match(html, /retryCastTarget/);
   assert.match(html, /cast:\/\/link-open/);
+  assert.match(html, /castLinkOpenApplies/);
+  assert.match(html, /gen: gen/);
   assert.match(html, /cast_cancel_connect/);
   const retry = html.slice(html.indexOf('getElementById("castRetry")'), html.indexOf('getElementById("castEnterAddr")'));
   assert.match(retry, /manualTarget\(\)/);

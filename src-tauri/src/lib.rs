@@ -1148,11 +1148,12 @@ fn cast_connect(
     host: String,
     port: Option<u16>,
     name: Option<String>,
+    gen: u64,
 ) -> Result<cast::CastConnectInfo, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let watcher = std::thread::spawn(move || {
         if rx.recv().is_ok() {
-            let _ = app.emit("cast://link-open", ());
+            let _ = app.emit("cast://link-open", serde_json::json!({ "gen": gen }));
         }
     });
     let result = state.connect_linking(&host, port, name, Some(tx));
