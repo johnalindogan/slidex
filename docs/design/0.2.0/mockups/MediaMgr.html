@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · Media Manager and safe delete</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#000}
+a{color:rgba(255,255,255,.85)}a:hover{color:#fff}
+.sx{font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;color:#fff;-webkit-font-smoothing:antialiased;font-size:13px;line-height:1.45}
+.sx *{box-sizing:border-box}
+.mono{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.scr{width:1280px;height:800px;position:relative;overflow:hidden;background:#000}
+.modal{background:#141414;border:1px solid rgba(255,255,255,.1);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.7)}
+.btn{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.08)}
+.btn.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff}
+.btn.pri{background:#fff;color:#000;border-color:#fff;font-weight:600}
+.btn.dng{background:rgba(220,60,60,.16);border-color:rgba(220,60,60,.75);color:#ffc2c2}
+.btn.ico{width:32px;padding:0;justify-content:center}
+.btn.sm{height:28px;font-size:12px;padding:0 9px}
+.fv{outline:2px solid #fff;outline-offset:2px}
+.kbd{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75)}
+.t85{color:rgba(255,255,255,.85)}.t55{color:rgba(255,255,255,.6)}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600}
+.h2{font-size:15px;font-weight:700;margin:0}
+.in{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:28px;padding:0 10px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap}
+.row{display:flex;align-items:center;gap:10px}.col{display:flex;flex-direction:column;gap:10px}.sp{flex:1}
+.hr{height:1px;background:rgba(255,255,255,.08)}
+.vsep{width:1px;height:20px;background:rgba(255,255,255,.12);margin:0 4px}
+.tab{font:inherit;font-size:13px;color:rgba(255,255,255,.65);background:transparent;border:0;height:44px;padding:0 4px;cursor:pointer;border-bottom:2px solid transparent}
+.tab.on{color:#fff;font-weight:700;border-bottom-color:#fff}
+.it{display:flex;gap:10px;align-items:center;padding:8px;border-radius:8px;border:1px solid transparent}
+.it.sel{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.45)}
+.th{border-radius:4px;flex:none}
+.mi{font:inherit;font-size:13px;color:rgba(255,255,255,.88);background:transparent;border:0;border-radius:6px;height:32px;padding:0 10px;display:flex;align-items:center;gap:8px;width:100%;text-align:left;cursor:pointer}
+.mi:hover{background:rgba(255,255,255,.08)}.mi .kbd{margin-left:auto}
+.g1{background:linear-gradient(180deg,#3e2c5a,#a3687a 60%,#2e2346 61%)}.g2{background:linear-gradient(180deg,#8fb3cf,#c7d9e4 55%,#5c7f93 56%)}.g3{background:linear-gradient(180deg,#5596da,#a5cbee 55%,#d3a066 56%,#a2683f)}.g4{background:linear-gradient(180deg,#9fb39c,#c9d4c0 50%,#4f7a52 51%,#2e4c31)}.g5{background:radial-gradient(circle at 30% 40%,#a35bd6,#3a1f6b 60%,#1a1033)}.g6{background:linear-gradient(180deg,#2b2f6b,#c0546a)}.g7{background:linear-gradient(135deg,#1e2c6b,#e88356)}
+
+</style>
+</head>
+<body>
+<div class="scr sx">
+  <div class="g3" style="position: absolute; left: 253px; top: 0; width: 774px; height: 380px"></div>
+  <div style="position: absolute; left: 0; right: 0; top: 380px; height: 50px; background: #0a0a0a; border-top: 1px solid rgba(255,255,255,.08); display: flex; align-items: center; padding: 0 12px" class="t55">Controls bar</div>
+
+  <section id="media-dock" style="position: absolute; left: 0; right: 0; top: 430px; bottom: 0; background: #0d0d0d; border-top: 1px solid rgba(255,255,255,.1)">
+    <header class="row" style="padding: 0 16px; border-bottom: 1px solid rgba(255,255,255,.08); gap: 14px">
+      <div class="row" role="tablist" style="gap: 18px">
+        <button class="tab on" role="tab" aria-selected="true">Media <span class="t55" style="font-weight: 400">7</span></button>
+        <button class="tab" role="tab" id="musicTab">Music <span class="t55" style="font-weight: 400">4</span></button>
+      </div>
+      <span class="chip">3 selected</span>
+      <input class="in" style="width: 240px" placeholder="Search playlist…  Ctrl F" aria-label="Search playlist">
+      <span class="sp"></span>
+      <button class="btn sm" title="Add files (a)">+ Files</button>
+      <button class="btn sm" title="Add a folder">+ Folder</button>
+      <div class="vsep"></div>
+      <button class="btn sm" title="Shuffle order">Shuffle</button>
+      <button class="btn sm" title="New folder in playlist">New folder</button>
+      <button class="btn sm" title="Save playlist as… (Ctrl+S)">Save as…</button>
+      <button class="btn sm" title="Open playlist library (Ctrl+L)">Library…</button>
+      <div class="vsep"></div>
+      <button class="btn sm" title="Move to its own window (Ctrl+Shift+U)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="13" height="13" rx="2"></rect><path d="M8 21h11a2 2 0 0 0 2-2V8"></path></svg>Open in window</button>
+      <button class="btn ico sm" aria-label="Collapse panel" title="Collapse panel" style="width: 28px">▾</button>
+    </header>
+    <div style="display: flex; height: 326px">
+      <div id="pllist" class="col" style="width: 320px; padding: 8px; gap: 4px; border-right: 1px solid rgba(255,255,255,.08)">
+        <div class="it"><span aria-hidden="true" class="t55">⋮⋮</span><div class="th g2" style="width: 48px; height: 30px"></div><div class="col" style="gap: 0"><span>lake_morning_02.jpg</span><span class="t55" style="font-size: 11px">Photo · 10 s · Ken Burns: Auto</span></div></div>
+        <div class="it sel"><span aria-hidden="true" class="t55">⋮⋮</span><div class="th g3" style="width: 48px; height: 30px"></div><div class="col" style="gap: 0"><span>desert_noon_03.jpg</span><span class="t55" style="font-size: 11px">Photo · 10 s · Ken Burns: Push In</span></div></div>
+        <div class="it sel"><span aria-hidden="true" class="t55">⋮⋮</span><div class="th g4" style="width: 48px; height: 30px"></div><div class="col" style="gap: 0"><span>forest_ridge_04.jpg</span><span class="t55" style="font-size: 11px">Photo · 10 s · Ken Burns: Auto</span></div></div>
+        <div class="it sel"><span aria-hidden="true" class="t55">⋮⋮</span><div class="th g5" style="width: 48px; height: 30px"></div><div class="col" style="gap: 0"><span>abstract_glow_05.jpg</span><span class="t55" style="font-size: 11px">Photo · 10 s · Ken Burns: Off</span></div></div>
+        <div class="it"><span aria-hidden="true" class="t55">⋮⋮</span><div class="th g7" style="width: 48px; height: 30px"></div><div class="col" style="gap: 0"><span>clip_waves_07.mp4</span><span class="t55" style="font-size: 11px">Video · 0:42</span></div></div>
+      </div>
+      <div id="tstrip" style="flex: 1; display: flex; align-items: center; gap: 10px; padding: 0 20px">
+        <div class="th g1" style="width: 64px; height: 40px"></div><div class="th g2" style="width: 64px; height: 40px"></div><div class="th g3" style="width: 64px; height: 40px; outline: 2px solid #fff; outline-offset: 2px"></div><div class="th g4" style="width: 64px; height: 40px"></div><div class="th g5" style="width: 64px; height: 40px"></div><div class="th g6" style="width: 64px; height: 40px"></div><div class="th g7" style="width: 64px; height: 40px"></div>
+      </div>
+    </div>
+  </section>
+
+  <div role="menu" class="modal" style="position: absolute; left: 228px; top: 520px; width: 250px; padding: 6px">
+    <button class="mi" role="menuitem">Duplicate<span class="kbd">Ctrl D</span></button>
+    <button class="mi" role="menuitem">Remove from playlist<span class="kbd">Del</span></button>
+    <div class="hr" style="margin: 4px 0"></div>
+    <button class="mi" role="menuitem" style="color: #ffc2c2">Move file to Recycle Bin…<span class="kbd">⇧ Del</span></button>
+  </div>
+
+  <div style="position: absolute; inset: 0; background: rgba(0,0,0,.55)"></div>
+  <section class="modal" role="alertdialog" aria-labelledby="delT" aria-describedby="delD" style="position: absolute; left: 410px; top: 200px; width: 460px; padding: 20px">
+    <h2 id="delT" class="h2">Move 3 files to the Recycle Bin?</h2>
+    <p id="delD" class="t85" style="margin: 8px 0 10px">This deletes the files from your PC, not just from this playlist. Other playlists that use them will show them as missing.</p>
+    <div class="mono t55" style="font-size: 12px; background: #0b0b0b; border-radius: 6px; padding: 8px 10px">desert_noon_03.jpg<br>forest_ridge_04.jpg<br>abstract_glow_05.jpg</div>
+    <div class="t55" style="font-size: 12px; margin-top: 8px">Files on a network share can't go to the Recycle Bin and are deleted for good.</div>
+    <div class="row" style="margin-top: 16px">
+      <button class="btn">Remove from playlist only</button>
+      <span class="sp"></span>
+      <button class="btn fv">Cancel<span class="kbd">Esc</span></button>
+      <button class="btn dng">Move to Recycle Bin</button>
+    </div>
+  </section>
+</div>
+</body>
+</html>

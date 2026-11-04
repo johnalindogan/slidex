@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · Tempo unclear and beat grid fix</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#000}
+a{color:rgba(255,255,255,.85)}a:hover{color:#fff}
+.sx{font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;color:#fff;-webkit-font-smoothing:antialiased;font-size:13px;line-height:1.45}
+.sx *{box-sizing:border-box}
+.mono{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.scr{width:1280px;height:800px;position:relative;overflow:hidden;background:#050505}
+.modal{background:#141414;border:1px solid rgba(255,255,255,.08);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6)}
+.pop{background:#1a1a1a;border:1px solid rgba(255,255,255,.16);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.8)}
+.btn{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.08)}
+.btn.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff}
+.btn.pri{background:#fff;color:#000;border-color:#fff;font-weight:600}
+.btn.ico{width:32px;padding:0;justify-content:center}
+.btn.sm{height:28px;font-size:12px;padding:0 9px}
+.kbd{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75)}
+.btn.pri .kbd{color:rgba(0,0,0,.65);border-color:rgba(0,0,0,.3)}
+.t85{color:rgba(255,255,255,.85)}.t55{color:rgba(255,255,255,.6)}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600}
+.h2{font-size:15px;font-weight:700;margin:0}
+.in{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:32px;padding:0 10px}
+.bn{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.18);font-size:13px;color:rgba(255,255,255,.88)}
+.bn.warn{border-color:rgba(232,179,90,.55);background:rgba(232,179,90,.08)}
+.bn b{color:#fff}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap}
+.chip.warn{border-color:rgba(232,179,90,.6);color:#f3d29b}
+.row{display:flex;align-items:center;gap:10px}.col{display:flex;flex-direction:column;gap:10px}.sp{flex:1}
+.hr{height:1px;background:rgba(255,255,255,.08)}
+.gr{display:grid;grid-template-columns:120px 1fr;gap:14px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.gr>.k{font-weight:600}
+.wave{height:70px;position:relative;border-radius:6px;background:#0b0b0b;overflow:hidden}
+.wave .w{position:absolute;inset:14px 0;background:repeating-linear-gradient(90deg,rgba(255,255,255,.45) 0 2px,transparent 2px 4px,rgba(255,255,255,.2) 4px 5px,transparent 5px 9px)}
+.wave .g{position:absolute;inset:0;background-image:repeating-linear-gradient(90deg,rgba(232,179,90,.95) 0 2px,transparent 2px 120px),repeating-linear-gradient(90deg,rgba(232,179,90,.45) 0 1px,transparent 1px 30px)}
+.rad{display:flex;gap:8px;align-items:center}
+.rad i{font-style:normal;width:16px;height:16px;border-radius:50%;border:1.5px solid rgba(255,255,255,.7);flex:none}
+.rad i.on{border:5px solid #fff}
+.ghost{background:#1a1a1a;border-radius:8px}
+
+</style>
+</head>
+<body>
+<div class="scr sx">
+  <section class="modal" style="position: absolute; left: 16px; top: 12px; right: 16px; bottom: 12px; display: flex; flex-direction: column; padding: 14px 24px; gap: 12px">
+    <div class="row"><h1 class="h2">Make music video</h1><span class="t55" style="font-size: 12px">Rain walk edit · step 5 of 7 · Edit</span></div>
+    <div class="bn warn" role="alert"><span aria-hidden="true">!</span><div style="flex: 1"><b>The beat in Rain Study isn't clear.</b> Cuts may land off the beat. Fix the beat grid, or cut on a fixed timer instead.</div><button class="btn sm on">Fix beat grid…</button><button class="btn sm">Cut every 2 s</button></div>
+    <div class="row" style="gap: 16px; opacity: .35" aria-hidden="true"><div class="ghost" style="width: 560px; height: 300px"></div><div class="ghost" style="flex: 1; height: 300px"></div></div>
+    <div class="ghost" style="height: 150px; opacity: .35" aria-hidden="true"></div>
+  </section>
+  <div style="position: absolute; inset: 0; background: rgba(0,0,0,.5)"></div>
+
+  <section id="amvGridFix" class="pop" role="dialog" aria-labelledby="gfT" style="position: absolute; left: 340px; top: 110px; width: 600px; padding: 18px 20px">
+    <div class="row"><h2 id="gfT" class="h2">Beat grid</h2><span class="chip warn">Detected 98 BPM · low confidence</span><span class="sp"></span><button class="btn ico sm" aria-label="Close (Esc)" title="Close (Esc)" style="width: 28px">✕</button></div>
+    <div class="t55" style="font-size: 12px; margin: 4px 0 10px">Orange lines are where SlideX thinks the beats are. Line them up with the peaks while it plays.</div>
+    <div class="wave" aria-label="Waveform with beat grid overlay" role="img"><div class="w"></div><div class="g"></div><div style="position: absolute; left: 212px; top: 0; bottom: 0; width: 2px; background: #fff"></div></div>
+    <div class="row" style="margin-top: 8px"><button class="btn sm" aria-label="Play this part (Space)" title="Play this part (Space)">▶ Play loop</button><span class="mono t55" style="font-size: 12px">0:41–0:49</span></div>
+
+    <div class="gr"><div class="k">Tempo</div><div class="row"><input class="in mono" style="width: 90px" value="98.0" aria-label="Tempo in BPM"><span class="t55">BPM</span><button class="btn sm" title="Halve tempo (Shift+,)">½×</button><button class="btn sm" title="Double tempo (Shift+.)">2×</button><span class="t55" style="font-size: 12px">Try 2× if cuts feel too slow</span></div></div>
+    <div class="gr"><div class="k">Shift grid</div><div class="row"><button class="btn sm" aria-label="Earlier by 10 ms (Alt+←)" title="Earlier by 10 ms (Alt+←)">← 10 ms</button><span class="mono" style="width: 70px; text-align: center">+40 ms</span><button class="btn sm" aria-label="Later by 10 ms (Alt+→)" title="Later by 10 ms (Alt+→)">10 ms →</button></div></div>
+    <div class="gr"><div class="k">First beat of bar</div><div class="row"><button class="btn sm on" title="Tap on each bar's first beat while it plays (T)">Tap along<span class="kbd">T</span></button><span class="row" style="gap: 4px" aria-label="3 of 4 taps"><span style="width: 8px; height: 8px; border-radius: 50%; background: #fff"></span><span style="width: 8px; height: 8px; border-radius: 50%; background: #fff"></span><span style="width: 8px; height: 8px; border-radius: 50%; background: #fff"></span><span style="width: 8px; height: 8px; border-radius: 50%; border: 1px solid #fff"></span></span><span class="t55" style="font-size: 12px">3 of 4 taps</span></div></div>
+    <div class="gr" style="border: 0"><div class="k">No beat</div><div class="rad"><i></i><span>Ignore the beat and cut every</span><input class="in mono" style="width: 64px; height: 28px" value="2.0" aria-label="Seconds per cut"><span>seconds</span></div></div>
+
+    <div class="hr" style="margin: 4px 0 14px"></div>
+    <div class="row"><button class="btn sm">Reset to detected</button><span class="sp"></span><span class="t55" style="font-size: 12px">Locked shots that still fit are kept</span><button class="btn">Cancel</button><button class="btn pri">Apply and re-plan<span class="kbd">Enter</span></button></div>
+  </section>
+</div>
+</body>
+</html>

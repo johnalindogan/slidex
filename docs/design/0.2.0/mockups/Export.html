@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · Export music video</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#000}
+a{color:rgba(255,255,255,.85)}a:hover{color:#fff}
+.sx{font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;color:#fff;-webkit-font-smoothing:antialiased;font-size:13px;line-height:1.45}
+.sx *{box-sizing:border-box}
+.mono{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.scr{width:1280px;height:800px;position:relative;overflow:hidden;background:#000}
+.stage{position:absolute;inset:0;background:linear-gradient(180deg,#4f8fd6 0%,#9cc6ec 58%,#d3a066 58%,#c08752 74%,#a2683f 100%)}
+.dim{position:absolute;inset:0;background:rgba(0,0,0,.72)}
+.modal{background:#141414;border:1px solid rgba(255,255,255,.08);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6)}
+.card{background:#1a1a1a;border:1px solid rgba(255,255,255,.08);border-radius:10px}
+.btn{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.08)}
+.btn.pri{background:#fff;color:#000;border-color:#fff;font-weight:600}
+.btn.ico{width:32px;padding:0;justify-content:center}
+.btn.sm{height:26px;font-size:12px;padding:0 9px}
+.kbd{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75)}
+.btn.pri .kbd{color:rgba(0,0,0,.65);border-color:rgba(0,0,0,.3)}
+.t85{color:rgba(255,255,255,.85)}.t55{color:rgba(255,255,255,.6)}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600}
+.h2{font-size:15px;font-weight:700;margin:0}
+.in{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:32px;padding:0 10px}
+.sel{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:32px;padding:0 8px}
+.seg{display:inline-flex;border:.5px solid rgba(255,255,255,.18);border-radius:7px;padding:2px;gap:2px}
+.seg button{font:inherit;font-size:12px;color:rgba(255,255,255,.75);background:transparent;border:0;border-radius:5px;padding:0 12px;height:28px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.seg button.on{background:rgba(255,255,255,.15);color:#fff;box-shadow:inset 0 0 0 .5px rgba(255,255,255,.55);font-weight:600}
+.bn{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.18);font-size:13px;color:rgba(255,255,255,.88)}
+.bn b{color:#fff}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap}
+.row{display:flex;align-items:center;gap:10px}.col{display:flex;flex-direction:column;gap:10px}.sp{flex:1}
+.hr{height:1px;background:rgba(255,255,255,.08)}
+.opt{display:grid;grid-template-columns:130px 1fr;gap:16px;align-items:start;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.06)}
+.opt>.k{padding-top:6px;font-weight:600}
+.hint{font-size:12px;color:rgba(255,255,255,.6);margin-top:6px}
+.rad{display:flex;gap:8px;align-items:flex-start}
+.rad i{font-style:normal;width:16px;height:16px;border-radius:50%;border:1.5px solid rgba(255,255,255,.7);margin-top:1px;flex:none}
+.rad i.on{border:5px solid #fff}
+.ar{display:inline-block;border:1.5px solid currentColor;border-radius:2px}
+.cap{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:rgba(255,255,255,.7);font-weight:700;margin-bottom:8px}
+
+</style>
+</head>
+<body>
+<div class="scr sx">
+  <div class="stage"></div><div class="dim"></div>
+  <section id="mvx" class="modal" role="dialog" aria-labelledby="mvxTitle" style="position: absolute; left: 80px; top: 60px; width: 720px; padding: 20px 24px">
+    <div class="row"><h1 id="mvxTitle" class="h2" style="font-size: 18px">Export as music video</h1><span class="sp"></span><button class="btn ico" aria-label="Close (Esc)" title="Close (Esc)">✕</button></div>
+    <div class="t55" style="margin-top: 4px">Renders your slideshow as it is, in playlist order, with its music. Nothing is picked or reordered.</div>
+    <div id="mvxSummary" class="card row" style="padding: 12px 14px; margin-top: 14px; gap: 14px; flex-wrap: wrap">
+      <span><b>7 items</b> <span class="t55">· playlist order</span></span>
+      <span><b>Golden Hour, Low Tide</b> <span class="t55">· 2 songs</span></span>
+      <span><b>Every 4 beats</b></span>
+      <span class="sp"></span><span class="mono">≈ 0:54</span>
+    </div>
+    <div class="opt"><div class="k">Shape</div><div><div id="mvxAspect" class="seg" role="radiogroup" aria-label="Shape"><button class="on" role="radio" aria-checked="true"><span class="ar" style="width: 18px; height: 10px" aria-hidden="true"></span>16:9 wide</button><button role="radio"><span class="ar" style="width: 9px; height: 15px" aria-hidden="true"></span>9:16 tall</button><button role="radio"><span class="ar" style="width: 12px; height: 12px" aria-hidden="true"></span>1:1 square</button></div><div class="hint mono">1920 × 1080 · 30 fps</div></div></div>
+    <div class="opt"><div class="k">Clip sound</div><div class="col" style="gap: 8px">
+      <div class="rad" role="radio" aria-checked="true"><i class="on"></i><div>Song only <span class="t55">· video clips are muted</span></div></div>
+      <div class="rad" role="radio" aria-disabled="true" style="opacity: .6"><i></i><div>Keep clips' own sound quietly underneath <span class="chip">Coming later</span></div></div></div></div>
+    <div class="opt"><div class="k">Quality</div><div><select id="mvxEnc" class="sel" style="width: 100%"><option>Auto · NVIDIA graphics (fastest)</option><option>Compatible · uses the CPU</option><option>Windows built-in encoder</option><option>Intel graphics</option></select><div class="hint mono">encoder: h264_nvenc</div></div></div>
+    <div class="opt" style="border: 0"><div class="k">Save to</div><div><div class="row"><input id="mvxOut" class="in mono" style="flex: 1; font-size: 12px" value="C:\Users\John\Videos\SlideX\Weekend trip.mp4"><button class="btn">Change…</button></div><div class="hint">Never next to your originals.</div></div></div>
+    <div class="row" style="margin-top: 8px"><span class="t55" style="font-size: 12px">If you upload it, a commercial song may get it muted or claimed.</span><span class="sp"></span><button class="btn">Cancel</button><button id="mvxGo" class="btn pri">Export<span class="kbd">Enter</span></button></div>
+  </section>
+
+  <div class="col" style="position: absolute; left: 840px; top: 60px; width: 380px; gap: 14px">
+    <div class="modal" style="padding: 14px 16px">
+      <div class="cap">State · no music</div>
+      <div class="bn"><span aria-hidden="true">♪</span><div><b>This slideshow has no music.</b> Add songs in the Music tab first, then export.</div></div>
+      <div class="row" style="margin-top: 10px"><button class="btn sm">Open Music tab</button></div>
+    </div>
+    <div class="modal" style="padding: 14px 16px">
+      <div class="cap">State · over the cap</div>
+      <div class="bn" style="border-color: rgba(220,60,60,.65); background: rgba(220,60,60,.1)"><span aria-hidden="true">!</span><div><b>This would run 14:20.</b> Music videos can be up to 10:00. Remove some items or songs, or use fewer beats per slide.</div></div>
+    </div>
+    <div class="modal" style="padding: 14px 16px">
+      <div class="cap">Then</div>
+      <div class="t85">Progress, background behaviour and the Done screen are the same as Make music video (steps 6 and 7).</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

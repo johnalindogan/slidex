@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · Controls and Tools sheet</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#000}
+a{color:rgba(255,255,255,.85)}a:hover{color:#fff}
+.sx{font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;color:#fff;-webkit-font-smoothing:antialiased;font-size:13px;line-height:1.45}
+.sx *{box-sizing:border-box}
+.mono{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace}
+.scr{width:1280px;height:800px;position:relative;overflow:hidden;background:#000}
+.stage{position:absolute;inset:0;background:linear-gradient(180deg,#4f8fd6 0%,#9cc6ec 58%,#d3a066 58%,#c08752 74%,#a2683f 100%)}
+.dim{position:absolute;inset:0;background:rgba(0,0,0,.62)}
+.glass{background:rgba(10,10,10,.82);border:1px solid rgba(255,255,255,.08);backdrop-filter:blur(18px)}
+.modal{background:#141414;border:1px solid rgba(255,255,255,.08);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6)}
+.card{background:#1a1a1a;border:1px solid rgba(255,255,255,.08);border-radius:8px}
+.btn{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.08)}
+.btn.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff}
+.btn.pri{background:#fff;color:#000;border-color:#fff;font-weight:600}
+.btn.dng{background:rgba(220,60,60,.16);border-color:rgba(220,60,60,.75);color:#ffc2c2}
+.btn.ico{width:32px;padding:0;justify-content:center}
+.btn.sm{height:26px;font-size:12px;padding:0 9px}
+.btn[disabled]{opacity:.4;cursor:default}
+.fv{outline:2px solid #fff;outline-offset:2px}
+.kbd{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75)}
+.t85{color:rgba(255,255,255,.85)}.t55{color:rgba(255,255,255,.6)}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600}
+.h2{font-size:15px;font-weight:700;margin:0}
+.in{font:inherit;font-size:13px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:32px;padding:0 10px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap}
+.chip.live{border-color:rgba(159,208,255,.6);color:#cfe7ff}
+.row{display:flex;align-items:center;gap:10px}.col{display:flex;flex-direction:column;gap:10px}.sp{flex:1}
+.hr{height:1px;background:rgba(255,255,255,.08)}
+.ctrls{position:absolute;left:0;right:0;bottom:0;height:50px;background:rgba(10,10,10,.85);border-top:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:6px;padding:0 12px}
+.vsep{width:1px;height:20px;background:rgba(255,255,255,.12);margin:0 4px}
+.tool{font:inherit;font-size:13px;color:rgba(255,255,255,.88);background:transparent;border:0;border-radius:6px;height:34px;padding:0 8px;display:flex;align-items:center;gap:8px;cursor:pointer;width:100%;text-align:left}
+.tool:hover{background:rgba(255,255,255,.08)}
+.tool .kbd{margin-left:auto}
+.tool.on::after{content:"On";font-size:10px;margin-left:6px;padding:1px 6px;border-radius:999px;border:.5px solid rgba(255,255,255,.5)}
+.sel{font:inherit;font-size:12px;color:#fff;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;height:26px;padding:0 6px;margin-left:auto}
+
+</style>
+</head>
+<body>
+<div id="viewer" class="scr sx">
+  <div id="stage" class="stage"></div>
+  <div style="position: absolute; right: 68px; top: 40px; width: 140px; height: 140px; border-radius: 50%; background: #fffbe3"></div>
+  <div id="fnov" class="glass" style="position: absolute; right: 12px; bottom: 62px; border-radius: 6px; padding: 3px 8px; font-size: 12px">desert_noon_03.jpg</div>
+
+  <section id="ctrls-overflow" class="glass" role="dialog" aria-label="Tools" style="position: absolute; left: 50%; transform: translateX(-50%); bottom: 62px; width: 1040px; border-radius: 12px; padding: 14px 16px 12px">
+    <div class="row" style="margin-bottom: 10px">
+      <h2 class="h2">Tools</h2>
+      <input class="in" style="width: 280px; height: 28px; margin-left: 10px" placeholder="Type to find a tool…" aria-label="Find a tool">
+      <span class="sp"></span>
+      <span class="t55" style="font-size: 12px">Hover any tool for its shortcut · <span class="kbd">Esc</span> closes</span>
+      <button class="btn sm" title="Settings (Ctrl+,)">All settings<span class="kbd">Ctrl ,</span></button>
+    </div>
+    <div class="hr"></div>
+    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; margin-top: 12px">
+      <div class="col" style="gap: 2px">
+        <div class="lbl" style="padding: 0 8px 4px">Playback</div>
+        <button class="tool" id="brev">Reverse play<span class="kbd">b</span></button>
+        <div class="tool" style="cursor: default">Speed<span class="row" style="gap: 4px; margin-left: auto"><button class="btn sm ico" aria-label="Slower (,)" title="Slower (,)">−</button><span class="mono" style="font-size: 12px; width: 38px; text-align: center">1.0×</span><button class="btn sm ico" aria-label="Faster (.)" title="Faster (.)">+</button></span></div>
+        <label class="tool">Photo duration<select id="dsel" class="sel"><option>10 s</option></select></label>
+        <label class="tool">Transition<select id="tsel" class="sel"><option>Fade</option></select></label>
+        <label class="tool">Video skip<input id="vskip" class="in mono" style="width: 56px; height: 26px; margin-left: auto; font-size: 12px" value="5 s"></label>
+        <div class="tool" style="cursor: default">Volume<button class="btn sm ico" aria-label="Mute" title="Mute" style="margin-left: auto">M</button><input type="range" aria-label="Volume" style="width: 90px; accent-color: #fff"></div>
+      </div>
+      <div class="col" style="gap: 2px">
+        <div class="lbl" style="padding: 0 8px 4px">Image</div>
+        <button class="tool">Colour…<span class="kbd">c</span></button>
+        <button class="tool">Crop…<span class="t55" style="font-size: 11px; margin-left: auto">export inside</span></button>
+        <button class="tool">Mirror horizontal</button>
+        <button class="tool">Mirror vertical</button>
+        <button class="tool">Rotate 90°</button>
+      </div>
+      <div class="col" style="gap: 2px">
+        <div class="lbl" style="padding: 0 8px 4px">Motion &amp; view</div>
+        <button class="tool on">Ken Burns…<span class="kbd">k</span></button>
+        <button class="tool">Fit width</button>
+        <button class="tool">Fit height</button>
+        <button class="tool on">Show file name</button>
+        <button class="tool">Hide controls<span class="kbd">h</span></button>
+        <button class="tool">Themes…<span class="kbd">t</span></button>
+      </div>
+      <div class="col" style="gap: 2px">
+        <div class="lbl" style="padding: 0 8px 4px">Export &amp; create</div>
+        <button class="tool">Screenshot<span class="kbd">s</span></button>
+        <button class="tool">Export graded<span class="kbd">e</span></button>
+        <div class="hr" style="margin: 4px 8px"></div>
+        <button class="tool" style="font-weight: 600"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l11-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="17" cy="16" r="3"></circle></svg>Make music video…<span class="kbd">Ctrl ⇧ M</span></button>
+        <button class="tool">Export as music video…<span class="kbd">Ctrl ⇧ E</span></button>
+      </div>
+    </div>
+    <div class="t55" style="font-size: 11px; margin-top: 10px; padding: 0 8px">Keys marked c, k, h are proposed new defaults; check them against your keymap in Settings › Shortcuts.</div>
+  </section>
+
+  <nav id="ctrls" class="ctrls" aria-label="Playback controls">
+    <button id="bpr" class="btn ico" aria-label="Previous (←)" title="Previous (←)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"></path></svg></button>
+    <button id="bpl" class="btn ico" aria-label="Pause (Space)" title="Pause (Space)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M9 5v14M15 5v14"></path></svg></button>
+    <button id="bne" class="btn ico" aria-label="Next (→)" title="Next (→)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"></path></svg></button>
+    <div id="pbw" style="width: 180px; height: 4px; background: rgba(255,255,255,.18); border-radius: 2px; margin: 0 6px"><div style="width: 40%; height: 100%; background: #fff; border-radius: 2px"></div></div>
+    <span id="sc" class="mono t85" style="font-size: 12px">3 / 7</span>
+    <div class="vsep"></div>
+    <button class="btn ico" aria-label="Zoom out (-)" title="Zoom out (-)">−</button>
+    <span class="mono t85" style="font-size: 12px">100%</span>
+    <button class="btn ico" aria-label="Zoom in (+)" title="Zoom in (+)">+</button>
+    <div class="vsep"></div>
+    <button class="btn ico" aria-label="Fullscreen (F11)" title="Fullscreen (F11)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"></path></svg></button>
+    <button id="bplt" class="btn" title="Media Manager (Ctrl+B)">Media</button>
+    <button id="bmusic" class="btn" title="Music (Ctrl+Shift+L)" style="max-width: 230px"><span aria-hidden="true" style="width: 7px; height: 7px; border-radius: 50%; background: #fff"></span><span style="overflow: hidden; text-overflow: ellipsis">Golden Hour</span><span class="mono t55" style="font-size: 11px">124 BPM</span></button>
+    <span class="sp"></span>
+    <button id="bcast" class="btn" title="Cast to a Google TV (Ctrl+Shift+C)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 16a6 6 0 0 1 6 6M2 12a10 10 0 0 1 10 10M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"></path></svg>Cast</button>
+    <button id="bmore" class="btn on" aria-expanded="true" aria-controls="ctrls-overflow" title="Tools (/)">Tools</button>
+    <button id="bsettings" class="btn ico" aria-label="Settings (Ctrl+,)" title="Settings (Ctrl+,)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9L7 7M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"></path></svg></button>
+  </nav>
+</div>
+</body>
+</html>
