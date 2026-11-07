@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlideX 0.2.0 · SlideX copy deck</title>
+<style>
+/* Bundle Plus Jakarta Sans + JetBrains Mono locally (see Porting note); system fallbacks keep this offline-safe. */
+
+body{margin:0;background:#0b0b0b}
+a{color:#cfe7ff}a:hover{color:#fff}
+.doc{width:1280px;min-height:2500px;box-sizing:border-box;padding:56px 64px;background:#0b0b0b;color:#fff;font-family:"Plus Jakarta Sans",system-ui,"Segoe UI",sans-serif;font-size:13px;line-height:1.5}
+.doc h1{font-size:34px;margin:0 0 6px;letter-spacing:-.02em}
+.doc h2{font-size:17px;margin:28px 0 8px}
+.doc p{margin:0;color:rgba(255,255,255,.75)}
+.doc table{width:100%;border-collapse:collapse}
+.doc th{text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.2)}
+.doc td{vertical-align:top;padding:7px 10px;border-bottom:1px solid rgba(255,255,255,.07);color:rgba(255,255,255,.88)}
+.k{font-family:"JetBrains Mono",ui-monospace,Consolas,monospace;font-size:11px;color:rgba(255,255,255,.6);white-space:nowrap}
+.cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 40px}
+
+</style>
+</head>
+<body>
+<div class="doc">
+  <h1>Copy deck · 0.2.0</h1>
+  <p>Plain words, sentence case, no exclamation marks. {braces} are filled at runtime. Technical detail goes under a "Details" disclosure, never deleted.</p>
+
+  <div class="cols">
+  <div>
+  <h2>Make music video · frame</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">amv.title</td><td>Make music video</td></tr>
+    <tr><td class="k">amv.project</td><td>{project name} · saved</td></tr>
+    <tr><td class="k">amv.steps</td><td>Media · Song · Options · Analyze · Edit · Render · Done</td></tr>
+    <tr><td class="k">amv.close.tip</td><td>Close (Esc). Project is saved.</td></tr>
+    <tr><td class="k">amv.footer.safe</td><td>Your files are only read, never changed.</td></tr>
+    <tr><td class="k">amv.next</td><td>Next: {step} · Analyze · Render MP4</td></tr>
+  </table>
+
+  <h2>1 · Media</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">amv.media.h</td><td>Pick photos and clips</td></tr>
+    <tr><td class="k">amv.media.src</td><td>Current playlist · {n} / Selected items · {n} / A folder…</td></tr>
+    <tr><td class="k">amv.media.sub</td><td>SlideX picks the best moments. Untick anything you don't want used.</td></tr>
+    <tr><td class="k">amv.media.count</td><td>{used} of {total} used · {p} photos · {v} videos · {dur}</td></tr>
+    <tr><td class="k">amv.media.empty.h</td><td>No photos or clips yet</td></tr>
+    <tr><td class="k">amv.media.empty.b</td><td>Pick what goes into the video. SlideX will choose the best moments.</td></tr>
+  </table>
+
+  <h2>2 · Song</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">amv.song.h</td><td>Pick a song</td></tr>
+    <tr><td class="k">amv.song.drop</td><td>Drop a song here · Choose song…</td></tr>
+    <tr><td class="k">amv.song.local</td><td>Local files only. SlideX never uploads anything or uses streaming services.</td></tr>
+    <tr><td class="k">amv.song.cached</td><td>Analyzed before · fast</td></tr>
+    <tr><td class="k">amv.song.empty.h</td><td>Pick a song to set the rhythm</td></tr>
+    <tr><td class="k">amv.song.empty.b</td><td>Cuts follow its beat. MP3, FLAC or WAV from this PC.</td></tr>
+  </table>
+
+  <h2>3 · Options</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">amv.opt.style</td><td>Style: Chill · Balanced · Hype</td></tr>
+    <tr><td class="k">amv.opt.style.chill</td><td>Calm: a new shot every 8 beats, every 4 in the chorus.</td></tr>
+    <tr><td class="k">amv.opt.style.bal</td><td>Balanced: every 8 beats in calm parts, every 2 in the chorus, every beat on a drop.</td></tr>
+    <tr><td class="k">amv.opt.style.hype</td><td>Fast: every 4 beats in calm parts, every beat in the chorus and drop.</td></tr>
+    <tr><td class="k">amv.opt.len</td><td>Length: Whole song · {dur} / 30 s / 60 s / Custom…</td></tr>
+    <tr><td class="k">amv.opt.len.hint</td><td>Takes the strongest {n} s (chorus and drop). Up to 10 minutes.</td></tr>
+    <tr><td class="k">amv.opt.shape</td><td>Shape: 16:9 wide / 9:16 tall / 1:1 square</td></tr>
+    <tr><td class="k">amv.opt.sound</td><td>Song only · video clips are muted</td></tr>
+    <tr><td class="k">amv.opt.sound.keep</td><td>Keep clips' own sound quietly underneath · Coming later</td></tr>
+    <tr><td class="k">amv.opt.out.hint</td><td>Never next to your originals. The project is kept so you can edit and render again.</td></tr>
+    <tr><td class="k">amv.opt.summary</td><td>You'll get · {dur} MP4 · about {size} · about {t} to render on this PC</td></tr>
+  </table>
+
+  <h2>4 · Analyze</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">amv.an.h</td><td>Analyzing · {i} of {n} · about {t} left</td></tr>
+    <tr><td class="k">amv.an.song</td><td>Song · {bpm} BPM · {sig} · {n} sections</td></tr>
+    <tr><td class="k">amv.an.media</td><td>Looking for dark, blurry, frozen or black stretches</td></tr>
+    <tr><td class="k">amv.an.file</td><td>{file} · {pos} of {dur}</td></tr>
+    <tr><td class="k">amv.an.skipped</td><td>Skipped so far: {list}</td></tr>
+    <tr><td class="k">amv.an.slow</td><td>Reading from {share} is slow (about {rate}). It will finish, just slower. Copying the files to this PC first is faster.</td></tr>
+    <tr><td class="k">amv.an.cache</td><td>Results are cached. Running this again with the same files and song takes seconds.</td></tr>
+    <tr><td class="k">amv.an.fast</td><td>Everything was analyzed before. Ready in 1 s.</td></tr>
+    <tr><td class="k">amv.an.btns</td><td>Cancel analysis · Run in background · Open editor</td></tr>
+    <tr><td class="k">amv.an.cancel.toast</td><td>Analysis stopped. Finished files are kept for next time.</td></tr>
+  </table>
+
+  <h2>5 · Edit</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">amv.ed.preview</td><td>Preview · low resolution · not rendered yet</td></tr>
+    <tr><td class="k">amv.ed.shot</td><td>Shot {i} of {n}</td></tr>
+    <tr><td class="k">amv.ed.lock</td><td>Lock / Locked · Kept when you regenerate (L)</td></tr>
+    <tr><td class="k">amv.ed.swap</td><td>Swap… · Uses that item's best moment (W)</td></tr>
+    <tr><td class="k">amv.ed.len</td><td>{b} beats · {s} s · Split · Merge →</td></tr>
+    <tr><td class="k">amv.ed.trim</td><td>Start point inside the clip (length stays fixed)</td></tr>
+    <tr><td class="k">amv.ed.kb</td><td>Ken Burns move</td></tr>
+    <tr><td class="k">amv.ed.trans</td><td>Into this shot: Hard cut / Crossfade</td></tr>
+    <tr><td class="k">amv.ed.regen</td><td>Regenerate · {n} locked shots stay</td></tr>
+    <tr><td class="k">amv.ed.regen.toast</td><td>Re-planned {n} shots. {k} locked shots kept, {d} no longer fit and were unlocked. · Undo</td></tr>
+    <tr><td class="k">amv.ed.undo</td><td>Undo · Redo · tooltip: Undo {step} (Ctrl+Z) / Nothing to undo</td></tr>
+    <tr><td class="k">amv.ed.undo.toast</td><td>{step} done. · Undo — then: Undid: {step}. / Redid: {step}.</td></tr>
+    <tr><td class="k">amv.ed.history</td><td>{n} steps back</td></tr>
+    <tr><td class="k">amv.ed.legend</td><td>Tall tick = bar · short tick = beat · Dark left edge = crossfade · ▶ = video</td></tr>
+  </table>
+  </div>
+
+  <div>
+  <h2>Beat grid</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">grid.h</td><td>Beat grid · Detected {bpm} BPM · {confidence} confidence</td></tr>
+    <tr><td class="k">grid.sub</td><td>Orange lines are where SlideX thinks the beats are. Line them up with the peaks while it plays.</td></tr>
+    <tr><td class="k">grid.tempo</td><td>Tempo · ½× · 2× · Try 2× if cuts feel too slow</td></tr>
+    <tr><td class="k">grid.shift</td><td>Shift grid · ← 10 ms · 10 ms →</td></tr>
+    <tr><td class="k">grid.tap</td><td>First beat of bar · Tap along (T) · {n} of 4 taps</td></tr>
+    <tr><td class="k">grid.fixed</td><td>Ignore the beat and cut every {s} seconds</td></tr>
+    <tr><td class="k">grid.btns</td><td>Reset to detected · Cancel · Apply and re-plan</td></tr>
+  </table>
+
+  <h2>6 · Render · 7 · Done (also Export)</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">rnd.h</td><td>{pct}% · Rendering shot {i} of {n}</td></tr>
+    <tr><td class="k">rnd.time</td><td>{elapsed} elapsed · about {left} left</td></tr>
+    <tr><td class="k">rnd.reuse</td><td>Grey = reused from your last render ({n}) · White = rendered now · Empty = still to do</td></tr>
+    <tr><td class="k">rnd.bg</td><td>You can keep watching or editing your slideshow. Rendering continues in the background and when SlideX is minimized, but playback may stutter while it runs. Quitting SlideX asks first.</td></tr>
+    <tr><td class="k">rnd.btns</td><td>Cancel render · Keep working</td></tr>
+    <tr><td class="k">rnd.pill</td><td>Rendering · {pct}% · {left}</td></tr>
+    <tr><td class="k">rnd.quit</td><td>A music video is still rendering ({pct}%). Quit and stop it? · Keep rendering · Quit</td></tr>
+    <tr><td class="k">rnd.cancel</td><td>Stop rendering? Shots already done are kept, so the next render is faster. · Keep rendering · Stop</td></tr>
+    <tr><td class="k">done.h</td><td>Your music video is ready</td></tr>
+    <tr><td class="k">done.btns</td><td>Play in SlideX · Open folder · Cast it… · Back to the editor · Make another</td></tr>
+    <tr><td class="k">done.toast</td><td>Music video ready. {file} · {dur} · Open · Play · Cast</td></tr>
+    <tr><td class="k">legal.line</td><td>If you upload this video, a commercial song may get it muted or claimed.</td></tr>
+    <tr><td class="k">mvx.h</td><td>Export as music video</td></tr>
+    <tr><td class="k">mvx.sub</td><td>Renders your slideshow as it is, in playlist order, with its music. Nothing is picked or reordered.</td></tr>
+    <tr><td class="k">mvx.nomusic</td><td>This slideshow has no music. Add songs in the Music tab first, then export.</td></tr>
+  </table>
+
+  <h2>Music + beat sync</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">music.tab</td><td>Music</td></tr>
+    <tr><td class="k">music.empty</td><td>No music yet · Add songs to play under your slideshow. Slides can change on the beat. · Add music… · Add a folder…</td></tr>
+    <tr><td class="k">music.status</td><td>{bpm} BPM · Cached · {bpm} BPM · Analyzing {pct}% · ! Tempo unclear · ✕ Can't read</td></tr>
+    <tr><td class="k">music.pace</td><td>Change slides: Every N beats / Every bar · beats · about {s} s</td></tr>
+    <tr><td class="k">music.trans</td><td>Stronger on loud parts</td></tr>
+    <tr><td class="k">music.offset</td><td>Sync offset · {ms} ms · Saved · use if speakers or HDMI lag</td></tr>
+    <tr><td class="k">music.castwarn</td><td>Casting to {tv}. Beat sync covers this PC's screens only. For a beat-synced show on the TV, export a music video and cast the file.</td></tr>
+    <tr><td class="k">bar.status</td><td>Slides follow the music: every {n} beats</td></tr>
+  </table>
+
+  <h2>Cast</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">cast.h</td><td>Cast to TV · Sends the show to a Google TV on the same network. Not a screen mirror.</td></tr>
+    <tr><td class="k">cast.steps</td><td>Found {tv} · Opening a secure link to the TV… {s} s · Starting the stream · If the TV shows a prompt, accept it.</td></tr>
+    <tr><td class="k">cast.what</td><td>This slideshow · A video file…</td></tr>
+    <tr><td class="k">cast.quality</td><td>Auto · {best} (fastest) · Compatible · uses the CPU · Windows built-in encoder · NVIDIA graphics · Intel graphics</td></tr>
+    <tr><td class="k">cast.manual</td><td>TV not listed? Enter its address</td></tr>
+    <tr><td class="k">cast.playing</td><td>Playing on {tv} · {file} · Use the TV remote or the controls here.</td></tr>
+  </table>
+
+  <h2>Second window</h2>
+  <table>
+    <tr><th>Key</th><th>Text</th></tr>
+    <tr><td class="k">sw.open</td><td>Open in window · Dock back</td></tr>
+    <tr><td class="k">sw.link</td><td>Linked to main window · in sync / Connecting to main window… / Main window busy / Not linked · Last update {t} ago</td></tr>
+    <tr><td class="k">sw.busy</td><td>Browsing works. Changes you make are sent when the main window catches up, so they may take a few seconds to show.</td></tr>
+    <tr><td class="k">sw.docked</td><td>Media Manager is back here. Order and selection kept.</td></tr>
+  </table>
+  </div>
+  </div>
+
+  <h2>Errors · message + what to do (+ Details)</h2>
+  <table>
+    <tr><th style="width: 190px">Case</th><th>Message</th><th>What to do</th><th style="width: 290px">Details (expandable)</th></tr>
+    <tr><td>No beats / tempo unclear</td><td>The beat in {song} isn't clear.</td><td>Fix the beat grid, or cut on a fixed timer instead. · Fix beat grid… · Cut every 2 s</td><td class="k">confidence 0.31 · candidates 98/196 BPM</td></tr>
+    <tr><td>Unsupported file</td><td>{n} files can't be used: {names}</td><td>The rest are fine. Skip these and carry on. · Skip and continue</td><td class="k">scan_0042.tif: TIFF not supported · voice_memo.m4a: audio only</td></tr>
+    <tr><td>Missing file</td><td>{file} isn't where it was.</td><td>It may have been moved or renamed. · Locate… · Skip it</td><td class="k">{full path}</td></tr>
+    <tr><td>Share unreachable</td><td>Can't reach {share}. {n} files live there.</td><td>Check the NAS is on and you're on the home network, then try again. · Try again · Locate folder… · Skip those {n}</td><td class="k">ERROR_BAD_NETPATH (53)</td></tr>
+    <tr><td>Render failed</td><td>Rendering stopped at shot {i}.</td><td>Nothing was lost. Try again, or pick the Compatible encoder if it keeps failing. · Try again · Copy log path</td><td class="k">ffmpeg exit code · stderr tail · render.log path</td></tr>
+    <tr><td>Disk space</td><td>Not enough space on {drive}.</td><td>This render needs about {need} (temporary files plus the video). {drive} has {free} free. · Save to another drive… · Try again</td><td class="k">temp: {temp dir} · output: {path}</td></tr>
+    <tr><td>Over 10 min</td><td>{song} is {dur}. Music videos can be up to 10:00.</td><td>Pick 30 s, 60 s or Custom to trim it. · Trim to 10:00 · Use 60 s</td><td class="k">—</td></tr>
+    <tr><td>Too few items</td><td>Not enough material for {dur}.</td><td>{n} items cover about {cover} without repeats. Add more, shorten the video, or carry on and some shots will repeat.</td><td class="k">—</td></tr>
+    <tr><td>Song can't be read</td><td>Couldn't read {file}.</td><td>The file may be damaged or not really an {ext}. Pick another song.</td><td class="k">decoder error · analysis.log path</td></tr>
+    <tr><td>TV unreachable</td><td>Couldn't connect to {tv}.</td><td>Make sure the TV is on and on the same Wi-Fi. If Windows asked about the firewall, allow SlideX on Private networks. · Try again · Enter TV address</td><td class="k">TLS handshake to {ip}:{port} timed out (10 s) · cast.log path</td></tr>
+    <tr><td>Link dropped (2nd window)</td><td>Lost the link to the main window.</td><td>This is the last copy it sent. Editing is paused so nothing gets out of step. · Reconnect · Dock back</td><td class="k">last snapshot v{n} · {t} ago</td></tr>
+  </table>
+</div>
+</body>
+</html>
