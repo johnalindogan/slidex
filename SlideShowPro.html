@@ -1409,7 +1409,7 @@ let SSP_WINDOW_ROLE = (function () {
   return 'main';
 })();
 let SSP_IS_PLAYLIST_WINDOW = SSP_WINDOW_ROLE === 'playlist';
-/** Undock is off in 0.1.18. The second window is rebuilt in 0.2.0. The code stays. */
+/** Undock is off in 0.1.19. The second window is rebuilt in 0.2.0. The code stays. */
 const SSP_UNDOCK_ENABLED = false;
 if (SSP_UNDOCK_ENABLED) document.body.classList.add('ssp-undock-enabled');
 let playlistUndocked = false;
@@ -3718,6 +3718,13 @@ function showMaxCompanion(curIdx) {
 window.addEventListener('resize', () => { if (getMediaItems().length) showMaxCompanion(cur); });
 
 /* ── Remove item from playlist helper ── */
+// The last item is gone, so the welcome screen must not offer it under Continue.
+function forgetEmptiedSession() {
+  sessionLoaded = false;
+  sessionDirty = false;
+  if (window.SlideXCore && SlideXCore.forgetEmptiedSession) SlideXCore.forgetEmptiedSession(localStorage, 0);
+  else { try { localStorage.removeItem('ssp_autosave'); } catch (_) {} }
+}
 function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
   if (!item) return;
@@ -3725,7 +3732,7 @@ function removeItem(itemsIdx, clearLS) {
   items.splice(itemsIdx, 1);
   selectedItems.clear();
   const cnt = getMediaItems().length;
-  if (!cnt) { g('bru').click(); } else { rebuildSlides(Math.min(cur, cnt - 1)); }
+  if (!cnt) { forgetEmptiedSession(); g('bru').click(); } else { rebuildSlides(Math.min(cur, cnt - 1)); }
   autoSave();
 }
 
@@ -6569,7 +6576,7 @@ function removePlaylistFiles(files, clearLS, byPath) {
   cur = plan.cur;
   selectedItems.clear();
   const cnt = getMediaItems().length;
-  if (!cnt) { try { g('bru').click(); } catch (_) {} }
+  if (!cnt) { forgetEmptiedSession(); try { g('bru').click(); } catch (_) {} }
   else rebuildSlides(cur);
   autoSave();
 }

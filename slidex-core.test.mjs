@@ -745,19 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.18 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.19 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.18');
-  assert.equal(tauri.version, '0.1.18');
+  assert.equal(pkg.version, '0.1.19');
+  assert.equal(tauri.version, '0.1.19');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.18"/m);
-  assert.match(lock, /"version": "0\.1\.18"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.18"/);
+  assert.match(cargo, /^version = "0\.1\.19"/m);
+  assert.match(lock, /"version": "0\.1\.19"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.19"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -2001,6 +2001,21 @@ test('user media is never permanently deleted and the confirm names files', () =
   );
   assert.equal(subst.recycleOk, false);
   assert.match(subst.body, /network share/);
+  const netUse = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4', driveType: C.DRIVE_REMOTE, deviceTarget: '\\Device\\LanmanRedirector\\;Z:0000000000012345\\localhost\\Users' }],
+    { inTauri: true }
+  );
+  assert.equal(netUse.recycleOk, false);
+  assert.match(netUse.body, /It's on a network drive/);
+  assert.doesNotMatch(netUse.body, /substitute/);
+  const substLocal = C.deleteConfirmModel(
+    [{ name: 'photo.jpg', path: 'X:\\photo.jpg', driveType: 1, deviceTarget: '\\??\\C:\\Photos' }],
+    { inTauri: true }
+  );
+  assert.equal(substLocal.recycleOk, false);
+  assert.match(substLocal.body, /made with subst/);
+  assert.doesNotMatch(substLocal.body, /not on a fixed drive/);
+  assert.match(substLocal.body, /Nothing was deleted/);
   const partial = C.deleteConfirmRefused(
     [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4' }],
     "Moved lake.jpg to the Recycle Bin. Couldn't move clip.mp4 to the Recycle Bin. It's on a network drive, which has no Recycle Bin.",
@@ -2226,7 +2241,7 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.equal(C.castFailureMessage('Living Room TV'), failed.message);
 });
 
-test('the Undock button stays in the code and is not shown in 0.1.18', () => {
+test('the Undock button stays in the code and is not shown in 0.1.19', () => {
   assert.equal(C.UNDOCK_MAIN_WINDOW, false);
   assert.equal(C.undockControlShown(false), false);
   assert.equal(C.undockControlShown(true), true);
@@ -2243,5 +2258,24 @@ test('the Undock button stays in the code and is not shown in 0.1.18', () => {
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
   const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
   assert.match(open, /undock_blocked_reason/);
-  assert.match(lib, /Undock is off in 0\.1\.18/);
+  assert.match(lib, /Undock is off in 0\.1\.19/);
+});
+
+test('emptying the playlist forgets the saved session so Continue is not offered', () => {
+  const store = new Map([['ssp_autosave', JSON.stringify({ items: [{ id: 'a', name: 'gone.jpg' }] })], ['ssp_default_dur', '5000']]);
+  const storage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k)
+  };
+  assert.equal(C.forgetEmptiedSession(storage, 1), false);
+  assert.ok(store.has('ssp_autosave'));
+  assert.equal(C.forgetEmptiedSession(storage, 0), true);
+  assert.equal(storage.getItem('ssp_autosave'), null);
+  assert.equal(storage.getItem('ssp_default_dur'), '5000');
+  // The close-time save that follows must not write the empty session back.
+  C.saveBeforeExitThenAck(storage, 5000, { items: [] }, null, { loaded: false, dirty: false });
+  assert.equal(storage.getItem('ssp_autosave'), null);
+  const broken = { removeItem: () => { throw new Error('denied'); } };
+  assert.equal(C.forgetEmptiedSession(broken, 0), false);
 });
