@@ -814,6 +814,33 @@ body.ssp-playlist-window #dock-toggle-btn {
 #kbclose:hover{background:rgba(255,255,255,.18);}
 </style>
 <style>
+/* 0.2.0 soundtrack (local files only). Main window owns the queue. */
+#bmusic{gap:5px;padding:6px 8px;font-size:12px;font-family:var(--font-main);max-width:180px;}
+#bmusic span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#bmusic.music-live{border-color:rgba(159,208,255,.6);color:#cfe7ff;}
+body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none;}
+#musicPane{display:none;position:fixed;right:16px;bottom:64px;z-index:9998;width:360px;max-width:calc(100vw - 32px);max-height:min(70vh,520px);flex-direction:column;gap:8px;background:rgba(10,10,10,.94);border:1px solid rgba(255,255,255,.12);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5);padding:12px;color:rgba(255,255,255,.85);font:13px/1.4 var(--font-main),system-ui,sans-serif;}
+#musicPane.open{display:flex;}
+#musicPane .mrow{display:flex;align-items:center;gap:6px;}
+#musicPane .msp{flex:1;}
+#musicPane h3{margin:0;font-size:13px;font-weight:700;color:#fff;}
+#musicPane button{font:inherit;font-size:12px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;height:28px;padding:0 9px;cursor:pointer;}
+#musicPane button:hover{background:rgba(255,255,255,.08);}
+#musicPane button.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff;}
+#musicPane button:focus-visible{outline:2px solid #fff;outline-offset:1px;}
+#musicNow{font-size:12px;color:rgba(255,255,255,.6);min-height:17px;}
+#musicList{display:flex;flex-direction:column;gap:2px;overflow-y:auto;min-height:0;flex:1;}
+#musicList .mtrack{display:grid;grid-template-columns:18px 1fr 26px;gap:8px;align-items:center;padding:5px 8px;border-radius:7px;border:1px solid transparent;cursor:pointer;}
+#musicList .mtrack:hover{background:rgba(255,255,255,.05);}
+#musicList .mtrack.now{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.4);}
+#musicList .mtrack.bad .mname{color:#ffc2c2;}
+#musicList .mtrack .mnum{font-size:11px;color:rgba(255,255,255,.6);}
+#musicList .mtrack .mname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+#musicList .mtrack button{width:26px;padding:0;height:24px;}
+#musicEmpty{font-size:12px;color:rgba(255,255,255,.6);padding:8px 2px;}
+#musicEmpty b{color:#fff;display:block;margin-bottom:2px;}
+#musicVol{flex:1;accent-color:#fff;}
+#fimusic{display:none;}
 #castPanel{display:none;position:fixed;right:16px;bottom:16px;z-index:9999;width:320px;max-width:calc(100vw - 32px);background:#1a2230;border:1px solid rgba(90,180,255,.35);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.45);padding:14px 14px 12px;color:#e8eef7;font:13px/1.4 system-ui,sans-serif;}
 #castPanel.open{display:block;}
 #castPanel h3{margin:0 0 8px;font-size:14px;font-weight:600;color:#9fd0ff;}
@@ -964,6 +991,10 @@ body.ssp-playlist-window #dock-toggle-btn {
         <button class="cb" id="bked" title="Keyboard shortcuts">
           <svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/></svg>
         </button>
+        <button class="cb" id="bmusic" type="button" title="Music: add songs from this PC" aria-expanded="false" aria-controls="musicPane">
+          <svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          <span>Music</span>
+        </button>
         <button class="cb" id="bcast" type="button" title="Cast the slideshow to a Google TV on this Wi-Fi">
           <svg viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 015.9 20M2 12.05A9 9 0 019.95 20M2 8V6a2 2 0 012-2h16a2 2 0 012 2v12a2 2 0 01-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
           Cast…
@@ -1085,6 +1116,7 @@ body.ssp-playlist-window #dock-toggle-btn {
         <button id="plnewfolder" title="New Folder">&#128193;</button>
         <button id="plsave" title="Save playlist as…">&#128190;</button>
         <button id="plload" title="Load playlist">&#128194;</button>
+        <button id="musicTab" title="Music: songs that play under the slideshow">Music</button>
         <button id="pllocate" title="Locate folder for missing items" hidden>Locate folder…</button>
         <button id="plundock" title="Undock Media Manager">Undock</button>
         <button id="pldockback" title="Dock back to main window">Dock</button>
@@ -4218,6 +4250,7 @@ g('plshuffle').onclick = shufflePlaylist;
 
 g('bru').onclick = function() {
   sessionLoaded = false;
+  if (typeof window.sspSoundtrackSync === 'function') window.sspSoundtrackSync();
   sessionDirty = false;
   clearTimeout(tmr); clearInterval(ptmr);
   if (kbId) { cancelAnimationFrame(kbId); kbId = null; }
@@ -5988,6 +6021,7 @@ function updPlayBtn() {
   g('ipl').innerHTML = playing
     ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>'
     : '<polygon points="5 3 19 12 5 21 5 3"/>';
+  if (typeof window.sspSoundtrackSync === 'function') window.sspSoundtrackSync();
 }
 function togglePlay() {
   playing = !playing; updPlayBtn();
@@ -8182,6 +8216,251 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   setInterval(watchNetwork, 2000);
   setInterval(poll, 400);
   watchNetwork();
+})();
+</script>
+<div id="musicPane" role="dialog" aria-label="Music">
+  <div class="mrow">
+    <h3>Music</h3>
+    <span class="msp"></span>
+    <button type="button" id="musicAdd" title="Add songs from this PC">+ Songs</button>
+    <button type="button" id="musicClear" title="Remove all songs">Clear</button>
+    <button type="button" id="musicClose" title="Close (Esc)" aria-label="Close">&#x2715;</button>
+  </div>
+  <div id="musicNow" aria-live="polite"></div>
+  <div class="mrow">
+    <button type="button" id="musicPrev" title="Previous song" aria-label="Previous song">&#x2039;</button>
+    <button type="button" id="musicPlay" title="Music on or off. Music plays while the slideshow plays.">Music on</button>
+    <button type="button" id="musicNext" title="Next song" aria-label="Next song">&#x203A;</button>
+    <button type="button" id="musicRepeat" title="Repeat">Repeat all</button>
+    <input type="range" id="musicVol" min="0" max="1" step="0.05" value="0.8" title="Music volume" aria-label="Music volume">
+  </div>
+  <div id="musicList" role="listbox" aria-label="Music playlist"></div>
+  <div id="musicEmpty"><b>No music yet</b>Add songs to play under your slideshow. Local files only. SlideX never uploads anything or uses streaming services.</div>
+  <input type="file" id="fimusic" multiple accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus">
+  <audio id="musicAudio" preload="auto"></audio>
+</div>
+<script>
+/* 0.2.0 MVP 1/4: local-file soundtrack. One audio element in the main window plays the
+   queue while the slideshow plays. The queue model lives in SlideXCore so beat sync,
+   export and the 0.3.0 karaoke queue can reuse it. No streaming services. */
+(function initSoundtrack() {
+  var C = window.SlideXCore;
+  var audio = document.getElementById('musicAudio');
+  var pane = document.getElementById('musicPane');
+  var btn = document.getElementById('bmusic');
+  if (!C || !audio || !pane || !btn) return;
+  var isMain = !(typeof SSP_IS_PLAYLIST_WINDOW !== 'undefined' && SSP_IS_PLAYLIST_WINDOW);
+  var LS_KEY = 'sspSoundtrackV1';
+  var q = C.createAudioQueue();
+  try {
+    var saved = sspIsTauri() ? localStorage.getItem(LS_KEY) : null;
+    if (saved) q = C.parseAudioQueue(saved);
+  } catch (_) {}
+  var loadedIdx = -1;
+  var bad = Object.create(null);
+  var lastNowText = '';
+
+  function el(id) { return document.getElementById(id); }
+  function save() {
+    if (!sspIsTauri()) return;
+    try { localStorage.setItem(LS_KEY, C.serializeAudioQueue(q)); } catch (_) {}
+  }
+  function toast(msg) { try { showToast(msg, 4000); } catch (_) {} }
+  function srcFor(t) {
+    if (t.url) return t.url;
+    var core = window.__TAURI__ && window.__TAURI__.core;
+    if (core && typeof core.convertFileSrc === 'function') return core.convertFileSrc(t.path);
+    return null;
+  }
+  function loadTrack(i) {
+    var t = q.tracks[i];
+    loadedIdx = -1;
+    if (!t) { audio.removeAttribute('src'); try { audio.load(); } catch (_) {} return false; }
+    var src = srcFor(t);
+    if (!src) return false;
+    audio.src = src;
+    loadedIdx = i;
+    return true;
+  }
+  function shouldPlay() {
+    return C.soundtrackShouldPlay({
+      slideshowPlaying: typeof playing !== 'undefined' && !!playing,
+      on: q.on,
+      hasTrack: q.index >= 0 && q.index < q.tracks.length,
+      mainWindow: isMain,
+      sessionLoaded: typeof sessionLoaded !== 'undefined' && !!sessionLoaded
+    });
+  }
+  function sync() {
+    audio.volume = q.volume;
+    if (shouldPlay()) {
+      if (loadedIdx !== q.index && !loadTrack(q.index)) { render(); return; }
+      if (audio.paused) {
+        var p = audio.play();
+        if (p && typeof p.catch === 'function') p.catch(function (e) {
+          if (e && e.name === 'AbortError') return;
+          console.warn('[music] play failed', e);
+        });
+      }
+    } else if (!audio.paused) {
+      audio.pause();
+    }
+    render();
+  }
+  window.sspSoundtrackSync = sync;
+
+  function setQueue(next) { q = next; save(); sync(); }
+  function go(index, restart) {
+    if (index === q.index && restart) { try { audio.currentTime = 0; } catch (_) {} }
+    if (index !== q.index) loadedIdx = -1;
+    setQueue(Object.assign({}, q, { index: index }));
+  }
+  function step(dir, auto) {
+    var r = C.queueStep(q, dir, auto);
+    if (r.index < 0) return;
+    if (r.stop) { loadedIdx = -1; setQueue(Object.assign({}, q, { index: r.index, on: false })); return; }
+    go(r.index, true);
+  }
+
+  audio.addEventListener('ended', function () { step(1, true); });
+  audio.addEventListener('error', function () {
+    var t = q.tracks[loadedIdx];
+    if (!t || !audio.getAttribute('src')) return;
+    bad[t.path] = true;
+    toast('Couldn\u2019t read ' + t.name + '. Skipping it.');
+    var allBad = q.tracks.every(function (x) { return bad[x.path]; });
+    if (allBad) { loadedIdx = -1; setQueue(Object.assign({}, q, { on: false })); return; }
+    step(1, false);
+  });
+  audio.addEventListener('playing', function () {
+    var t = q.tracks[loadedIdx];
+    if (t) delete bad[t.path];
+    render();
+  });
+  audio.addEventListener('pause', render);
+  audio.addEventListener('timeupdate', renderNow);
+  audio.addEventListener('loadedmetadata', renderNow);
+
+  function renderNow() {
+    var t = q.tracks[q.index];
+    var text;
+    if (!t) text = '';
+    else if (!q.on) text = 'Music is off \u00b7 ' + t.name;
+    else if (!shouldPlay()) text = 'Starts with the slideshow \u00b7 ' + t.name;
+    else text = t.name + ' \u00b7 ' + C.formatTrackTime(audio.currentTime) + ' / ' + C.formatTrackTime(audio.duration);
+    if (text !== lastNowText) { lastNowText = text; el('musicNow').textContent = text; }
+  }
+  function render() {
+    var t = q.tracks[q.index];
+    var live = !!t && !audio.paused;
+    btn.classList.toggle('music-live', live);
+    btn.querySelector('span').textContent = t ? t.name : 'Music';
+    btn.title = t ? ('Music: ' + t.name) : 'Music: add songs from this PC';
+    el('musicPlay').textContent = q.on ? 'Music on' : 'Music off';
+    el('musicPlay').classList.toggle('on', q.on);
+    el('musicRepeat').textContent = q.repeat === 'one' ? 'Repeat one' : (q.repeat === 'off' ? 'Repeat off' : 'Repeat all');
+    el('musicVol').value = String(q.volume);
+    el('musicEmpty').hidden = q.tracks.length > 0;
+    el('musicClear').disabled = !q.tracks.length;
+    var list = el('musicList');
+    list.textContent = '';
+    q.tracks.forEach(function (tr, i) {
+      var row = document.createElement('div');
+      row.className = 'mtrack' + (i === q.index ? ' now' : '') + (bad[tr.path] ? ' bad' : '');
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-selected', i === q.index ? 'true' : 'false');
+      row.title = tr.url ? tr.name : tr.path;
+      var num = document.createElement('span');
+      num.className = 'mnum';
+      num.textContent = i === q.index && live ? '\u25B6' : String(i + 1);
+      var name = document.createElement('span');
+      name.className = 'mname';
+      name.textContent = tr.name;
+      var rm = document.createElement('button');
+      rm.type = 'button';
+      rm.title = 'Remove from music (the file is not deleted)';
+      rm.setAttribute('aria-label', 'Remove ' + tr.name);
+      rm.textContent = '\u2715';
+      rm.onclick = function (e) { e.stopPropagation(); removeAt(i); };
+      row.appendChild(num); row.appendChild(name); row.appendChild(rm);
+      row.onclick = function () { go(i, true); if (!q.on) setQueue(Object.assign({}, q, { on: true })); };
+      list.appendChild(row);
+    });
+    renderNow();
+  }
+
+  function removeAt(i) {
+    var t = q.tracks[i];
+    if (!t) return;
+    if (t.url) { try { URL.revokeObjectURL(t.url); } catch (_) {} }
+    delete bad[t.path];
+    if (i === loadedIdx || i < loadedIdx) { audio.pause(); loadedIdx = -1; }
+    var next = C.queueRemoveAt(q, i);
+    if (!next.tracks.length) loadTrack(-1);
+    setQueue(next);
+  }
+  function addEntries(entries) {
+    var r = C.queueAddTracks(q, entries);
+    if (r.skipped.length) toast(r.skipped.length + ' file(s) can\u2019t be used: ' + r.skipped.slice(0, 3).join(', '));
+    setQueue(r.queue);
+  }
+  async function addSongs() {
+    if (sspIsTauri()) {
+      try {
+        var picked = await tauriDialogOpen({
+          multiple: true, directory: false, title: 'Add music',
+          filters: [{ name: 'Music', extensions: C.AUDIO_EXTS.slice() }]
+        });
+        if (!picked) return;
+        addEntries(Array.isArray(picked) ? picked : [picked]);
+      } catch (e) {
+        console.warn('[music] add failed', e);
+        toast('Could not open the file picker.');
+      }
+      return;
+    }
+    el('fimusic').click();
+  }
+  el('fimusic').onchange = function () {
+    var files = Array.prototype.slice.call(this.files || []);
+    this.value = '';
+    addEntries(files.map(function (f) {
+      return { path: 'file:' + f.name + ':' + f.size, name: f.name, url: URL.createObjectURL(f) };
+    }));
+  };
+
+  function openPane(open) {
+    var want = open === undefined ? !pane.classList.contains('open') : !!open;
+    pane.classList.toggle('open', want);
+    btn.setAttribute('aria-expanded', want ? 'true' : 'false');
+    if (want) render();
+  }
+  function blurAfter(fn) { return function (e) { fn(e); if (this && this.blur) this.blur(); }; }
+  btn.onclick = blurAfter(function () { openPane(); });
+  if (el('musicTab')) el('musicTab').onclick = blurAfter(function () { openPane(true); });
+  el('musicClose').onclick = function () { openPane(false); };
+  el('musicAdd').onclick = blurAfter(addSongs);
+  el('musicClear').onclick = blurAfter(function () {
+    q.tracks.forEach(function (t) { if (t.url) { try { URL.revokeObjectURL(t.url); } catch (_) {} } });
+    bad = Object.create(null);
+    audio.pause(); loadTrack(-1);
+    setQueue(Object.assign(C.createAudioQueue({ repeat: q.repeat, volume: q.volume }), {}));
+  });
+  el('musicPlay').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { on: !q.on })); });
+  el('musicPrev').onclick = blurAfter(function () { step(-1, false); });
+  el('musicNext').onclick = blurAfter(function () { step(1, false); });
+  el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });
+  el('musicVol').oninput = function () {
+    q = Object.assign({}, q, { volume: C.clampVolume(this.value) });
+    audio.volume = q.volume;
+    save();
+  };
+  pane.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { e.stopPropagation(); openPane(false); btn.focus(); }
+  });
+
+  if (!isMain) { btn.hidden = true; return; }
+  render();
 })();
 </script>
 
