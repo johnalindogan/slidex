@@ -2391,8 +2391,12 @@ test('beat analysis finds tempo, first beat and downbeat of a click track', () =
   for (const [bpm, off] of [[120, 0.25], [90, 0.1], [128, 0.4], [174, 0.05]]) {
     const r = C.analyzeBeats(clickTrack(bpm, off, 40), 22050);
     assert.equal(r.ok, true, `${bpm}`);
-    assert.ok(Math.abs(r.grid.bpm - bpm) < 0.5, `${bpm} got ${r.grid.bpm}`);
-    assert.ok(Math.abs(r.grid.offset - off) < 0.03, `${bpm} offset ${r.grid.offset}`);
+    const m = C.tempoMatch(r.grid.bpm, bpm, 0.5);
+    assert.ok(m > 0, `${bpm} got ${r.grid.bpm}`);
+    // The first beat lands on a true beat (half tempo keeps every other beat).
+    const truePeriod = 60 / bpm * (m === 2 ? 0.5 : 1);
+    const phase = ((r.grid.offset - off) % truePeriod + truePeriod) % truePeriod;
+    assert.ok(Math.min(phase, truePeriod - phase) < 0.03, `${bpm} offset ${r.grid.offset}`);
     assert.equal(r.grid.beatsPerBar, 4);
   }
   const shifted = C.analyzeBeats(clickTrack(120, 0.25, 40, { accentBeat: 2 }), 22050);
@@ -2449,8 +2453,8 @@ test('beat sync is wired into the slide timer, off by default, PC only', () => {
   assert.match(sched, /const ms = slideMs\(cur\);/);
   assert.match(html, /var beatMode = 'off';/);
   assert.match(html, /id="musicBeat"/);
-  const snap = html.slice(html.indexOf('window.sspBeatSnapMs = function'), html.indexOf('function maybeAnalyze'));
-  assert.match(snap, /beatMode === 'off' \|\| audio\.paused \|\| window\.__sspCastActive\) return ms/);
+  const snap = html.slice(html.indexOf('window.sspBeatSnapMs = function'), html.indexOf('window.sspBeatSnapMs = function') + 400);
+  assert.match(snap, /return C\.beatSnapDelay\(\{\s*mode: beatMode, audioPaused: audio\.paused, casting: !!window\.__sspCastActive,\s*grid: currentGrid\(\), now: audio\.currentTime, targetMs: ms\s*\}\)/);
   assert.match(html, /new Offline\(1, 1, 22050\)/);
 });
 
@@ -2472,4 +2476,140 @@ test('progress bar and Ken Burns use the same beat-snapped slide length as the t
   assert.doesNotMatch(sched, /getEDur|sspBeatSnapMs/);
   // Only the timer, Ken Burns and the progress bar ask for the slide length; cast keeps getEDur.
   assert.equal((html.match(/window\.sspBeatSnapMs\(/g) || []).length, 1);
+});
+
+test('tempo half or double counts as a match', () => {
+  assert.equal(C.tempoMatch(120.2, 120, 0.5), 1);
+  assert.equal(C.tempoMatch(60.1, 120, 0.5), 0.5);
+  assert.equal(C.tempoMatch(240.5, 120, 0.5), 2);
+  assert.equal(C.tempoMatch(100, 120, 0.5), 0);
+  assert.equal(C.tempoMatch(0, 120), 0);
+});
+
+test('5-minute synced song: no drift, every change within 50 ms of a beat', () => {
+  const bpm = 123.4, off = 0.37, secs = 300;
+  const r = C.analyzeBeats(clickTrack(bpm, off, secs), 22050);
+  assert.equal(r.ok, true);
+  const m = C.tempoMatch(r.grid.bpm, bpm, 0.5);
+  assert.ok(m > 0, `tempo ${r.grid.bpm}`);
+  const truePeriod = 60 / bpm * (m === 2 ? 0.5 : 1);
+  const errToBeat = (t) => { const ph = ((t - off) % truePeriod + truePeriod) % truePeriod; return Math.min(ph, truePeriod - ph); };
+  for (const unit of ['beat', 'bar']) {
+    for (const slide of [2000, 4000, 7000]) {
+      let now = 0.6, seed = 3, changes = 0, worst = 0;
+      while (true) {
+        const ms = C.beatSnapDelay({ mode: unit, audioPaused: false, casting: false, grid: r.grid, now, targetMs: slide });
+        if (now + ms / 1000 > secs - 1) break;
+        assert.ok(ms >= slide * 0.5 && ms <= slide * 1.5 + r.grid.period * 4000, `${unit} ${slide}: ${ms}`);
+        seed = (seed * 16807) % 2147483647;
+        const late = (seed % 16) / 1000; // setTimeout fires 0–15 ms late
+        now += ms / 1000 + late;
+        worst = Math.max(worst, errToBeat(now));
+        changes++;
+      }
+      assert.ok(changes > secs * 1000 / (slide * 1.6), `${unit} ${slide}: ${changes} changes`);
+      assert.ok(worst < 0.05, `${unit} ${slide}: worst ${Math.round(worst * 1000)} ms`);
+    }
+  }
+});
+
+test('beat sync off gives exactly the #46 slide times, and fallbacks never skip or double a slide', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const memo = html.slice(html.indexOf('let slideMsMemo = null;'), html.indexOf('/* ── Zoom / Pan ── */'));
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0.1, duration: 300 });
+  const state = { mode: 'off', audioPaused: false, casting: false, grid, now: 10 };
+  const timers = [], visits = [];
+  const sandbox = {
+    SlideXCore: C, cur: 0, playing: true, tmr: null, reversePlay: false,
+    items: Array.from({ length: 6 }, (_, i) => ({ name: `p${i}.jpg` })),
+    getMediaItems() { return sandbox.items; },
+    isV() { return false; },
+    nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
+    getEDur(i) { return 3000 + 500 * ((i ?? sandbox.cur) % 3); },
+    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout() {},
+    goTo(i, source) { visits.push(i); sandbox.cur = i; },
+    Promise,
+    window: {},
+  };
+  sandbox.window.SlideXCore = C;
+  vm.runInNewContext(memo + '\n' + sched, sandbox);
+  // #46 had no snap hook at all; "off" with the hook must match it.
+  sandbox.schedNext();
+  const noHook = timers[0].ms;
+  sandbox.window.sspBeatSnapMs = (ms) => C.beatSnapDelay({ ...state, targetMs: ms });
+  timers.length = 0;
+  sandbox.schedNext();
+  assert.equal(timers[0].ms, noHook);
+  assert.equal(timers[0].ms, sandbox.getEDur(0));
+  // Walk a show through on → paused → on → casting → unclear (no grid) → on.
+  const plan = [
+    ['beat', {}], ['off', {}], ['bar', {}], ['beat', { audioPaused: true }], ['beat', {}],
+    ['bar', { casting: true }], ['beat', { grid: null }], ['bar', {}], ['off', {}], ['beat', {}],
+  ];
+  timers.length = 0; visits.length = 0;
+  sandbox.cur = 0;
+  let expected = 0;
+  for (const [mode, extra] of plan) {
+    await new Promise((r) => setImmediate(r)); // each slide starts in its own timer task
+    Object.assign(state, { mode, audioPaused: false, casting: false, grid }, extra);
+    timers.length = 0;
+    sandbox.schedNext();
+    assert.equal(timers.length, 1, 'exactly one timer per slide');
+    const base = sandbox.getEDur(sandbox.cur);
+    const fallback = mode === 'off' || state.audioPaused || state.casting || !state.grid;
+    if (fallback) assert.equal(timers[0].ms, base, `${mode} ${JSON.stringify(extra)}`);
+    else assert.ok(timers[0].ms >= base * 0.5 && timers[0].ms <= base * 1.5 + 2000);
+    state.now += timers[0].ms / 1000;
+    const before = visits.length;
+    const fn = timers[0].fn;
+    timers.length = 0;
+    fn();
+    assert.equal(visits.length, before + 1, 'one slide change per timer');
+    expected = (expected + 1) % sandbox.items.length;
+    assert.equal(visits[visits.length - 1], expected, 'no skipped slide');
+    assert.equal(timers.length, 1, 'the next slide arms one timer');
+  }
+  // Songs over 12 minutes never get a grid, so they fall back like "tempo unclear".
+  assert.equal(C.BEAT_MAX_SECONDS, 720);
+  assert.equal(C.analyzeBeats(new Float32Array(1), 1 / 721).reason, 'too-long');
+  assert.match(html, /if \(ab\.duration > C\.BEAT_MAX_SECONDS\) \{ finish\(\{ state: 'unclear', reason: 'too-long' \}\); return; \}/);
+});
+
+test('beat analysis never starts from the slide path and runs one song ahead', () => {
+  // Window: free when paused; while playing only after the transition with time to spare.
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: false }), true);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: 300, remainingMs: 4000, workMs: 500 }), false);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: 1000, remainingMs: 4000, workMs: 500 }), true);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: 1000, remainingMs: 700, workMs: 500 }), false);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: NaN, remainingMs: 4000, workMs: 1 }), false);
+  assert.equal(C.analysisWorkMs(300), 950);
+  // Targets: current, then the next song; done songs are skipped.
+  const q = { ...C.queueAddTracks(C.createAudioQueue(), ['a.mp3', 'b.mp3', 'c.mp3']).queue, index: 2 };
+  assert.deepEqual([...C.beatAnalysisTargets(q, () => false)], ['c.mp3', 'a.mp3']);
+  assert.deepEqual([...C.beatAnalysisTargets({ ...q, repeat: 'off' }, () => false)], ['c.mp3', 'a.mp3']);
+  assert.deepEqual([...C.beatAnalysisTargets({ ...q, index: 0 }, (p) => p === 'a.mp3')], ['b.mp3']);
+  assert.deepEqual([...C.beatAnalysisTargets({ ...q, repeat: 'one', index: 1 }, () => false)], ['b.mp3', 'c.mp3']);
+  assert.equal(C.beatAnalysisTargets(C.createAudioQueue(), () => false).length, 0);
+  // Wiring.
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const between = (a, b) => html.slice(html.indexOf(a), html.indexOf(b, html.indexOf(a)));
+  for (const [name, body] of [
+    ['schedNext', between('function schedNext()', 'function goTo(')],
+    ['goTo', between('function goTo(', 'function updPlayBtn()')],
+    ['showSlide', between('function showSlide(', 'function startKB(i)')],
+    ['startKB/startProg', between('function startKB(i)', 'function startVProg(')],
+    ['updPlayBtn', between('function updPlayBtn()', 'function togglePlay()')],
+    ['soundtrack sync', between('  function sync() {', 'window.sspSoundtrackSync = sync;')],
+    ['snap hook', between('window.sspBeatSnapMs = function', '  };')],
+  ]) assert.doesNotMatch(body, /pumpAnalysis|analyzeBeats|decodeTrack/, name);
+  assert.equal((html.match(/C\.analyzeBeats\(/g) || []).length, 1);
+  const pump = between('function pumpAnalysis()', 'function currentGrid()');
+  assert.match(pump, /C\.beatAnalysisTargets\(q,/);
+  assert.match(pump, /whenSafe\(C\.analysisWorkMs\(ab\.duration\), function \(\) \{[\s\S]*C\.analyzeBeats\(/);
+  assert.match(between('function whenSafe(', 'function decodeTrack('), /if \(analysisWindow\(workMs\)\) \{ fn\(\); return; \}/);
+  assert.match(between('function addEntries(', 'async function addSongs('), /setQueue\(r\.queue\);\s*pumpAnalysis\(\);/);
+  assert.match(between("audio.addEventListener('playing'", "audio.addEventListener('pause'"), /pumpAnalysis\(\);/);
+  assert.match(between("el('musicBeat').onclick", "el('musicRepeat').onclick"), /pumpAnalysis\(\);/);
 });

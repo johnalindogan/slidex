@@ -8288,7 +8288,6 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   var beatMode = 'off';
   try { var bm = localStorage.getItem(BEAT_KEY); if (C.BEAT_SYNC_MODES.indexOf(bm) >= 0) beatMode = bm; } catch (_) {}
   var beats = Object.create(null); // track path -> { state: 'analyzing'|'ok'|'unclear'|'failed', grid }
-  var BEAT_MAX_SECONDS = 12 * 60;
 
   function el(id) { return document.getElementById(id); }
   function save() {
@@ -8322,7 +8321,6 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     });
   }
   function sync() {
-    maybeAnalyze();
     audio.volume = q.volume;
     if (shouldPlay()) {
       if (loadedIdx !== q.index && !loadTrack(q.index)) { render(); return; }
@@ -8340,18 +8338,36 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   }
   window.sspSoundtrackSync = sync;
 
-  /* Beat sync (off by default). Analysis runs once per song per session, in this webview:
-     decode at 22.05 kHz, mix to mono, then SlideXCore.analyzeBeats. Any failure leaves
-     slides on their normal timer. */
-  function analyzeTrack(t) {
-    if (!t || beats[t.path]) return;
+  /* Beat sync (off by default). Each song is analysed once per session, in this webview:
+     fetch + decode at 22.05 kHz (async, off the slide timer), then the CPU step
+     (mix to mono + SlideXCore.analyzeBeats) waits for a safe window: never during a slide
+     change and never with too little slide time left. Analysis starts when songs are added,
+     when a song starts (the current one and the next one, one ahead) and when beat sync is
+     turned on. Nothing on the slide path starts it. Any failure keeps the normal timer. */
+  var analysisBusy = false;
+  function analysisWindow(workMs) {
+    var show = typeof playing !== 'undefined' && !!playing && typeof sessionLoaded !== 'undefined' && !!sessionLoaded;
+    var since = Infinity, left = Infinity;
+    if (show) {
+      if (typeof isV === 'function' && isV(cur)) {
+        var v = typeof getSl === 'function' ? getSl(cur)?.querySelector('video') : null;
+        left = v && Number.isFinite(v.duration) ? (v.duration - v.currentTime) * 1000 : 0;
+      } else {
+        since = typeof ps === 'number' ? Date.now() - ps : 0;
+        left = (typeof slideMs === 'function' ? slideMs(cur) : 0) - since;
+      }
+    }
+    return C.analysisWindowOk({ slideshowPlaying: show, sinceSlideStartMs: since, remainingMs: left, workMs: workMs });
+  }
+  function whenSafe(workMs, fn) {
+    if (analysisWindow(workMs)) { fn(); return; }
+    setTimeout(function () { whenSafe(workMs, fn); }, 150);
+  }
+  function decodeTrack(t) {
     var src = srcFor(t);
     var Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    if (!src || !Offline || typeof fetch !== 'function') { beats[t.path] = { state: 'failed' }; render(); return; }
-    beats[t.path] = { state: 'analyzing' };
-    render();
-    var path = t.path;
-    fetch(src).then(function (r) {
+    if (!src || !Offline || typeof fetch !== 'function') return Promise.reject(new Error('no decoder'));
+    return fetch(src).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.arrayBuffer();
     }).then(function (buf) {
@@ -8360,21 +8376,33 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
         var p = ctx.decodeAudioData(buf, resolve, reject);
         if (p && typeof p.then === 'function') p.then(resolve, reject);
       });
-    }).then(function (ab) {
-      if (ab.duration > BEAT_MAX_SECONDS) return { ok: false, reason: 'too-long' };
-      var chans = [];
-      for (var c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
-      return new Promise(function (resolve) {
-        setTimeout(function () { resolve(C.analyzeBeats(C.mixToMono(chans), ab.sampleRate)); }, 0);
-      });
-    }).then(function (res) {
-      if (!beats[path]) return; // removed meanwhile
-      beats[path] = res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason };
+    });
+  }
+  function pumpAnalysis() {
+    if (beatMode === 'off' || analysisBusy) return;
+    var path = C.beatAnalysisTargets(q, function (p) { return !!beats[p]; })[0];
+    var t = path && q.tracks.find(function (x) { return x.path === path; });
+    if (!t) return;
+    analysisBusy = true;
+    beats[path] = { state: 'analyzing' };
+    render();
+    function finish(result) {
+      analysisBusy = false;
+      if (beats[path]) beats[path] = result; // removed meanwhile → dropped
       render();
+      pumpAnalysis();
+    }
+    decodeTrack(t).then(function (ab) {
+      if (ab.duration > C.BEAT_MAX_SECONDS) { finish({ state: 'unclear', reason: 'too-long' }); return; }
+      whenSafe(C.analysisWorkMs(ab.duration), function () {
+        var chans = [];
+        for (var c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
+        var res = C.analyzeBeats(C.mixToMono(chans), ab.sampleRate);
+        finish(res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason });
+      });
     }).catch(function (e) {
       console.warn('[music] beat analysis failed', e);
-      if (beats[path]) beats[path] = { state: 'failed' };
-      render();
+      finish({ state: 'failed' });
     });
   }
   function currentGrid() {
@@ -8382,18 +8410,13 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var b = t && beats[t.path];
     return b && b.state === 'ok' ? b.grid : null;
   }
-  /** schedNext() asks for the slide delay. Beat sync covers this PC only; while casting the TV keeps fixed timing. */
+  /** slideMs() asks for the slide delay. Beat sync covers this PC only; while casting the TV keeps fixed timing. */
   window.sspBeatSnapMs = function (ms) {
-    if (beatMode === 'off' || audio.paused || window.__sspCastActive) return ms;
-    var grid = currentGrid();
-    if (!grid) return ms;
-    return C.beatSyncDelayMs({ grid: grid, now: audio.currentTime, targetMs: ms, unit: beatMode });
+    return C.beatSnapDelay({
+      mode: beatMode, audioPaused: audio.paused, casting: !!window.__sspCastActive,
+      grid: currentGrid(), now: audio.currentTime, targetMs: ms
+    });
   };
-  function maybeAnalyze() {
-    if (beatMode === 'off') return;
-    var t = q.tracks[q.index];
-    if (t && !beats[t.path]) analyzeTrack(t);
-  }
 
   function setQueue(next) { q = next; save(); sync(); }
   function go(index, restart) {
@@ -8419,6 +8442,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     step(1, false);
   });
   audio.addEventListener('playing', function () {
+    pumpAnalysis(); // song started: make sure it and the next one are analysed
     var t = q.tracks[loadedIdx];
     if (t) delete bad[t.path];
     render();
@@ -8501,6 +8525,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var r = C.queueAddTracks(q, entries);
     if (r.skipped.length) toast(r.skipped.length + ' file(s) can\u2019t be used: ' + r.skipped.slice(0, 3).join(', '));
     setQueue(r.queue);
+    pumpAnalysis();
   }
   async function addSongs() {
     if (sspIsTauri()) {
@@ -8551,6 +8576,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     beatMode = C.nextBeatSyncMode(beatMode);
     try { localStorage.setItem(BEAT_KEY, beatMode); } catch (_) {}
     sync();
+    pumpAnalysis();
   });
   el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });
   el('musicVol').oninput = function () {

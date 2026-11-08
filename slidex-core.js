@@ -2198,6 +2198,7 @@
     if (!samples || !(sampleRate > 0)) return { ok: false, reason: 'no-audio' };
     var duration = samples.length / sampleRate;
     if (duration < 8) return { ok: false, reason: 'too-short' };
+    if (duration > (o.maxSeconds || BEAT_MAX_SECONDS)) return { ok: false, reason: 'too-long' };
     var env = onsetEnvelope(samples, sampleRate, hop);
     var frameRate = sampleRate / hop;
     var t = estimateTempo(env, frameRate, o);
@@ -2263,6 +2264,62 @@
     return Math.round((t - now) * 1000);
   }
 
+  var BEAT_MAX_SECONDS = 12 * 60;
+
+  /** 1 = same tempo, 0.5 / 2 = half / double (accepted as a match), 0 = no match. */
+  function tempoMatch(bpm, ref, tolBpm) {
+    var tol = tolBpm || 1;
+    if (!(bpm > 0) || !(ref > 0)) return 0;
+    if (Math.abs(bpm - ref) <= tol) return 1;
+    if (Math.abs(bpm - ref / 2) <= tol / 2) return 0.5;
+    if (Math.abs(bpm - ref * 2) <= tol * 2) return 2;
+    return 0;
+  }
+
+  /** The slide delay to use. Every fallback returns targetMs unchanged (the #46 timer). */
+  function beatSnapDelay(s) {
+    var targetMs = s && s.targetMs;
+    if (!s || s.mode !== 'beat' && s.mode !== 'bar') return targetMs;
+    if (s.audioPaused || s.casting || !s.grid) return targetMs;
+    return beatSyncDelayMs({ grid: s.grid, now: s.now, targetMs: targetMs, unit: s.mode });
+  }
+
+  /** Rough main-thread cost of analyzeBeats for a song (measured ~2 ms per second of audio). */
+  function analysisWorkMs(durationSec) {
+    var d = Number(durationSec);
+    return Math.ceil((Number.isFinite(d) && d > 0 ? d : BEAT_MAX_SECONDS) * 3) + 50;
+  }
+
+  /** Heavy analysis runs only when it can't touch a slide change: slideshow not playing, or
+      after the transition has finished with enough slide time left for the work plus a margin. */
+  function analysisWindowOk(s) {
+    if (!s || !s.slideshowPlaying) return true;
+    var transition = s.transitionMs == null ? 900 : s.transitionMs;
+    var margin = s.marginMs == null ? 300 : s.marginMs;
+    var since = Number(s.sinceSlideStartMs), left = Number(s.remainingMs);
+    if (!Number.isFinite(since) || !Number.isFinite(left)) return false;
+    return since >= transition && left >= Number(s.workMs) + margin;
+  }
+
+  /** Songs to analyse, in order: the current one, then the one that plays next (one ahead).
+      done(path) says whether a song already has a result (or is in progress). */
+  function beatAnalysisTargets(q, done) {
+    var out = [];
+    if (!q || !q.tracks || !q.tracks.length) return out;
+    var cur = q.index < 0 ? 0 : q.index;
+    var idx = [cur];
+    if (q.tracks.length > 1) {
+      var nx = queueStep(q, 1, true);
+      var next = (nx.stop || nx.index === cur) ? (cur + 1) % q.tracks.length : nx.index;
+      if (next !== cur) idx.push(next);
+    }
+    idx.forEach(function (i) {
+      var t = q.tracks[i];
+      if (t && !(done && done(t.path))) out.push(t.path);
+    });
+    return out;
+  }
+
   function nextBeatSyncMode(mode) {
     var i = BEAT_SYNC_MODES.indexOf(mode);
     return BEAT_SYNC_MODES[(i + 1) % BEAT_SYNC_MODES.length];
@@ -2294,6 +2351,12 @@
     beatSyncDelayMs: beatSyncDelayMs,
     nextBeatSyncMode: nextBeatSyncMode,
     mixToMono: mixToMono,
+    BEAT_MAX_SECONDS: BEAT_MAX_SECONDS,
+    tempoMatch: tempoMatch,
+    beatSnapDelay: beatSnapDelay,
+    analysisWorkMs: analysisWorkMs,
+    analysisWindowOk: analysisWindowOk,
+    beatAnalysisTargets: beatAnalysisTargets,
     AUDIO_EXTS: AUDIO_EXTS,
     audioMimeForPath: audioMimeForPath,
     isAudioPath: isAudioPath,
