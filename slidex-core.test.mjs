@@ -587,6 +587,7 @@ test('the cast timer skips unsupported files without another photo wait', () => 
     isV() { return false; },
     nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
     getEDur() { return 10000; },
+    slideMs() { return sandbox.getEDur(); },
     setTimeout(fn, ms) { const id = seq++; timers.push({ id, fn, ms }); return id; },
     clearTimeout() {},
     goTo(i, source) { visits.push({ i, source }); sandbox.cur = i; },
@@ -2445,10 +2446,30 @@ test('beat sync keeps slide times near the setting and falls back off the grid',
 test('beat sync is wired into the slide timer, off by default, PC only', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
-  assert.match(sched, /ms = window\.sspBeatSnapMs\(ms\)/);
+  assert.match(sched, /const ms = slideMs\(cur\);/);
   assert.match(html, /var beatMode = 'off';/);
   assert.match(html, /id="musicBeat"/);
   const snap = html.slice(html.indexOf('window.sspBeatSnapMs = function'), html.indexOf('function maybeAnalyze'));
   assert.match(snap, /beatMode === 'off' \|\| audio\.paused \|\| window\.__sspCastActive\) return ms/);
   assert.match(html, /new Offline\(1, 1, 22050\)/);
+});
+
+test('progress bar and Ken Burns use the same beat-snapped slide length as the timer', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const fn = html.slice(html.indexOf('function slideMs(i)'), html.indexOf('/* ── Zoom / Pan ── */'));
+  assert.match(fn, /if \(idx !== cur \|\| typeof window\.sspBeatSnapMs !== 'function'\) return base;/);
+  assert.match(fn, /const ms = window\.sspBeatSnapMs\(base\);/);
+  assert.match(fn, /Promise\.resolve\(\)\.then\(\(\) => \{ slideMsMemo = null; \}\)/);
+  const prog = html.slice(html.indexOf('function startProg()'), html.indexOf('function startVProg('));
+  assert.match(prog, /const dur = slideMs\(cur\);/);
+  assert.doesNotMatch(prog, /getEDur/);
+  const kb = html.slice(html.indexOf('function startKB(i)'), html.indexOf('function startProg()'));
+  assert.ok((kb.match(/const dur = slideMs\(i\);/g) || []).length >= 2);
+  assert.doesNotMatch(kb, /getEDur/);
+  const comp = html.slice(html.indexOf('function startCompKB(i)'), html.indexOf('function startCompKB(i)') + 600);
+  assert.match(comp, /const dur = slideMs\(i\);/);
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.doesNotMatch(sched, /getEDur|sspBeatSnapMs/);
+  // Only the timer, Ken Burns and the progress bar ask for the slide length; cast keeps getEDur.
+  assert.equal((html.match(/window\.sspBeatSnapMs\(/g) || []).length, 1);
 });

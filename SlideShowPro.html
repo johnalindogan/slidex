@@ -3264,6 +3264,20 @@ const getItemDur = i => {
   return (item && item.customDur) || getDur();
 };
 const getEDur = i => getItemDur(i != null ? i : cur) / getSpd();
+/* The current slide's real length: the beat-snapped delay when beat sync applies, else getEDur.
+   Ken Burns, the progress bar and schedNext() run in the same task when a slide starts, so the
+   value is computed once and shared until the task ends; they all end on the same beat. */
+let slideMsMemo = null;
+function slideMs(i) {
+  const idx = i != null ? i : cur;
+  const base = getEDur(idx);
+  if (idx !== cur || typeof window.sspBeatSnapMs !== 'function') return base;
+  if (slideMsMemo && slideMsMemo.i === idx && slideMsMemo.base === base) return slideMsMemo.ms;
+  const ms = window.sspBeatSnapMs(base);
+  slideMsMemo = { i: idx, base, ms };
+  Promise.resolve().then(() => { slideMsMemo = null; });
+  return ms;
+}
 
 /* ── Zoom / Pan ── */
 function updZoom() { g('zlb').textContent = Math.round(zoom * 100) + '%'; }
@@ -3699,7 +3713,7 @@ function startCompKB(i) {
   const mc2 = g('maxcomp2'), med2 = mc2?.querySelector('img');
   const p = getKBPreset(i);
   if (!p) { updCompT(); return; }
-  const dur = getEDur(i); let st = null;
+  const dur = slideMs(i); let st = null;
   function step(ts) {
     if (!st) st = ts;
     const t = Math.min((ts - st) / dur, 1), ev = kbEase(t);
@@ -5777,7 +5791,7 @@ function startKB(i) {
       return;
     }
     if (!p) { writeMax(Math.max(1, zoom).toFixed(4), panX.toFixed(1), panY.toFixed(1)); return; }
-    const dur = getEDur(i); let st = null;
+    const dur = slideMs(i); let st = null;
     function stepMax(ts) {
       if (!st) st = ts;
       const t = Math.min((ts - st) / dur, 1), ev = kbEase(t);
@@ -5794,7 +5808,7 @@ function startKB(i) {
   const ends = SlideXCore.wholeImageEndpoints(
     { fs: p.fs, ts: p.ts, fx: p.fx, fy: p.fy, tx: p.tx, ty: p.ty }, 1, 1
   );
-  const dur = getEDur(i); let st = null;
+  const dur = slideMs(i); let st = null;
   const box = layoutFrame(sl, item);
   function step(ts) {
     if (!st) st = ts;
@@ -5814,7 +5828,7 @@ function startKB(i) {
 function startProg() {
   clearInterval(ptmr); ps = Date.now(); g('pb').style.width = '0%';
   setSeekBarMode(false);
-  const dur = getEDur();
+  const dur = slideMs(cur);
   ptmr = setInterval(() => {
     const pct = Math.min(((Date.now()-ps)/dur)*100,100);
     g('pb').style.width = pct.toFixed(1) + '%';
@@ -5920,8 +5934,7 @@ function waitForVideoFrame(video) {
 
 function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
-  let ms = getEDur(cur);
-  if (typeof window.sspBeatSnapMs === 'function') ms = window.sspBeatSnapMs(ms);
+  const ms = slideMs(cur);
   tmr = setTimeout(() => {
     if (window.__sspCastActive && window.SlideXCore && typeof window.SlideXCore.nextIndexSkippingUnsupported === "function") {
       var skipTo = window.SlideXCore.nextIndexSkippingUnsupported(cur, getMediaItems(), {
