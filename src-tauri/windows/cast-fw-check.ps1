@@ -1,4 +1,7 @@
 # Unelevated Cast firewall check. Prints status=match, status=partial, or status=nomatch.
+# When the named rules do not match, a second line app_rule=allow says another
+# enabled rule (for example the one the Windows prompt creates) already lets
+# slideshowpro.exe in on Private networks. The installer only reads status=.
 # The exe path is a parameter so names like O'Brien are not quoted into the script text.
 param(
   [Parameter(Mandatory = $true)][string]$ExePath,
@@ -105,6 +108,56 @@ function Get-CastRecords([string]$MediaName, [string]$MdnsName, [string]$Fixture
   return $records
 }
 
+function Test-AnyPort([string]$Got, [string]$Want) {
+  $g = $Got -replace '\s', ''
+  if ($g -eq '' -or $g -eq 'Any' -or $g -eq '*') { return $true }
+  return ($g -eq ($Want -replace '\s', ''))
+}
+
+# Any enabled inbound rule for this exe on Private, whatever its name.
+# Returns 'allow' when TCP $Ports and UDP $Udp are both let in and no
+# Private block rule for the exe exists, otherwise ''.
+function Get-AppRuleState($Records, [string]$Ports, [string]$Udp, [string]$Exe) {
+  $want = (ConvertTo-ProbePath $Exe).ToLower()
+  $tcp = $false
+  $udpOk = $false
+  foreach ($rec in $Records) {
+    if ($null -eq $rec) { continue }
+    $enabled = ($rec.enabled -eq $true) -or ("$($rec.enabled)" -eq 'True')
+    if (-not $enabled) { continue }
+    $direction = [string]$rec.direction
+    if ($direction -ne 'Inbound' -and $direction -ne 'In') { continue }
+    $raw = [Environment]::ExpandEnvironmentVariables([string]$rec.program)
+    if ((ConvertTo-ProbePath $raw).ToLower() -ne $want) { continue }
+    if (-not (Test-PrivateProfile ([string]$rec.profile))) { continue }
+    $action = [string]$rec.action
+    if ($action -eq 'Block') { return '' }
+    if ($action -ne 'Allow') { continue }
+    $proto = [string]$rec.protocol
+    $any = ($proto -eq '' -or $proto -eq 'Any' -or $proto -eq '256')
+    if (($any -or $proto -eq 'TCP' -or $proto -eq '6') -and (Test-AnyPort ([string]$rec.localport) $Ports)) { $tcp = $true }
+    if (($any -or $proto -eq 'UDP' -or $proto -eq '17') -and (Test-AnyPort ([string]$rec.localport) $Udp)) { $udpOk = $true }
+  }
+  if ($tcp -and $udpOk) { return 'allow' }
+  return ''
+}
+
+function Get-AppRecords([string]$Exe, [string]$Fixture) {
+  if (-not [string]::IsNullOrWhiteSpace($Fixture)) {
+    return @((Get-Content -Raw -LiteralPath $Fixture | ConvertFrom-Json))
+  }
+  $want = (ConvertTo-ProbePath $Exe).ToLower()
+  $records = @()
+  foreach ($filter in @(Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue)) {
+    $raw = [Environment]::ExpandEnvironmentVariables([string]$filter.Program)
+    if ((ConvertTo-ProbePath $raw).ToLower() -ne $want) { continue }
+    foreach ($rule in @($filter | Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+      $records += ConvertTo-LiveRecord $rule ([string]$rule.DisplayName)
+    }
+  }
+  return $records
+}
+
 try {
   $records = @(Get-CastRecords $MediaName $MdnsName $Fixture)
   $mediaOk = $false
@@ -114,8 +167,16 @@ try {
     if (Test-CastRecord $rec $MdnsName 'UDP' $UdpPort $ExePath) { $mdnsOk = $true }
   }
   if ($mediaOk -and $mdnsOk) { Write-Output 'status=match' }
-  elseif ($mediaOk -or $mdnsOk) { Write-Output 'status=partial' }
-  else { Write-Output 'status=nomatch' }
+  else {
+    if ($mediaOk -or $mdnsOk) { Write-Output 'status=partial' }
+    else { Write-Output 'status=nomatch' }
+    try {
+      $app = Get-AppRuleState @(Get-AppRecords $ExePath $Fixture) $TcpPorts $UdpPort $ExePath
+      if ($app -eq 'allow') { Write-Output 'app_rule=allow' }
+    } catch {
+      # The named-rule status above stands on its own.
+    }
+  }
 } catch {
   Write-Output ("query failed: " + $_.Exception.Message)
   exit 1

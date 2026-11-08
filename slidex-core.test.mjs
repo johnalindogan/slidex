@@ -2001,6 +2001,21 @@ test('user media is never permanently deleted and the confirm names files', () =
   );
   assert.equal(subst.recycleOk, false);
   assert.match(subst.body, /network share/);
+  const netUse = C.deleteConfirmModel(
+    [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4', driveType: C.DRIVE_REMOTE, deviceTarget: '\\Device\\LanmanRedirector\\;Z:0000000000012345\\localhost\\Users' }],
+    { inTauri: true }
+  );
+  assert.equal(netUse.recycleOk, false);
+  assert.match(netUse.body, /It's on a network drive/);
+  assert.doesNotMatch(netUse.body, /substitute/);
+  const substLocal = C.deleteConfirmModel(
+    [{ name: 'photo.jpg', path: 'X:\\photo.jpg', driveType: 1, deviceTarget: '\\??\\C:\\Photos' }],
+    { inTauri: true }
+  );
+  assert.equal(substLocal.recycleOk, false);
+  assert.match(substLocal.body, /made with subst/);
+  assert.doesNotMatch(substLocal.body, /not on a fixed drive/);
+  assert.match(substLocal.body, /Nothing was deleted/);
   const partial = C.deleteConfirmRefused(
     [{ name: 'clip.mp4', path: 'Z:\\Media\\clip.mp4' }],
     "Moved lake.jpg to the Recycle Bin. Couldn't move clip.mp4 to the Recycle Bin. It's on a network drive, which has no Recycle Bin.",
@@ -2244,4 +2259,23 @@ test('the Undock button stays in the code and is not shown in 0.1.18', () => {
   const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
   assert.match(open, /undock_blocked_reason/);
   assert.match(lib, /Undock is off in 0\.1\.18/);
+});
+
+test('emptying the playlist forgets the saved session so Continue is not offered', () => {
+  const store = new Map([['ssp_autosave', JSON.stringify({ items: [{ id: 'a', name: 'gone.jpg' }] })], ['ssp_default_dur', '5000']]);
+  const storage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k)
+  };
+  assert.equal(C.forgetEmptiedSession(storage, 1), false);
+  assert.ok(store.has('ssp_autosave'));
+  assert.equal(C.forgetEmptiedSession(storage, 0), true);
+  assert.equal(storage.getItem('ssp_autosave'), null);
+  assert.equal(storage.getItem('ssp_default_dur'), '5000');
+  // The close-time save that follows must not write the empty session back.
+  C.saveBeforeExitThenAck(storage, 5000, { items: [] }, null, { loaded: false, dirty: false });
+  assert.equal(storage.getItem('ssp_autosave'), null);
+  const broken = { removeItem: () => { throw new Error('denied'); } };
+  assert.equal(C.forgetEmptiedSession(broken, 0), false);
 });

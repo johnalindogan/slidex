@@ -144,6 +144,11 @@ pub const LAUNCH_TIMEOUT_MESSAGE: &str =
 pub const MEDIA_FETCH_MESSAGE: &str =
     "The TV couldn't load the media from this PC. Check that the PC and TV are on the same network and that SlideX's Cast firewall rules are allowed.";
 
+/// TCP connect to the TV's :8009. A TV on the same LAN accepts in well under
+/// a second, so an address that does not answer is reported unreachable after
+/// this instead of the old 4 s.
+const CAST_TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
+
 /// PLAY, PAUSE, and SEEK. The UI's reply wait is longer, so a live TV is not
 /// reported unreachable while this wait is still running.
 const MEDIA_CMD_DEADLINE: Duration = Duration::from_secs(4);
@@ -3505,7 +3510,7 @@ impl CastLink {
     ) -> Result<Self, String> {
         cast_log("connect", &format!("{host}:{port}"));
         let addr = SocketAddr::from((host, port));
-        let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).map_err(|_| {
+        let mut tcp = TcpStream::connect_timeout(&addr, CAST_TCP_CONNECT_TIMEOUT).map_err(|_| {
             let reason = format!(
                 "TV unreachable at {host}. It may be off, or this PC and the TV are not on the same Wi-Fi."
             );
@@ -5225,10 +5230,20 @@ impl CastState {
             abandon_attempt(session);
             return Err(CAST_CANCELLED.to_string());
         }
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| "cast state lock".to_string())?;
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                abandon_attempt(session);
+                return Err("cast state lock".to_string());
+            }
+        };
+        // Final check under the lock: a Cancel that lands after the check above
+        // cannot see a session stored here.
+        if Self::attempt_cancelled(own_cancel) {
+            drop(guard);
+            abandon_attempt(session);
+            return Err(CAST_CANCELLED.to_string());
+        }
         *guard = Some(session);
         Ok(())
     }
@@ -6059,14 +6074,26 @@ fn query_firewall_text() -> String {
     }
 }
 
+/// Shown when SlideX's own rules are not there but another enabled rule (often
+/// the one the Windows "Allow access" prompt creates) already lets the app in on
+/// Private networks. Cast works, so this is not a warning.
+pub const FW_APP_RULE_DETAIL: &str =
+    "Windows already allows slideshowpro.exe on private networks, so Cast can reach this PC.";
+
 pub fn parse_firewall_script_output(text: &str) -> CastFirewallStatus {
     let lower = text.to_ascii_lowercase();
+    let app_allowed = lower.lines().any(|l| l.trim() == "app_rule=allow");
     if lower.contains("status=match") || lower.contains("status=present") {
         CastFirewallStatus {
             state: "added".into(),
             detail: format!(
                 "Private firewall rules are installed for slideshowpro.exe: TCP {CAST_PORT_LO}-{CAST_PORT_HI} and UDP 5353."
             ),
+        }
+    } else if app_allowed {
+        CastFirewallStatus {
+            state: "added".into(),
+            detail: FW_APP_RULE_DETAIL.into(),
         }
     } else if lower.contains("status=partial") {
         CastFirewallStatus {
@@ -8365,6 +8392,19 @@ mod tests {
         let joined = args.join(" ");
         assert!(!joined.contains("-Command"));
         assert!(joined.contains("-ExecutionPolicy Bypass -File"));
+        // A Windows-prompt rule for the exe is not a "missing rule" warning.
+        let app = parse_firewall_script_output("status=nomatch\r\napp_rule=allow\r\n");
+        assert_eq!(app.state, "added");
+        assert_eq!(app.detail, FW_APP_RULE_DETAIL);
+        assert!(!app.detail.contains("No Private inbound rule"));
+        assert_eq!(
+            parse_firewall_script_output("status=partial\napp_rule=allow").state,
+            "added"
+        );
+        assert_eq!(
+            parse_firewall_script_output("status=nomatch\napp_rule=").state,
+            "missing"
+        );
         assert_eq!(parse_firewall_script_output("status=match").state, "added");
         assert_eq!(parse_firewall_script_output("status=present").state, "added");
         assert!(
@@ -8635,6 +8675,96 @@ mod tests {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
             let _ = TcpStream::connect_timeout(&self.addr, Duration::from_millis(300));
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    /// A fake TV that accepts TCP and never answers TLS. Every accepted socket is
+    /// polled, so a second attempt is accepted too, and Drop stops the thread,
+    /// joins it, and closes every socket even when an assert fails first.
+    struct StallPeer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        accepted: Arc<AtomicUsize>,
+        closed_by_app: Arc<AtomicUsize>,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl StallPeer {
+        fn bind(ip: Ipv4Addr) -> Self {
+            let listener = TcpListener::bind((ip, 0)).expect("bind stalling peer");
+            listener.set_nonblocking(true).expect("non-blocking stall listener");
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let closed_by_app = Arc::new(AtomicUsize::new(0));
+            let (stop_t, accepted_t, closed_t) =
+                (Arc::clone(&stop), Arc::clone(&accepted), Arc::clone(&closed_by_app));
+            let join = thread::spawn(move || {
+                let mut socks: Vec<TcpStream> = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !stop_t.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((sock, _)) => {
+                            sock.set_nonblocking(true).ok();
+                            accepted_t.fetch_add(1, Ordering::SeqCst);
+                            socks.push(sock);
+                        }
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                        Err(_) => break,
+                    }
+                    socks.retain_mut(|sock| match sock.read(&mut buf) {
+                        Ok(0) => {
+                            closed_t.fetch_add(1, Ordering::SeqCst);
+                            false
+                        }
+                        Ok(_) => true,
+                        Err(err)
+                            if err.kind() == ErrorKind::WouldBlock
+                                || err.kind() == ErrorKind::TimedOut =>
+                        {
+                            true
+                        }
+                        Err(_) => {
+                            closed_t.fetch_add(1, Ordering::SeqCst);
+                            false
+                        }
+                    });
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // Dropping `socks` here closes every socket the app left open.
+            });
+            Self {
+                port,
+                stop,
+                accepted,
+                closed_by_app,
+                join: Some(join),
+            }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        /// Wait until the app has closed `n` sockets. Returns the count seen.
+        fn wait_closed_by_app(&self, n: usize, limit: Duration) -> usize {
+            let deadline = Instant::now() + limit;
+            loop {
+                let seen = self.closed_by_app.load(Ordering::SeqCst);
+                if seen >= n || Instant::now() >= deadline {
+                    return seen;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for StallPeer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
             if let Some(join) = self.join.take() {
                 let _ = join.join();
             }
@@ -9124,6 +9254,23 @@ mod tests {
     }
 
     #[test]
+    fn slow_cast_commands_run_off_the_main_thread() {
+        // A sync #[tauri::command] runs on the main thread, so an 8 s scan or a
+        // PowerShell firewall query would freeze the window ("Not Responding").
+        let src = include_str!("lib.rs").replace("\r\n", "\n");
+        for name in ["cast_discover", "cast_network_fingerprint", "cast_firewall_status"] {
+            let at = src
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found in lib.rs"));
+            let attr = src[..at].rfind("#[tauri::command").expect("command attribute");
+            assert!(
+                src[attr..at].starts_with("#[tauri::command(async)]"),
+                "{name} must be #[tauri::command(async)]"
+            );
+        }
+    }
+
+    #[test]
     fn heartbeat_deadlines_and_launch_timeout_sentence() {
         assert_eq!(PING_EVERY, Duration::from_secs(5));
         assert_eq!(LINK_DEAD_AFTER, Duration::from_secs(15));
@@ -9154,6 +9301,7 @@ mod tests {
             "os error 110"
         )));
         assert_eq!(LAN_CATEGORY_WAIT, Duration::from_millis(2500));
+        assert_eq!(CAST_TCP_CONNECT_TIMEOUT, Duration::from_millis(2000));
         assert_eq!(LAN_CATEGORY_STALE, Duration::from_secs(30));
         assert_eq!(unix_to_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(unix_to_utc(1_700_000_000), "2023-11-14T22:13:20Z");
@@ -10328,36 +10476,8 @@ mod tests {
             .clone()
             .or_else(|| snap.preferred.first().cloned())
             .expect("a home-LAN address is required to start a cast");
-        let listener = TcpListener::bind((iface.ip, 0)).expect("bind stalling peer");
-        let port = listener.local_addr().unwrap().port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_t = Arc::clone(&stop);
-        thread::spawn(move || {
-            listener.set_nonblocking(true).ok();
-            while !stop_t.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut sock, _)) => {
-                        // Keep the TCP session open and never answer TLS.
-                        sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
-                        let mut buf = [0u8; 1024];
-                        while !stop_t.load(Ordering::SeqCst) {
-                            match sock.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(_) => {}
-                                Err(err)
-                                    if err.kind() == ErrorKind::WouldBlock
-                                        || err.kind() == ErrorKind::TimedOut => {}
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let peer = StallPeer::bind(iface.ip);
+        let port = peer.port;
         let state = CastState::default();
         let started = Instant::now();
         let err = state
@@ -10370,15 +10490,25 @@ mod tests {
             )
             .expect_err("a peer that accepts and stays silent must time out");
         let elapsed = started.elapsed();
-        stop.store(true, Ordering::SeqCst);
+        assert!(peer.accepted() >= 1, "the stalling peer never saw the connect");
+        // Lower bound only: the upper end is the TLS join plus the profile
+        // wait, and a slow runner must not turn that into a failure.
         assert!(
-            elapsed >= Duration::from_millis(350) && elapsed < Duration::from_secs(6),
-            "ready wait should be ~400ms plus the TLS join, got {elapsed:?}"
+            elapsed >= Duration::from_millis(350),
+            "ready wait should be ~400ms, got {elapsed:?}"
         );
-        // A Public Windows profile replaces the unreachable sentence. GitHub's
-        // runner is Public, so the timeout still has to match that wording.
-        let expected = with_public_network(link_down_message());
-        assert_eq!(err, expected);
+        assert!(
+            elapsed < Duration::from_secs(4) + LAN_CATEGORY_WAIT * 2,
+            "ready wait should end well before the 15 s UI clock, got {elapsed:?}"
+        );
+        // A Public Windows profile replaces the unreachable sentence. The
+        // profile query runs in the background and can finish before or after
+        // this attempt, so a second read here could disagree. Accept exactly
+        // these two sentences and nothing else.
+        assert!(
+            err == link_down_message() || err == PUBLIC_WIFI_MESSAGE,
+            "unexpected timeout sentence: {err}"
+        );
         assert_eq!(state.status().error.as_deref(), Some(err.as_str()));
         let written = log.text();
         let lines: Vec<_> = written
@@ -10499,35 +10629,8 @@ mod tests {
             .clone()
             .or_else(|| snap.preferred.first().cloned())
             .expect("a home-LAN address is required to start a cast");
-        let listener = TcpListener::bind((iface.ip, 0)).expect("bind stalling peer");
-        let port = listener.local_addr().unwrap().port();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_t = Arc::clone(&stop);
-        thread::spawn(move || {
-            listener.set_nonblocking(true).ok();
-            while !stop_t.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut sock, _)) => {
-                        sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
-                        let mut buf = [0u8; 256];
-                        while !stop_t.load(Ordering::SeqCst) {
-                            match sock.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(_) => {}
-                                Err(err)
-                                    if err.kind() == ErrorKind::WouldBlock
-                                        || err.kind() == ErrorKind::TimedOut => {}
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let peer = StallPeer::bind(iface.ip);
+        let port = peer.port;
         let state = Arc::new(CastState::default());
         let state_t = Arc::clone(&state);
         let host = iface.ip.to_string();
@@ -10558,6 +10661,11 @@ mod tests {
         );
         assert!(!state.status().connected);
         assert!(state.status().error.is_none(), "{:?}", state.status().error);
+        assert_eq!(
+            peer.wait_closed_by_app(1, Duration::from_secs(2)),
+            1,
+            "the cancelled attempt must close its TCP socket to the TV"
+        );
 
         let retry_started = Instant::now();
         let retry = state.connect_wait(
@@ -10568,8 +10676,13 @@ mod tests {
             None,
         );
         let retry_elapsed = retry_started.elapsed();
-        stop.store(true, Ordering::SeqCst);
         assert!(retry.is_err(), "a retry must run instead of staying stuck");
+        assert_eq!(peer.accepted(), 2, "the retry must reach the TV again");
+        assert_eq!(
+            peer.wait_closed_by_app(2, Duration::from_secs(2)),
+            2,
+            "a timed-out retry must close its TCP socket too"
+        );
         assert!(
             retry_elapsed < Duration::from_secs(3),
             "retry should honor its own deadline, got {retry_elapsed:?}"
