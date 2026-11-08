@@ -1053,7 +1053,7 @@ fn read_text_file(path: String, allowed: State<'_, AllowedMedia>) -> Result<Stri
 }
 
 
-/// 0.1.18 keeps the second window off. The JS flag hides the button; this
+/// 0.1.19 keeps the second window off. The JS flag hides the button; this
 /// command is the gate that nothing else can skip.
 const UNDOCK_MAIN_WINDOW: bool = false;
 
@@ -1061,7 +1061,7 @@ pub fn undock_blocked_reason() -> Option<&'static str> {
     if UNDOCK_MAIN_WINDOW {
         None
     } else {
-        Some("Undock is off in 0.1.18")
+        Some("Undock is off in 0.1.19")
     }
 }
 

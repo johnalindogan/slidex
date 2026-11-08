@@ -1502,7 +1502,7 @@
   }
 
   var CAST_CONNECT_TIMEOUT_MS = 15000;
-  /** 0.1.18 keeps Undock off. The second window is rebuilt in 0.2.0. */
+  /** 0.1.19 keeps Undock off. The second window is rebuilt in 0.2.0. */
   var UNDOCK_MAIN_WINDOW = false;
 
   function castFailureMessage(tv) {

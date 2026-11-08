@@ -745,19 +745,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.18 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.19 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.18');
-  assert.equal(tauri.version, '0.1.18');
+  assert.equal(pkg.version, '0.1.19');
+  assert.equal(tauri.version, '0.1.19');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.18"/m);
-  assert.match(lock, /"version": "0\.1\.18"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.18"/);
+  assert.match(cargo, /^version = "0\.1\.19"/m);
+  assert.match(lock, /"version": "0\.1\.19"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.19"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -2241,7 +2241,7 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.equal(C.castFailureMessage('Living Room TV'), failed.message);
 });
 
-test('the Undock button stays in the code and is not shown in 0.1.18', () => {
+test('the Undock button stays in the code and is not shown in 0.1.19', () => {
   assert.equal(C.UNDOCK_MAIN_WINDOW, false);
   assert.equal(C.undockControlShown(false), false);
   assert.equal(C.undockControlShown(true), true);
@@ -2258,7 +2258,7 @@ test('the Undock button stays in the code and is not shown in 0.1.18', () => {
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
   const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
   assert.match(open, /undock_blocked_reason/);
-  assert.match(lib, /Undock is off in 0\.1\.18/);
+  assert.match(lib, /Undock is off in 0\.1\.19/);
 });
 
 test('emptying the playlist forgets the saved session so Continue is not offered', () => {
