@@ -3768,6 +3768,15 @@ function recordPlaylistEdit(label) {
   if (window.SlideXCore && SlideXCore.undoCommit) plUndo = SlideXCore.undoCommit(plUndo, label, playlistSnapshot());
 }
 function clearPlaylistUndo() { plUndo = { past: [], future: [] }; }
+function playlistUndoPending() { return !!(plUndo.past.length || plUndo.future.length); }
+/* An undoable edit that empties the list goes back to the landing screen (bru) but keeps the history,
+   so Ctrl+Z or the toast's Undo can bring the items back. bru itself still starts a clean history. */
+function emptyPlaylistKeepUndo() {
+  const keep = plUndo;
+  forgetEmptiedSession();
+  try { g('bru').click(); } catch (_) {}
+  plUndo = keep;
+}
 function toastPlaylistEdit(label) {
   showToast(label + ' done. <button type="button" class="toast-undo" data-pl-undo title="Undo ' + label + ' (Ctrl+Z)">Undo</button>', 5000);
 }
@@ -3777,7 +3786,20 @@ function undoPlaylistEdit(redo) {
   const step = redo ? core.redoStep(plUndo, playlistSnapshot()) : core.undoStep(plUndo, playlistSnapshot());
   if (!step) { showToast(redo ? 'Nothing to redo' : 'Nothing to undo', 1800); return false; }
   plUndo = step.history;
+  const fromEmpty = !getMediaItems().length;
   items = step.snap.items.slice();
+  if (!getMediaItems().length) {
+    /* Redo of a Remove that empties the list: same path as the edit itself. */
+    selectedItems.clear(); lastClickedMI = -1;
+    emptyPlaylistKeepUndo();
+    showToast((redo ? 'Redid: ' : 'Undid: ') + step.label + '.', 2500);
+    return true;
+  }
+  if (fromEmpty) {
+    /* Back from the landing screen after the last item was removed. */
+    sessionLoaded = true;
+    dz.style.display = 'none'; viewer.style.display = 'flex';
+  }
   selectedItems.clear(); lastClickedMI = -1;
   cur = Math.max(0, Math.min(step.snap.cur | 0, Math.max(0, getMediaItems().length - 1)));
   rebuildSlides(cur);
@@ -3801,7 +3823,8 @@ function removeItem(itemsIdx, clearLS) {
   items.splice(itemsIdx, 1);
   selectedItems.clear();
   const cnt = getMediaItems().length;
-  if (!cnt) { forgetEmptiedSession(); g('bru').click(); } else { rebuildSlides(Math.min(cur, cnt - 1)); toastPlaylistEdit('Remove'); }
+  if (!cnt) emptyPlaylistKeepUndo(); else rebuildSlides(Math.min(cur, cnt - 1));
+  toastPlaylistEdit('Remove');
   autoSave();
 }
 
@@ -6554,7 +6577,7 @@ document.addEventListener('keydown', e => {
 
   /* Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) undo and redo playlist edits. Text fields keep their own undo. */
   const undoAct = window.SlideXCore && SlideXCore.undoKeyAction ? SlideXCore.undoKeyAction(e) : null;
-  if (undoAct && getMediaItems().length) { e.preventDefault(); undoPlaylistEdit(undoAct === 'redo'); return; }
+  if (undoAct && (getMediaItems().length || playlistUndoPending())) { e.preventDefault(); undoPlaylistEdit(undoAct === 'redo'); return; }
 
   if (!getMediaItems().length) {
     if (keysEqual(keyMap.watch, e.key)) return;
@@ -6660,7 +6683,10 @@ function removePlaylistFiles(files, clearLS, byPath) {
   cur = plan.cur;
   selectedItems.clear();
   const cnt = getMediaItems().length;
-  if (!cnt) { forgetEmptiedSession(); try { g('bru').click(); } catch (_) {} }
+  if (!cnt) {
+    if (clearLS) { forgetEmptiedSession(); try { g('bru').click(); } catch (_) {} }
+    else emptyPlaylistKeepUndo();
+  }
   else rebuildSlides(cur);
   autoSave();
 }
@@ -6736,8 +6762,9 @@ if (g('delCancel')) g('delCancel').onclick = () => closeDelConfirm();
 if (g('delRemoveOnly')) g('delRemoveOnly').onclick = () => {
   const files = delConfirmFiles.slice();
   closeDelConfirm();
+  const before = plUndo;
   removePlaylistFiles(files, false);
-  if (getMediaItems().length) toastPlaylistEdit('Remove');
+  if (plUndo !== before) toastPlaylistEdit('Remove');
 };
 if (g('delRecycle')) g('delRecycle').onclick = () => { commitRecycle(); };
 
