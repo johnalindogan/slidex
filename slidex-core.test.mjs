@@ -906,6 +906,19 @@ test('pan delta keeps the content under the pointer for every flip and rotation'
   });
 });
 
+test('keyboard focus shows a 2px white ring that outline:none cannot hide', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const css = (html.match(/<style[^>]*>([\s\S]*?)<\/style>/) || [])[1] || '';
+  const ring = css.match(/(^|[}\s]):focus-visible\s*\{([^}]*)\}/);
+  assert.ok(ring, 'a global :focus-visible rule exists');
+  assert.match(ring[2], /outline:\s*2px solid #fff\s*!important/);
+  /* No rule hides the ring for keyboard users. */
+  assert.doesNotMatch(css, /:focus-visible[^{]*\{[^}]*outline:\s*(none|0)/);
+  assert.doesNotMatch(css, /(^|[,}\s])\*?:focus\s*\{[^}]*outline:\s*(none|0)/);
+  /* Fields that set outline:none still get the ring, because the global rule is !important. */
+  assert.match(css, /#kedsearch\{[^}]*outline:none/);
+});
+
 test('zoom focus maps back to the content point on a mirrored rotated pane', () => {
   const spec = { flipH: true, flipV: false, rotation: 90, scale: 1.4, panX: 15, panY: -8, w: 300, h: 180 };
   const M = C.paneContentMatrix(spec);
