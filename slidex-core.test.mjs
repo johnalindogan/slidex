@@ -2868,25 +2868,205 @@ function swMatchBraceBlanked(blanked, openIdx) {
   return -1;
 }
 
-function swEnclosingFn(src, offset) {
-  const blanked = swBlankLiterals(src);
-  let start = -1;
-  const re = /\b(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{|\b(?:async\s+)?function\s*\([^)]*\)\s*\{|[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*=>\s*\{|[A-Za-z_$][\w$]*\s*=\s*(?:async\s+)?function\s*\([^)]*\)\s*\{|\.\w+\s*=\s*(?:async\s+)?function\s*\([^)]*\)\s*\{/g;
-  let m;
-  while ((m = re.exec(src)) !== null) {
-    if (m.index > offset) break;
-    start = m.index;
+function swSkipWs(blanked, i) {
+  while (i < blanked.length && /\s/.test(blanked[i])) i++;
+  return i;
+}
+
+function swMatchParenBlanked(blanked, openIdx) {
+  if (blanked[openIdx] !== '(') return -1;
+  let depth = 0;
+  for (let i = openIdx; i < blanked.length; i++) {
+    if (blanked[i] === '(') depth++;
+    else if (blanked[i] === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
   }
-  assert.ok(start !== -1, 'enclosing function before offset ' + offset);
-  const braceAt = blanked.indexOf('{', start);
-  const end = swMatchBraceBlanked(blanked, braceAt);
-  if (end < 0) return { start, end: src.length, text: src.slice(start), blanked: blanked.slice(start) };
-  return {
-    start,
-    end: end + 1,
-    text: src.slice(start, end + 1),
-    blanked: blanked.slice(start, end + 1),
+  return -1;
+}
+
+/**
+ * Build every function / arrow / method span once from blanked source.
+ * Each span is { start, end } covering the whole construct; the write must
+ * fall inside [start, end). Innermost span wins.
+ */
+function swBuildFnSpans(src, blanked) {
+  const spans = [];
+  const n = blanked.length;
+
+  const pushBraceBody = (start, bodyOpen) => {
+    const bodyClose = swMatchBraceBlanked(blanked, bodyOpen);
+    if (bodyClose < 0) return;
+    spans.push({ start, end: bodyClose + 1 });
   };
+
+  // function / async function (decl, expr, or default export already includes keyword)
+  const fnKw = /\b(?:async\s+)?function\b/g;
+  let m;
+  while ((m = fnKw.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    let i = m.index + m[0].length;
+    i = swSkipWs(blanked, i);
+    // optional name
+    if (/[A-Za-z_$#]/.test(blanked[i])) {
+      while (i < n && /[A-Za-z0-9_$#]/.test(blanked[i])) i++;
+      i = swSkipWs(blanked, i);
+    }
+    if (blanked[i] !== '(') continue;
+    const closeParen = swMatchParenBlanked(blanked, i);
+    if (closeParen < 0) continue;
+    i = swSkipWs(blanked, closeParen + 1);
+    if (blanked[i] !== '{') continue;
+    pushBraceBody(m.index, i);
+  }
+
+  // Arrows: =>  (braced or braceless; params with or without parens)
+  const arrowRe = /=>/g;
+  while ((m = arrowRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    // Find start of params
+    let pre = m.index - 1;
+    while (pre >= 0 && /\s/.test(blanked[pre])) pre--;
+    let start;
+    if (pre >= 0 && blanked[pre] === ')') {
+      // walk back to matching (
+      let depth = 0;
+      let j = pre;
+      for (; j >= 0; j--) {
+        if (blanked[j] === ')') depth++;
+        else if (blanked[j] === '(') {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      if (j < 0) continue;
+      start = j;
+      // optional async before params
+      let a = j - 1;
+      while (a >= 0 && /\s/.test(blanked[a])) a--;
+      if (a >= 4 && blanked.slice(a - 4, a + 1) === 'async') start = a - 4;
+    } else if (pre >= 0 && /[A-Za-z0-9_$#]/.test(blanked[pre])) {
+      let j = pre;
+      while (j >= 0 && /[A-Za-z0-9_$#]/.test(blanked[j])) j--;
+      start = j + 1;
+      let a = j;
+      while (a >= 0 && /\s/.test(blanked[a])) a--;
+      if (a >= 4 && blanked.slice(a - 4, a + 1) === 'async') start = a - 4;
+    } else {
+      continue;
+    }
+
+    let i = swSkipWs(blanked, m.index + 2);
+    if (blanked[i] === '{') {
+      pushBraceBody(start, i);
+      continue;
+    }
+    // Braceless: body runs to matching ), , or ; at expression depth 0
+    let depth = 0;
+    let end = i;
+    while (end < n) {
+      const ch = blanked[end];
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        if (depth === 0) break;
+        depth--;
+      } else if ((ch === ',' || ch === ';') && depth === 0) {
+        break;
+      }
+      end++;
+    }
+    if (end > i) spans.push({ start, end });
+  }
+
+  // Class / object methods: name(params) { … } without function/if/while/for/switch/catch
+  // Scan for ){ and verify a method-like header before it.
+  for (let i = 0; i < n - 1; i++) {
+    if (blanked[i] !== ')') continue;
+    let j = swSkipWs(blanked, i + 1);
+    if (blanked[j] !== '{') continue;
+    // Reject if this ){ already consumed as function/arrow body start — still OK to add; innermost wins
+    // Walk back from ) to matching (
+    let depth = 0;
+    let open = -1;
+    for (let k = i; k >= 0; k--) {
+      if (blanked[k] === ')') depth++;
+      else if (blanked[k] === '(') {
+        depth--;
+        if (depth === 0) { open = k; break; }
+      }
+    }
+    if (open < 0) continue;
+    // Name before (
+    let nameEnd = open - 1;
+    while (nameEnd >= 0 && /\s/.test(blanked[nameEnd])) nameEnd--;
+    if (nameEnd < 0 || !/[A-Za-z0-9_$#]/.test(blanked[nameEnd])) continue;
+    let nameStart = nameEnd;
+    while (nameStart >= 0 && /[A-Za-z0-9_$#]/.test(blanked[nameStart])) nameStart--;
+    nameStart++;
+    // Optional get/set/async/# already in name; check keyword before name
+    let before = nameStart - 1;
+    while (before >= 0 && /\s/.test(blanked[before])) before--;
+    // Skip async/get/set keywords that are separate tokens
+    const sliceBefore = (len) => blanked.slice(Math.max(0, before - len + 1), before + 1);
+    if (before >= 4 && sliceBefore(5) === 'async' && !/[A-Za-z0-9_$#]/.test(blanked[before - 5] || '')) {
+      nameStart = before - 4;
+      before = nameStart - 1;
+      while (before >= 0 && /\s/.test(blanked[before])) before--;
+    } else if (before >= 2 && (sliceBefore(3) === 'get' || sliceBefore(3) === 'set') && !/[A-Za-z0-9_$#]/.test(blanked[before - 3] || '')) {
+      nameStart = before - 2;
+      before = nameStart - 1;
+      while (before >= 0 && /\s/.test(blanked[before])) before--;
+    }
+    // Reject control-flow / function keyword
+    const prevWord = (() => {
+      if (before < 0 || !/[A-Za-z0-9_$#]/.test(blanked[before])) return '';
+      let s = before;
+      while (s >= 0 && /[A-Za-z0-9_$#]/.test(blanked[s])) s--;
+      return blanked.slice(s + 1, before + 1);
+    })();
+    if (/^(?:if|while|for|switch|catch|with|function|else)$/.test(prevWord)) continue;
+    // Reject arrows: => just before { would be arrow, already handled; method has no => between ) and {
+    pushBraceBody(nameStart, j);
+  }
+
+  return spans;
+}
+
+const swSpanCache = new Map();
+function swGetFnSpans(src) {
+  if (swSpanCache.has(src)) return swSpanCache.get(src);
+  const blanked = swBlankLiterals(src);
+  const spans = swBuildFnSpans(src, blanked);
+  const entry = { blanked, spans };
+  if (swSpanCache.size > 32) swSpanCache.clear();
+  swSpanCache.set(src, entry);
+  return entry;
+}
+
+/**
+ * All function/arrow/method spans containing offset, innermost first.
+ * Empty ⇒ top-level (writes fail). A guard on any ancestor that still
+ * contains the write counts (e.g. forEach callback inside a guarded if);
+ * a closed sibling function never appears here.
+ */
+function swContainingFns(src, offset) {
+  const { blanked, spans } = swGetFnSpans(src);
+  return spans
+    .filter(sp => offset >= sp.start && offset < sp.end)
+    .sort((a, b) => (a.end - a.start) - (b.end - b.start))
+    .map(sp => ({
+      start: sp.start,
+      end: sp.end,
+      text: src.slice(sp.start, sp.end),
+      blanked: blanked.slice(sp.start, sp.end),
+    }));
+}
+
+/** Innermost containing function, or null if top-level. */
+function swEnclosingFn(src, offset) {
+  const all = swContainingFns(src, offset);
+  return all.length ? all[0] : null;
 }
 
 function swIfCondition(fnText, blanked, ifIdx) {
@@ -2981,24 +3161,38 @@ const SW_CORE_LS_CALL = /SlideXCore\s*\.\s*(?:forgetEmptiedSession|saveBeforeExi
  * Deny-by-default: every localStorage / sessionStorage / Storage.prototype /
  * indexedDB / navigator.storage token outside comments must be a direct
  * .getItem( read, a matched guarded write, or one of the 2 allow-listed core
- * calls. Computed window[ / globalThis[ / self[ access always fails.
+ * calls. Computed window/globalThis/self/top/parent/frames/opener/this access
+ * always fails, as do eval(, new Function, Function(, Reflect.get( and
+ * getOwnPropertyDescriptor(.
+ *
+ * A lexical scan has limits (dynamic code, proxies, indirection the grammar
+ * cannot see). The runtime vm sandbox with a throwing storage Proxy is the
+ * backstop if we ever need it.
  */
 function swScanSource(src, fileLabel, opts = {}) {
   const blanked = swBlankLiterals(src);
   const hits = [];
   const allowlist = opts.allowlist || [];
 
-  const computedRe = /\b(?:window|globalThis|self)\s*\[/g;
+  const computedRe = /\b(?:window|globalThis|self|top|parent|frames|opener|this)\s*\[/g;
   let m;
   while ((m = computedRe.exec(blanked)) !== null) {
     if (blanked[m.index] === ' ') continue;
     const slice = src.slice(m.index, Math.min(src.length, m.index + 100));
-    // Any computed access on window/globalThis/self is denied (Pia: so does computed window[…)
     const line = src.slice(0, m.index).split('\n').length;
     hits.push({
       file: fileLabel, line, kind: 'computed-access', ok: false,
       snippet: slice.replace(/\s+/g, ' ').slice(0, 100),
     });
+  }
+
+  // Dynamic code / reflection that can reach storage without a direct token write.
+  const dynRe = /\beval\s*\(|\bnew\s+Function\b|\bFunction\s*\(|\bReflect\s*\.\s*get\s*\(|\bgetOwnPropertyDescriptor\s*\(/g;
+  while ((m = dynRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    const line = src.slice(0, m.index).split('\n').length;
+    const snippet = src.slice(m.index, Math.min(src.length, m.index + 80)).replace(/\s+/g, ' ');
+    hits.push({ file: fileLabel, line, kind: 'dynamic-access', ok: false, snippet });
   }
 
   const tokenRe = /\b(?:localStorage|sessionStorage|Storage\.prototype|indexedDB|navigator\.storage)\b/g;
@@ -3008,14 +3202,6 @@ function swScanSource(src, fileLabel, opts = {}) {
     const token = m[0];
     const afterBlank = blanked.slice(m.index + token.length, m.index + token.length + 80);
     const snippet = src.slice(Math.max(0, m.index - 40), Math.min(src.length, m.index + 60)).replace(/\s+/g, ' ');
-
-    const enc = swEnclosingFn(src, m.index);
-    const writeRel = m.index - enc.start;
-    const allowed = allowlist.find(a => a.re.test(enc.text) || a.re.test(snippet));
-    if (allowed) {
-      hits.push({ file: fileLabel, line, kind: token, ok: true, reason: allowed.reason });
-      continue;
-    }
 
     if (token === 'localStorage') {
       const lookBehind = src.slice(Math.max(0, m.index - 70), m.index + token.length);
@@ -3032,12 +3218,28 @@ function swScanSource(src, fileLabel, opts = {}) {
     }
 
     const writeFollow = /^\s*(?:\.\s*(?:setItem|removeItem|clear)\s*\(|\[[^\]]+\]\s*=|\.\w+\s*=)/.test(afterBlank);
+    const containers = swContainingFns(src, m.index);
     if (writeFollow) {
-      const ok = swGuardCoversWrite(enc.text, writeRel, enc.blanked);
+      if (!containers.length) {
+        hits.push({ file: fileLabel, line, kind: 'top-level-write', ok: false, snippet });
+        continue;
+      }
+      const allowed = allowlist.find(a => containers.some(enc => a.re.test(enc.text)) || a.re.test(snippet));
+      if (allowed) {
+        hits.push({ file: fileLabel, line, kind: token, ok: true, reason: allowed.reason });
+        continue;
+      }
+      const ok = containers.some(enc => swGuardCoversWrite(enc.text, m.index - enc.start, enc.blanked));
       hits.push({ file: fileLabel, line, kind: token + '-write', ok, snippet });
       continue;
     }
 
+    // Non-write, non-read token use (alias, destructure, …). Allowlist on any container.
+    const allowed = allowlist.find(a => containers.some(enc => a.re.test(enc.text)) || a.re.test(snippet));
+    if (allowed) {
+      hits.push({ file: fileLabel, line, kind: token, ok: true, reason: allowed.reason });
+      continue;
+    }
     hits.push({ file: fileLabel, line, kind: token + '-denied', ok: false, snippet });
   }
 
@@ -3049,15 +3251,18 @@ function swScanSource(src, fileLabel, opts = {}) {
       if (/(?:async\s+)?function\s*$/.test(pre)) continue;
     }
     const line = src.slice(0, m.index).split('\n').length;
-    const enc = swEnclosingFn(src, m.index);
-    const writeRel = m.index - enc.start;
+    const containers = swContainingFns(src, m.index);
     const snippet = src.slice(Math.max(0, m.index - 40), Math.min(src.length, m.index + 60)).replace(/\s+/g, ' ');
-    const allowed = allowlist.find(a => a.re.test(enc.text) || a.re.test(snippet));
+    if (!containers.length) {
+      hits.push({ file: fileLabel, line, kind: 'top-level-write', ok: false, snippet });
+      continue;
+    }
+    const allowed = allowlist.find(a => containers.some(enc => a.re.test(enc.text)) || a.re.test(snippet));
     if (allowed) {
       hits.push({ file: fileLabel, line, kind: m[0].slice(0, 40), ok: true, reason: allowed.reason });
       continue;
     }
-    const ok = swGuardCoversWrite(enc.text, writeRel, enc.blanked);
+    const ok = containers.some(enc => swGuardCoversWrite(enc.text, m.index - enc.start, enc.blanked));
     hits.push({ file: fileLabel, line, kind: m[0].slice(0, 40), ok, snippet });
   }
 
@@ -3088,14 +3293,16 @@ function swScanAll(html, core) {
     .concat(swScanSource(core, 'slidex-core.js', { allowlist: coreAllow }));
 }
 
-/** Permanent injection fixtures: scanner must fail on each (6 prior + 8 new). */
+/** Permanent injection fixtures: scanner must fail on each. */
 const SW_NO_WRITE_INJECTIONS = [
+  // Prior 6
   { name: "localStorage['k']=", code: "\n  localStorage['k'] = 'v';\n" },
   { name: 'sessionStorage.setItem', code: "\n  sessionStorage.setItem('k', 'v');\n" },
   { name: 'localStorage.clear', code: '\n  localStorage.clear();\n' },
   { name: 'saveMetaIDB()', code: "\n  saveMetaIDB('k', 1);\n" },
   { name: 'aliased ls.setItem', code: "\n  const ls = localStorage; ls.setItem('k', 'v');\n" },
   { name: 'empty if (sspIsMainWindow()) {} then write', code: "\n  if (sspIsMainWindow()) {}\n  localStorage.setItem('k', 'v');\n" },
+  // Prior 8
   { name: "window['local'+'Storage'].setItem", code: "\n  window['local'+'Storage'].setItem('k', 'v');\n" },
   { name: 'const ls = window.localStorage', code: '\n  const ls = window.localStorage;\n  ls.setItem("k", "v");\n' },
   { name: 'const {localStorage: ls} = window', code: '\n  const {localStorage: ls} = window;\n  ls.setItem("k", "v");\n' },
@@ -3104,7 +3311,31 @@ const SW_NO_WRITE_INJECTIONS = [
   { name: 'if (true || e && sspIsMainWindow()) { write }', code: "\n  if (true || e && sspIsMainWindow()) { localStorage.setItem('k', 'v'); }\n" },
   { name: 'else if (!sspIsMainWindow()) return; write', code: "\n  if (e) {} else if (!sspIsMainWindow()) return;\n  localStorage.setItem('k', 'v');\n" },
   { name: "'}' inside string throws off brace counter", code: '\n  if (sspIsMainWindow()) { const _s = "{"; }\n  localStorage.setItem("k", "v");\n' },
+  // After saveMetaIDB: page-style handlers must not inherit saveMetaIDB's guard
+  { name: 'addEventListener arrow after saveMetaIDB', after: 'saveMetaIDB',
+    code: "\ndocument.addEventListener('keyup', () => { localStorage.setItem('k', 'v'); });\n" },
+  { name: 'onchange braceless arrow after saveMetaIDB', after: 'saveMetaIDB',
+    code: "\ng('vskip').onchange = () => localStorage.setItem('k', 'v');\n" },
+  // Free nit: dynamic / cross-frame access
+  { name: 'eval/Reflect.get/top computed',
+    code: "\n  eval('1'); Reflect.get(window, 'localStorage').setItem('k', 'v'); top['localStorage'].setItem('a', 'b');\n" },
 ];
+
+/** Inject fixture code into the page source (swChildKey body, or just after saveMetaIDB). */
+function swInjectFixture(html0, inj) {
+  if (inj.after === 'saveMetaIDB') {
+    const start = html0.indexOf('async function saveMetaIDB');
+    assert.ok(start !== -1, 'saveMetaIDB');
+    const enc = swEnclosingFn(html0, start + 10);
+    assert.ok(enc, 'saveMetaIDB span');
+    return html0.slice(0, enc.end) + inj.code + html0.slice(enc.end);
+  }
+  const marker = 'function swChildKey(e) {';
+  const at = html0.indexOf(marker);
+  assert.ok(at !== -1);
+  const brace = html0.indexOf('{', at);
+  return html0.slice(0, brace + 1) + inj.code + html0.slice(brace + 1);
+}
 
 test('source scan: every persisted write in the page and core is covered by sspIsMainWindow before the write', () => {
   const html = swNoWriteHtml();
@@ -3127,22 +3358,23 @@ test('source scan: every persisted write in the page and core is covered by sspI
   );
 });
 
-test('source scan fails on each no-write injection fixture (6 prior + 8 new)', () => {
+test('source scan fails on each no-write injection fixture (14 prior + 2 after saveMetaIDB + 1 dynamic)', () => {
   const html0 = swNoWriteHtml();
   const core = swNoWriteCore();
-  const marker = 'function swChildKey(e) {';
-  const at = html0.indexOf(marker);
-  assert.ok(at !== -1);
-  const brace = html0.indexOf('{', at);
-  assert.equal(SW_NO_WRITE_INJECTIONS.length, 14);
+  assert.equal(SW_NO_WRITE_INJECTIONS.length, 17);
   for (const inj of SW_NO_WRITE_INJECTIONS) {
-    const html = html0.slice(0, brace + 1) + inj.code + html0.slice(brace + 1);
+    const html = swInjectFixture(html0, inj);
+    // Fresh span cache per injected source
+    swSpanCache.clear();
+    swBlankCacheByStr.clear();
     const bad = swScanAll(html, core).filter(h => !h.ok);
     assert.ok(
       bad.length >= 1,
       `expected scan to fail for ${inj.name}, but it stayed green`
     );
   }
+  swSpanCache.clear();
+  swBlankCacheByStr.clear();
   assert.equal(swScanAll(html0, core).filter(h => !h.ok).length, 0, 'real page must still pass');
 });
 
