@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -8,8 +8,47 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const androidDir = join(root, 'android', 'app', 'src', 'main', 'assets');
 const androidHtml = join(androidDir, 'SlideShowPro.html');
 const fontsSrc = join(root, 'fonts');
+const REQUIRED_FONTS = [
+  'PlusJakartaSans-Variable.woff2',
+  'JetBrainsMono-Regular.woff2',
+  'OFL.txt',
+];
+
+function requireFonts(dir) {
+  if (!existsSync(dir)) {
+    console.error(`fonts/: required directory missing: ${dir}`);
+    process.exit(1);
+  }
+  let names;
+  try {
+    names = new Set(readdirSync(dir));
+  } catch (err) {
+    console.error(`fonts/: cannot read ${dir}: ${err.message}`);
+    process.exit(1);
+  }
+  const missing = REQUIRED_FONTS.filter((name) => !names.has(name));
+  if (missing.length) {
+    console.error(`fonts/: missing required file(s): ${missing.join(', ')}`);
+    process.exit(1);
+  }
+  for (const name of REQUIRED_FONTS) {
+    const path = join(dir, name);
+    let st;
+    try {
+      st = statSync(path);
+    } catch (err) {
+      console.error(`fonts/: cannot stat required file ${name}: ${err.message}`);
+      process.exit(1);
+    }
+    if (!st.isFile() || st.size <= 0) {
+      console.error(`fonts/: required file is empty or not a file: ${name}`);
+      process.exit(1);
+    }
+  }
+}
 
 const core = join(root, 'slidex-core.js');
+requireFonts(fontsSrc);
 mkdirSync(androidDir, { recursive: true });
 mkdirSync(join(root, 'ui'), { recursive: true });
 mkdirSync(join(root, 'ui', 'fonts'), { recursive: true });
@@ -17,7 +56,7 @@ mkdirSync(join(androidDir, 'fonts'), { recursive: true });
 copyFileSync(join(root, 'SlideShowPro.html'), androidHtml);
 copyFileSync(core, join(root, 'ui', 'slidex-core.js'));
 copyFileSync(core, join(androidDir, 'slidex-core.js'));
-for (const name of readdirSync(fontsSrc)) {
+for (const name of REQUIRED_FONTS) {
   copyFileSync(join(fontsSrc, name), join(root, 'ui', 'fonts', name));
   copyFileSync(join(fontsSrc, name), join(androidDir, 'fonts', name));
 }
