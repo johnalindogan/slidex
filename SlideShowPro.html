@@ -354,7 +354,7 @@ body.ssp-playlist-window #viewer,
 body.ssp-playlist-window #ctrls,
 body.ssp-playlist-window #cpanel,
 body.ssp-playlist-window #ctrls-overflow,
-body.ssp-playlist-window #kbmodal,
+body.ssp-playlist-window #settings,
 body.ssp-playlist-window #ctxmenu,
 body.ssp-playlist-window .landing-only-hide {
   display: none !important;
@@ -732,8 +732,32 @@ body.ssp-playlist-window #dock-toggle-btn {
 .soon{font-size:9px;color:rgba(255,255,255,.22);margin-left:auto;font-family:system-ui,sans-serif;border:.5px solid rgba(255,255,255,.1);padding:1px 5px;border-radius:3px;flex-shrink:0;}
 
 /* Keyboard editor modal (P4 assignment / editing UI) */
-#keditor{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:200;align-items:center;justify-content:center;}
-#keditor.open{display:flex;}
+/* One Settings modal (P1-2): Ken Burns, Keyboard shortcuts and Advanced are sections, not separate modals. */
+#settings{display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:200;align-items:center;justify-content:center;font-family:var(--font-main);}
+#settings.open{display:flex;}
+#setBox{background:#141414;border:1px solid rgba(255,255,255,.08);border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);width:860px;max-width:94vw;height:620px;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;color:#fff;}
+#setHead{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid rgba(255,255,255,.08);}
+#setTitle{font-size:15px;font-weight:700;margin:0;}
+#setSaved{font-size:12px;color:rgba(255,255,255,.6);flex:1;}
+#setClose{background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;color:rgba(255,255,255,.85);width:32px;height:32px;cursor:pointer;font-size:14px;}
+#setClose:hover{background:rgba(255,255,255,.08);}
+#setMain{display:flex;flex:1;min-height:0;}
+#setNav{width:200px;flex-shrink:0;padding:12px 8px;border-right:1px solid rgba(255,255,255,.08);display:flex;flex-direction:column;gap:2px;}
+#setNav button{font:inherit;font-size:13px;text-align:left;color:rgba(255,255,255,.75);background:transparent;border:0;border-radius:6px;height:34px;padding:0 12px;cursor:pointer;}
+#setNav button:hover{background:rgba(255,255,255,.08);}
+#setNav button.on{background:rgba(255,255,255,.12);color:#fff;font-weight:700;box-shadow:inset 2px 0 0 #fff;}
+#setNavFoot{margin-top:auto;padding:0 12px;font-size:11px;color:rgba(255,255,255,.6);}
+#setPanes{flex:1;min-width:0;overflow-y:auto;padding:18px 24px;}
+#setPanes > section{display:none;}
+#setPanes > section.on{display:block;}
+#settings #kbbody,#settings #kedbody{background:none;border:0;border-radius:0;padding:0;width:auto;max-width:none;max-height:none;overflow:visible;}
+#setPane-adv h3{color:#fff;font-size:13px;font-weight:600;margin-bottom:14px;}
+.setrow{display:flex;align-items:center;gap:16px;min-height:52px;border-bottom:1px solid rgba(255,255,255,.06);}
+.setrow .k{flex:1;font-size:13px;}
+.setrow .k div+div{font-size:12px;color:rgba(255,255,255,.6);}
+.setrow button{font:inherit;font-size:13px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;padding:0 12px;height:32px;cursor:pointer;white-space:nowrap;}
+.setrow button:hover{background:rgba(255,255,255,.08);}
+#bsettings svg{width:18px;height:18px;}
 #kedbody{background:#111;border:.5px solid rgba(255,255,255,.15);border-radius:8px;padding:20px 24px;width:520px;max-width:94vw;max-height:82vh;overflow-y:auto;font-family:system-ui,sans-serif;display:flex;flex-direction:column;}
 #kedbody::-webkit-scrollbar{width:3px;}
 #kedbody::-webkit-scrollbar-thumb{background:rgba(255,255,255,.2);}
@@ -782,8 +806,6 @@ body.ssp-playlist-window #dock-toggle-btn {
 #watchbadge.show{display:block;}
 
 /* Ken Burns modal */
-#kbmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:200;align-items:center;justify-content:center;}
-#kbmodal.open{display:flex;}
 #kbbody{background:#111;border:.5px solid rgba(255,255,255,.15);border-radius:8px;padding:20px 24px;width:460px;max-height:84vh;overflow-y:auto;font-family:system-ui,sans-serif;}
 #kbbody::-webkit-scrollbar{width:3px;}
 #kbbody::-webkit-scrollbar-thumb{background:rgba(255,255,255,.2);}
@@ -908,7 +930,7 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
         QA Inject
       </button>
     </div>
-    <p id="ladvanced"><a href="#" id="lbupdates-link">Image Updates</a> · advanced</p>
+    <p id="ladvanced"><a href="#" id="lbsettings" title="Settings (Ctrl+,)">Settings</a> · Ctrl+,</p>
     <p id="ldrophint">or drop files here</p>
   </div>
 </div>
@@ -998,6 +1020,9 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
         <button class="cb" id="bcast" type="button" title="Cast the slideshow to a Google TV on this Wi-Fi">
           <svg viewBox="0 0 24 24"><path d="M2 16.1A5 5 0 015.9 20M2 12.05A9 9 0 019.95 20M2 8V6a2 2 0 012-2h16a2 2 0 012 2v12a2 2 0 01-2 2h-6"/><line x1="2" y1="20" x2="2.01" y2="20"/></svg>
           Cast…
+        </button>
+        <button class="cb" id="bsettings" type="button" title="Settings (Ctrl+,)" aria-label="Settings (Ctrl+,)">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
       </div>
       <button class="cb" id="bmore" title="More tools" aria-expanded="false" aria-controls="ctrls-overflow">
@@ -1141,8 +1166,23 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 </div>
 </div>
 
-<!-- Ken Burns modal -->
-<div id="kbmodal">
+<!-- Settings (one modal, Ctrl+,). Ken Burns and the shortcut editor are sections. -->
+<div id="settings" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+<div id="setBox">
+  <div id="setHead">
+    <h2 id="setTitle">Settings</h2>
+    <span id="setSaved">Changes save as you go</span>
+    <button type="button" id="setClose" title="Close (Esc)" aria-label="Close settings (Esc)">&#x2715;</button>
+  </div>
+  <div id="setMain">
+  <nav id="setNav" aria-label="Settings sections">
+    <button type="button" data-pane="kb">Ken Burns</button>
+    <button type="button" data-pane="keys">Keyboard shortcuts</button>
+    <button type="button" data-pane="adv">Advanced</button>
+    <div id="setNavFoot">Ctrl+, opens this</div>
+  </nav>
+  <div id="setPanes">
+  <section id="setPane-kb" aria-label="Ken Burns">
   <div id="kbbody">
     <h3>Ken Burns Effect</h3>
     <div class="kbsec">
@@ -1184,12 +1224,11 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
       <div class="kbsec-title">Per Slide Override</div>
       <div id="kbslidelist"></div>
     </div>
-    <button id="kbclose">Close</button>
   </div>
-</div>
+  </section>
 
-<!-- Keyboard editor modal (P4 assignment / editing) -->
-<div id="keditor" role="dialog" aria-modal="true" aria-labelledby="kedtitle">
+  <!-- Keyboard shortcut editor (P4 assignment / editing) -->
+  <section id="setPane-keys" aria-labelledby="kedtitle">
   <div id="kedbody">
     <h3 id="kedtitle">Keyboard Shortcuts</h3>
     <p>Click a key badge, then press a new key to assign. Escape cancels capture. Two commands cannot share a key.</p>
@@ -1199,10 +1238,19 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
     </div>
     <div id="kedconflict" role="status" aria-live="polite"></div>
     <div id="kedlist"></div>
-    <div id="kedactions">
-      <button type="button" id="kedclose">Close</button>
-    </div>
   </div>
+  </section>
+
+  <section id="setPane-adv" aria-label="Advanced">
+    <h3>Advanced</h3>
+    <div class="setrow">
+      <div class="k"><div>Image Updates</div><div>Load a saved Image Updates file (.json). Its per-image edits apply to matching files, now and when they load later.</div></div>
+      <button type="button" id="setImgUpd">Load Image Updates…</button>
+    </div>
+  </section>
+  </div>
+  </div>
+</div>
 </div>
 
 <!-- Context menu -->
@@ -2324,7 +2372,8 @@ g('lbplist').onclick = () => openPlaylistPicker();
     }
   } catch (_) {}
 })();
-g('lbupdates-link').onclick = (e) => { e.preventDefault(); openImageUpdatesPicker(); };
+g('lbsettings').onclick = (e) => { e.preventDefault(); openSettings(); };
+g('setImgUpd').onclick = () => openImageUpdatesPicker();
 g('lbcont').onclick = async () => {
   try {
     const snap = JSON.parse(localStorage.getItem('ssp_autosave') || 'null');
@@ -2939,21 +2988,52 @@ function renderKeyEditor() {
   list.appendChild(note);
   updateConflictBanner();
 }
-function toggleKeyEditor(force) {
-  const el = g('keditor');
-  const open = typeof force === 'boolean' ? force : !el.classList.contains('open');
-  el.classList.toggle('open', open);
-  if (open) {
+/* ── Settings: one modal (Ctrl+,). Sections: Ken Burns, Keyboard shortcuts, Advanced. ── */
+const SETTINGS_PANES = ['kb', 'keys', 'adv'];
+let settingsPane = 'kb';
+let settingsOpener = null;
+function settingsOpen() { return !!g('settings')?.classList.contains('open'); }
+function showSettingsPane(pane) {
+  if (!SETTINGS_PANES.includes(pane)) pane = 'kb';
+  if (settingsPane === 'keys' && pane !== 'keys') cancelKeyListen();
+  settingsPane = pane;
+  SETTINGS_PANES.forEach(p => g('setPane-' + p).classList.toggle('on', p === pane));
+  document.querySelectorAll('#setNav [data-pane]').forEach(b => {
+    const on = b.dataset.pane === pane;
+    b.classList.toggle('on', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
+  g('bkb').classList.toggle('on', pane === 'kb');
+  if (pane === 'kb') renderKBModal();
+  if (pane === 'keys') {
     kedFilter = g('kedsearch')?.value || '';
     renderKeyEditor();
     setTimeout(() => g('kedsearch')?.focus(), 0);
-  } else {
-    cancelKeyListen();
   }
 }
+function openSettings(pane) {
+  if (!settingsOpen()) settingsOpener = document.activeElement;
+  g('settings').classList.add('open');
+  showSettingsPane(pane || settingsPane);
+  if (settingsPane !== 'keys') setTimeout(() => document.querySelector('#setNav .on')?.focus(), 0);
+}
+function closeSettings() {
+  if (!settingsOpen()) return;
+  cancelKeyListen();
+  g('settings').classList.remove('open');
+  g('bkb').classList.remove('on');
+  const back = settingsOpener; settingsOpener = null;
+  try { if (back && back.focus && document.contains(back)) back.focus(); } catch (_) {}
+}
+function toggleKeyEditor(force) {
+  const open = typeof force === 'boolean' ? force : !(settingsOpen() && settingsPane === 'keys');
+  if (open) openSettings('keys'); else closeSettings();
+}
 g('bked').onclick = () => toggleKeyEditor();
-g('kedclose').onclick = () => toggleKeyEditor(false);
-g('keditor').addEventListener('click', e => { if (e.target === g('keditor')) toggleKeyEditor(false); });
+g('bsettings').onclick = () => (settingsOpen() ? closeSettings() : openSettings());
+g('setClose').onclick = () => closeSettings();
+g('settings').addEventListener('click', e => { if (e.target === g('settings')) closeSettings(); });
+document.querySelectorAll('#setNav [data-pane]').forEach(b => { b.onclick = () => showSettingsPane(b.dataset.pane); });
 g('kedresetall').onclick = async () => {
   cancelKeyListen();
   const ok = await sspConfirm('Reset all keyboard shortcuts to defaults?');
@@ -3005,10 +3085,8 @@ function renderKBModal() {
     row.appendChild(thumb); row.appendChild(name); row.appendChild(sel); list.appendChild(row);
   });
 }
-function toggleKBModal() { const open = g('kbmodal').classList.toggle('open'); g('bkb').classList.toggle('on', open); if (open) renderKBModal(); }
+function toggleKBModal() { if (settingsOpen() && settingsPane === 'kb') closeSettings(); else openSettings('kb'); }
 g('bkb').onclick = toggleKBModal;
-g('kbclose').onclick = toggleKBModal;
-g('kbmodal').addEventListener('click', e => { if (e.target === g('kbmodal')) toggleKBModal(); });
 g('kbena').onchange = () => { kbEnabled = g('kbena').checked; applyKBNow(); };
 g('kbzint').oninput = function() { kbZoomInt = parseInt(this.value)/100; g('kbzintv').textContent = this.value+'%'; applyKBNow(); };
 g('kbpint').oninput = function() { kbPanInt = parseInt(this.value)/100; g('kbpintv').textContent = this.value+'%'; applyKBNow(); };
@@ -6494,10 +6572,17 @@ document.addEventListener('keydown', e => {
 
   /* Escape: close shortcut editor, exit watch mode, close overflow, or clear selection (fixed) */
   if (e.key === 'Escape') {
-    if (g('keditor')?.classList.contains('open')) { toggleKeyEditor(false); return; }
+    if (settingsOpen()) { closeSettings(); return; }
     if (watchMode) { toggleWatchMode(); return; }
     if (g('ctrls-overflow')?.classList.contains('open')) { setOverflowOpen(false); return; }
     if (selectedItems.size > 0) { selectedItems.clear(); updSelBadge(); if (playlistChromeOpen()) renderPlaylist(); }
+    return;
+  }
+
+  /* Ctrl+, opens or closes Settings (fixed chord; single-key bindings never use Ctrl). */
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === ',') {
+    e.preventDefault();
+    if (settingsOpen()) closeSettings(); else openSettings();
     return;
   }
 
