@@ -2682,9 +2682,16 @@ test('track stat: File metadata first, then the Rust audio_file_stat reply', () 
   // Rust side: the command exists, is limited to registered audio files, and is permitted.
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
   assert.match(lib, /fn audio_file_stat\(path: String, allowed: State<'_, AllowedMedia>\)/);
-  assert.match(lib, /audio_stat::stat_audio\(&canonical, \|p\| is_path_allowed\(p, &allowed\)\)/);
-  assert.match(lib, /generate_handler!\[[\s\S]*audio_file_stat,/);
+  assert.match(lib, /audio_stat::stat_audio_path\(Path::new\(&path\), \|p\| is_path_allowed\(p, &allowed\)\)/);
+  // The stat route returns fixed strings only: no canonicalize_path (its error names the path)
+  // and no OS error text (which can carry the path).
   const rs = fs.readFileSync(new URL('./src-tauri/src/audio_stat.rs', import.meta.url), 'utf8');
+  const route = lib.slice(lib.indexOf('fn audio_file_stat('), lib.indexOf('fn read_media_file('));
+  assert.doesNotMatch(route, /canonicalize_path|to_string\(\)|format!/);
+  assert.doesNotMatch(rs, /map_err\(\|e\|/);
+  assert.match(rs, /map_err\(\|_\| ERR_NOT_RESOLVABLE\.to_string\(\)\)/);
+  assert.match(rs, /map_err\(\|_\| ERR_STAT_FAILED\.to_string\(\)\)/);
+  assert.match(lib, /generate_handler!\[[\s\S]*audio_file_stat,/);
   assert.match(rs, /pub mtime_ms: u64/);
   assert.match(rs, /if !allowed\(canonical\) \{\s*return Err/);
   assert.doesNotMatch(rs, /fs::read\(|File::open\(canonical/);

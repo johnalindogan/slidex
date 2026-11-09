@@ -312,8 +312,8 @@ fn media_file_size(path: String, allowed: State<'_, AllowedMedia>) -> Result<u64
 /// Size and mtime of a song the app plays, for the beat cache. Never reads the file.
 #[tauri::command]
 fn audio_file_stat(path: String, allowed: State<'_, AllowedMedia>) -> Result<audio_stat::AudioStat, String> {
-    let canonical = canonicalize_path(Path::new(&path))?;
-    audio_stat::stat_audio(&canonical, |p| is_path_allowed(p, &allowed))
+    // Fixed error strings only: nothing from the input path or the OS reaches the page.
+    audio_stat::stat_audio_path(Path::new(&path), |p| is_path_allowed(p, &allowed))
 }
 
 #[tauri::command]
