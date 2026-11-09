@@ -2358,4 +2358,5 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   assert.doesNotMatch(html, /spotify/i);
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
+  assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
 });
