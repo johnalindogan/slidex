@@ -2187,8 +2187,16 @@
       v: BEAT_ANALYZER_VERSION, bpm: bpm, period: period, offset: offset,
       beatsPerBar: bpb, barPhase: ((Math.round(Number(g.barPhase) || 0) % bpb) + bpb) % bpb,
       duration: Number(g.duration) > 0 ? Number(g.duration) : Infinity,
-      confidence: Number(g.confidence) || 0
+      // null = not measured (a hand-set grid); a measured grid keeps its score.
+      confidence: g.confidence == null || !Number.isFinite(Number(g.confidence)) ? null : Number(g.confidence)
     };
+  }
+
+  /** A grid slides may snap to: measured grids need BEAT_MIN_CONFIDENCE (2.2) or more.
+      Below it the show keeps the unsynced slide time. */
+  function beatGridUsable(grid) {
+    if (!grid || !(grid.bpm > 0) || !(grid.period > 0)) return false;
+    return grid.confidence == null || grid.confidence >= BEAT_MIN_CONFIDENCE;
   }
 
   /** Full analysis of mono PCM. Returns { ok: true, grid } or { ok: false, reason }. */
@@ -2280,8 +2288,69 @@
   function beatSnapDelay(s) {
     var targetMs = s && s.targetMs;
     if (!s || s.mode !== 'beat' && s.mode !== 'bar') return targetMs;
-    if (s.audioPaused || s.casting || !s.grid) return targetMs;
-    return beatSyncDelayMs({ grid: s.grid, now: s.now, targetMs: targetMs, unit: s.mode });
+    if (s.audioPaused || s.casting || !beatGridUsable(s.grid)) return targetMs;
+    // Sync offset: speakers or HDMI that lag by L ms are heard L ms behind audio.currentTime,
+    // so the grid is matched against the heard position (now - L) and slides change L ms later.
+    var now = Number(s.now) - clampSyncOffsetMs(s.offsetMs) / 1000;
+    return beatSyncDelayMs({ grid: s.grid, now: now, targetMs: targetMs, unit: s.mode });
+  }
+
+  var SYNC_OFFSET_MIN_MS = -200, SYNC_OFFSET_MAX_MS = 400;
+  /** Saved sync offset in ms, whole 10 ms steps within [-200, 400]; junk → 0. */
+  function clampSyncOffsetMs(v) {
+    var n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    n = Math.round(n / 10) * 10;
+    return Math.min(SYNC_OFFSET_MAX_MS, Math.max(SYNC_OFFSET_MIN_MS, n)) || 0;
+  }
+
+  /* Per-file beat cache (localStorage), so a song isn't decoded and analysed on every play or
+     every launch. Key = file path (case-folded like the queue) + file size + analyzer version;
+     a changed file or a new analyzer misses the cache. Stores the grid or the unclear reason. */
+  var BEAT_CACHE_MAX = 200;
+  function beatCacheKey(path, size, version) {
+    var n = Number(size);
+    if (!path || !(n > 0)) return null;
+    return audioPathKey(path) + '|' + Math.round(n) + '|v' + (version == null ? BEAT_ANALYZER_VERSION : version);
+  }
+  /** Cache entry from an analyzeBeats result. */
+  function beatCacheEntry(res) {
+    if (res && res.ok && res.grid) {
+      var g = res.grid;
+      return { ok: 1, bpm: g.bpm, offset: g.offset, beatsPerBar: g.beatsPerBar, barPhase: g.barPhase,
+        duration: Number.isFinite(g.duration) ? g.duration : 0, confidence: g.confidence };
+    }
+    return { ok: 0, reason: (res && res.reason) || 'tempo-unclear' };
+  }
+  /** Read a key back as the in-app state: { state: 'ok', grid } | { state: 'unclear', reason } | null.
+      A cached grid under the confidence bar reads as unclear. */
+  function beatCacheRead(store, key) {
+    var e = key && store && Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null;
+    if (!e || typeof e !== 'object') return null;
+    if (e.ok) {
+      var grid = buildBeatGrid(e);
+      if (!grid) return null;
+      if (!beatGridUsable(grid)) return { state: 'unclear', reason: 'tempo-unclear' };
+      return { state: 'ok', grid: grid };
+    }
+    var r = String(e.reason || 'tempo-unclear');
+    if (r !== 'tempo-unclear' && r !== 'too-long' && r !== 'too-short' && r !== 'no-audio') r = 'tempo-unclear';
+    return { state: 'unclear', reason: r };
+  }
+  /** New store with key set (most recent last); oldest entries dropped past max. */
+  function beatCacheWrite(store, key, entry, max) {
+    var out = {}, keys = Object.keys(store && typeof store === 'object' ? store : {}).filter(function (k) { return k !== key; });
+    var cap = Math.max(1, max || BEAT_CACHE_MAX);
+    keys = keys.slice(Math.max(0, keys.length - (cap - 1)));
+    keys.forEach(function (k) { out[k] = store[k]; });
+    if (key) out[key] = entry;
+    return out;
+  }
+  function parseBeatCache(raw) {
+    try {
+      var o = JSON.parse(raw || '{}');
+      return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+    } catch (_) { return {}; }
   }
 
   /** Rough main-thread cost of analyzeBeats for a song (measured ~2 ms per second of audio). */
@@ -2354,6 +2423,17 @@
     BEAT_MAX_SECONDS: BEAT_MAX_SECONDS,
     tempoMatch: tempoMatch,
     beatSnapDelay: beatSnapDelay,
+    BEAT_MIN_CONFIDENCE: BEAT_MIN_CONFIDENCE,
+    beatGridUsable: beatGridUsable,
+    SYNC_OFFSET_MIN_MS: SYNC_OFFSET_MIN_MS,
+    SYNC_OFFSET_MAX_MS: SYNC_OFFSET_MAX_MS,
+    clampSyncOffsetMs: clampSyncOffsetMs,
+    BEAT_CACHE_MAX: BEAT_CACHE_MAX,
+    beatCacheKey: beatCacheKey,
+    beatCacheEntry: beatCacheEntry,
+    beatCacheRead: beatCacheRead,
+    beatCacheWrite: beatCacheWrite,
+    parseBeatCache: parseBeatCache,
     analysisWorkMs: analysisWorkMs,
     analysisWindowOk: analysisWindowOk,
     beatAnalysisTargets: beatAnalysisTargets,

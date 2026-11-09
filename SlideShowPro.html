@@ -840,6 +840,8 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 #musicEmpty{font-size:12px;color:rgba(255,255,255,.6);padding:8px 2px;}
 #musicEmpty b{color:#fff;display:block;margin-bottom:2px;}
 #musicVol{flex:1;accent-color:#fff;}
+#musicOffset{flex:1;accent-color:#fff;}
+#musicOffsetLbl{font-size:11px;color:rgba(255,255,255,.75);white-space:nowrap;min-width:150px;}
 #musicBpm{font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap;}
 #musicBpm.live{border-color:rgba(159,208,255,.6);color:#cfe7ff;}
 #musicBpm.warn{border-color:rgba(232,179,90,.6);color:#f3d29b;}
@@ -8259,6 +8261,10 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="musicBeat" title="Change slides on the music's beat. Slide times stay close to your setting.">Beat sync off</button>
     <input type="range" id="musicVol" min="0" max="1" step="0.05" value="0.8" title="Music volume" aria-label="Music volume">
   </div>
+  <div class="mrow" id="musicOffsetRow" hidden>
+    <label for="musicOffset" id="musicOffsetLbl">Sync offset · 0 ms</label>
+    <input type="range" id="musicOffset" min="-200" max="400" step="10" value="0" title="Use if speakers or HDMI lag: slides change this much later than the beat in the file." aria-label="Sync offset in milliseconds">
+  </div>
   <div id="musicList" role="listbox" aria-label="Music playlist"></div>
   <div id="musicEmpty"><b>No music yet</b>Add songs to play under your slideshow. Local files only. SlideX never uploads anything or uses streaming services.</div>
   <input type="file" id="fimusic" multiple accept="audio/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.oga,.opus">
@@ -8288,6 +8294,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   var beatMode = 'off';
   try { var bm = localStorage.getItem(BEAT_KEY); if (C.BEAT_SYNC_MODES.indexOf(bm) >= 0) beatMode = bm; } catch (_) {}
   var beats = Object.create(null); // track path -> { state: 'analyzing'|'ok'|'unclear'|'failed', grid }
+  var BEAT_CACHE_KEY = 'sspBeatCacheV1';
+  var OFFSET_KEY = 'sspBeatOffsetV1';
+  var syncOffsetMs = 0;
+  try { syncOffsetMs = C.clampSyncOffsetMs(localStorage.getItem(OFFSET_KEY)); } catch (_) {}
+  function readBeatCache() { try { return C.parseBeatCache(localStorage.getItem(BEAT_CACHE_KEY)); } catch (_) { return {}; } }
+  function writeBeatCache(key, res) {
+    if (!key) return;
+    try { localStorage.setItem(BEAT_CACHE_KEY, JSON.stringify(C.beatCacheWrite(readBeatCache(), key, C.beatCacheEntry(res)))); } catch (_) {}
+  }
 
   function el(id) { return document.getElementById(id); }
   function save() {
@@ -8363,14 +8378,18 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (analysisWindow(workMs)) { fn(); return; }
     setTimeout(function () { whenSafe(workMs, fn); }, 150);
   }
-  function decodeTrack(t) {
+  function fetchTrack(t) {
     var src = srcFor(t);
-    var Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    if (!src || !Offline || typeof fetch !== 'function') return Promise.reject(new Error('no decoder'));
+    if (!src || typeof fetch !== 'function') return Promise.reject(new Error('no source'));
     return fetch(src).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.arrayBuffer();
-    }).then(function (buf) {
+    });
+  }
+  function decodeTrack(buf) {
+    var Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!Offline) return Promise.reject(new Error('no decoder'));
+    return Promise.resolve().then(function () {
       var ctx = new Offline(1, 1, 22050);
       return new Promise(function (resolve, reject) {
         var p = ctx.decodeAudioData(buf, resolve, reject);
@@ -8392,13 +8411,25 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       render();
       pumpAnalysis();
     }
-    decodeTrack(t).then(function (ab) {
-      if (ab.duration > C.BEAT_MAX_SECONDS) { finish({ state: 'unclear', reason: 'too-long' }); return; }
-      whenSafe(C.analysisWorkMs(ab.duration), function () {
-        var chans = [];
-        for (var c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
-        var res = C.analyzeBeats(C.mixToMono(chans), ab.sampleRate);
-        finish(res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason });
+    var cacheKey = null;
+    fetchTrack(t).then(function (buf) {
+      // Same file (path + size) and same analyzer as before: reuse the result, no decode.
+      cacheKey = C.beatCacheKey(t.path, buf.byteLength);
+      var hit = C.beatCacheRead(readBeatCache(), cacheKey);
+      if (hit) { finish(hit); return; }
+      return decodeTrack(buf).then(function (ab) {
+        if (ab.duration > C.BEAT_MAX_SECONDS) {
+          writeBeatCache(cacheKey, { ok: false, reason: 'too-long' });
+          finish({ state: 'unclear', reason: 'too-long' });
+          return;
+        }
+        whenSafe(C.analysisWorkMs(ab.duration), function () {
+          var chans = [];
+          for (var c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
+          var res = C.analyzeBeats(C.mixToMono(chans), ab.sampleRate);
+          writeBeatCache(cacheKey, res);
+          finish(res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason });
+        });
       });
     }).catch(function (e) {
       console.warn('[music] beat analysis failed', e);
@@ -8408,13 +8439,13 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function currentGrid() {
     var t = q.tracks[loadedIdx];
     var b = t && beats[t.path];
-    return b && b.state === 'ok' ? b.grid : null;
+    return b && b.state === 'ok' && C.beatGridUsable(b.grid) ? b.grid : null;
   }
   /** slideMs() asks for the slide delay. Beat sync covers this PC only; while casting the TV keeps fixed timing. */
   window.sspBeatSnapMs = function (ms) {
     return C.beatSnapDelay({
       mode: beatMode, audioPaused: audio.paused, casting: !!window.__sspCastActive,
-      grid: currentGrid(), now: audio.currentTime, targetMs: ms
+      grid: currentGrid(), now: audio.currentTime, targetMs: ms, offsetMs: syncOffsetMs
     });
   };
 
@@ -8471,6 +8502,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     el('musicRepeat').textContent = q.repeat === 'one' ? 'Repeat one' : (q.repeat === 'off' ? 'Repeat off' : 'Repeat all');
     el('musicBeat').textContent = beatMode === 'bar' ? 'Beat sync: every bar' : (beatMode === 'beat' ? 'Beat sync: every beat' : 'Beat sync off');
     el('musicBeat').classList.toggle('on', beatMode !== 'off');
+    el('musicOffsetRow').hidden = beatMode === 'off';
+    el('musicOffset').value = String(syncOffsetMs);
+    el('musicOffsetLbl').textContent = 'Sync offset \u00b7 ' + syncOffsetMs + ' ms';
     var chip = el('musicBpm'), bt = t && beats[t.path];
     chip.hidden = beatMode === 'off' || !bt;
     chip.className = '';
@@ -8578,6 +8612,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     sync();
     pumpAnalysis();
   });
+  el('musicOffset').oninput = function () {
+    syncOffsetMs = C.clampSyncOffsetMs(this.value);
+    el('musicOffsetLbl').textContent = 'Sync offset \u00b7 ' + syncOffsetMs + ' ms';
+  };
+  el('musicOffset').onchange = function () {
+    syncOffsetMs = C.clampSyncOffsetMs(this.value);
+    try { localStorage.setItem(OFFSET_KEY, String(syncOffsetMs)); } catch (_) {}
+    el('musicOffsetLbl').textContent = 'Sync offset \u00b7 ' + syncOffsetMs + ' ms \u00b7 Saved';
+  };
   el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });
   el('musicVol').oninput = function () {
     q = Object.assign({}, q, { volume: C.clampVolume(this.value) });
