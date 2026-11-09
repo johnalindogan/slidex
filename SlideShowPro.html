@@ -1076,7 +1076,7 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
         <div class="tglbl" id="tg-image">Image</div>
         <button class="cb tool" id="bcol" title="Color controls">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
-          <span class="tlbl">Colour…</span>
+          <span class="tlbl">Colour…</span><span class="kbd" data-cmd="colour"></span>
         </button>
         <button class="cb tool" id="bcrop" title="Crop (non-destructive)">
         <svg viewBox="0 0 24 24"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
@@ -1101,6 +1101,10 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
       </div>
       <div class="tgroup" role="group" aria-labelledby="tg-view">
         <div class="tglbl" id="tg-view">Motion &amp; view</div>
+        <button class="cb tool" id="toolKb" title="Ken Burns settings">
+        <svg viewBox="0 0 24 24"><path d="M15 3h6v6M14 10l6.1-6.1M9 21H3v-6M10 14l-6.1 6.1"/></svg>
+          <span class="tlbl">Ken Burns…</span><span class="kbd" data-cmd="kenBurns"></span>
+        </button>
         <button class="cb tool" id="btheme" title="Themes (T) — cycle 10 color presets; Shift=random; Alt=all">
         <svg viewBox="0 0 24 24"><path d="M12 2l1.6 4.9H19l-4 2.9 1.5 4.8-4.5-3.2-4.5 3.2L9 9.8 5 6.9h5.4L12 2z"/></svg>
           <span class="tlbl">Themes…</span><span class="kbd" data-cmd="theme"></span>
@@ -2765,6 +2769,8 @@ const FNS = [
   {id:'mirrorH',   label:'Mirror H',          def:'h',          group:'View'},
   {id:'mirrorV',   label:'Mirror V',          def:'v',          group:'View'},
   {id:'hidectl',   label:'Hide Controls',     def:'c',          group:'View'},
+  {id:'kenBurns',  label:'Ken Burns settings', def:'k',         group:'View'},
+  {id:'colour',    label:'Colour',            def:'q',          group:'View'},
   {id:'playlist',  label:'Playlist',          def:'l',          group:'View'},
   {id:'moreTools', label:'Tools',              def:'d',          group:'View'},
   {id:'rotCW',     label:'Rotate CW',         def:'r',          group:'View'},
@@ -2801,6 +2807,13 @@ function refreshMoreToolsTooltip() {
     const key = keyMap[el.dataset.cmd];
     el.textContent = key ? keyLabel(key) : '';
   });
+  /* Buttons outside the panel name their key too, and follow remaps. */
+  [['bkb', 'Ken Burns settings', 'kenBurns'], ['toolKb', 'Ken Burns settings', 'kenBurns'], ['bcol', 'Color controls', 'colour']].forEach(([id, text, cmd]) => {
+    const el = g(id);
+    if (!el) return;
+    const key = keyMap[cmd];
+    el.title = key ? (text + ' (' + keyLabel(key) + ')') : text;
+  });
 }
 function loadKeyMap() {
   let saved = null;
@@ -2809,11 +2822,21 @@ function loadKeyMap() {
     if (raw) saved = JSON.parse(raw);
   } catch (_) {}
   if (!saved || typeof saved !== 'object') saved = null;
-  if (window.SlideXCore && SlideXCore.resolveKeyMap) {
-    const next = SlideXCore.resolveKeyMap(FNS, saved);
+  if (window.SlideXCore && SlideXCore.resolveKeyMapReport) {
+    const report = SlideXCore.resolveKeyMapReport(FNS, saved);
+    const next = report.map;
     const explicit = saved && typeof saved.moreTools === 'string' ? saved.moreTools : null;
     keyMap = next;
-    if (next.moreTools === '' && explicit !== '') saveKeyMap();
+    if ((next.moreTools === '' && explicit !== '') || report.unbound.length) saveKeyMap();
+    /* A saved key kept its command and a new default was left unbound: say so once (the map is saved above). */
+    if (report.unbound.length) {
+      const msg = report.unbound.map(u => {
+        const f = FNS.find(x => x.id === u.id), o = FNS.find(x => x.id === u.keptBy);
+        return (f ? f.label : u.id) + ' has no key: you use ' + keyLabel(u.key) + ' for ' + (o ? o.label : u.keptBy);
+      }).join('. ') + '. Set one in Keyboard shortcuts.';
+      const safe = msg.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      setTimeout(() => { try { showToast(safe, 7000); } catch (_) {} }, 1200);
+    }
   } else {
     keyMap = {};
     FNS.forEach(f => { keyMap[f.id] = f.def; });
@@ -3065,6 +3088,7 @@ function renderKBModal() {
 }
 function toggleKBModal() { const open = g('kbmodal').classList.toggle('open'); g('bkb').classList.toggle('on', open); if (open) renderKBModal(); }
 g('bkb').onclick = toggleKBModal;
+if (g('toolKb')) g('toolKb').onclick = toggleKBModal;
 g('kbclose').onclick = toggleKBModal;
 g('kbmodal').addEventListener('click', e => { if (e.target === g('kbmodal')) toggleKBModal(); });
 g('kbena').onchange = () => { kbEnabled = g('kbena').checked; applyKBNow(); };
@@ -6510,6 +6534,8 @@ function runMappedKey(e) {
     case 'mirrorH': toggleMirrorH(); break;
     case 'mirrorV': toggleMirrorV(); break;
     case 'hidectl': toggleControls(); break;
+    case 'kenBurns': e.preventDefault(); toggleKBModal(); break;
+    case 'colour': e.preventDefault(); g('bcol').click(); break;
     case 'playlist': e.preventDefault(); togglePL(); break;
     case 'moreTools':
       if (window.SlideXCore && !SlideXCore.moreToolsKeyFires(e, keyMap.moreTools)) return false;
