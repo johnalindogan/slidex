@@ -906,6 +906,34 @@ test('pan delta keeps the content under the pointer for every flip and rotation'
   });
 });
 
+test('keyboard focus shows a 2px white ring that outline:none cannot hide', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const css = (html.match(/<style[^>]*>([\s\S]*?)<\/style>/) || [])[1] || '';
+  const ring = css.match(/(^|[}\s]):focus-visible\s*\{([^}]*)\}/);
+  assert.ok(ring, 'a global :focus-visible rule exists');
+  assert.match(ring[2], /outline:\s*2px solid #fff\s*!important/);
+  /* No rule hides the ring for keyboard users. */
+  assert.doesNotMatch(css, /:focus-visible[^{]*\{[^}]*outline:\s*(none|0)/);
+  assert.doesNotMatch(css, /(^|[,}\s])\*?:focus\s*\{[^}]*outline:\s*(none|0)/);
+  /* Fields that set outline:none still get the ring, because the global rule is !important. */
+  assert.match(css, /#kedsearch\{[^}]*outline:none/);
+
+  /* Dark halo: a black box-shadow wider than offset + outline, so black shows inside and outside the ring. */
+  const offset = Number((ring[2].match(/outline-offset:\s*(\d+)px/) || [])[1]);
+  const width = Number((ring[2].match(/outline:\s*(\d+)px/) || [])[1]);
+  const halo = ring[2].match(/box-shadow:\s*0 0 0 (\d+)px #000\s*!important/);
+  assert.ok(halo, 'black halo box-shadow');
+  assert.ok(Number(halo[1]) >= offset + width + 2, 'halo shows at least 2px outside the ring');
+  assert.ok(offset >= 2, 'halo shows at least 2px inside the ring');
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const lum = v => lin(v);
+  const cr = (a, b) => (Math.max(lum(a), lum(b)) + 0.05) / (Math.min(lum(a), lum(b)) + 0.05);
+  /* Ring against its halo, and the outer edge against the page: on a white slide the halo meets white,
+     on the black UI the white ring meets black. Both are 21:1, so at least 3:1 everywhere. */
+  assert.ok(cr(255, 0) >= 3, 'white ring on black halo');
+  for (const page of [255, 0]) assert.ok(Math.max(cr(0, page), cr(255, page)) >= 3, 'ring set reads on ' + page);
+});
+
 test('zoom focus maps back to the content point on a mirrored rotated pane', () => {
   const spec = { flipH: true, flipV: false, rotation: 90, scale: 1.4, panX: 15, panY: -8, w: 300, h: 180 };
   const M = C.paneContentMatrix(spec);
