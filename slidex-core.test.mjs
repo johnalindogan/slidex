@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import test from 'node:test';
 
@@ -2359,4 +2362,50 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
+
+test('bundled fonts are offline: no Google Fonts refs, woff2 + OFL.txt present', () => {
+  const rootDir = fileURLToPath(new URL('./', import.meta.url));
+  const syncUi = spawnSync(process.execPath, [join(rootDir, 'scripts', 'sync-ui.mjs')], { encoding: 'utf8' });
+  assert.equal(syncUi.status, 0, syncUi.stderr || syncUi.stdout);
+  const syncAndroid = spawnSync(process.execPath, [join(rootDir, 'scripts', 'sync-android-ui.mjs')], { encoding: 'utf8' });
+  assert.equal(syncAndroid.status, 0, syncAndroid.stderr || syncAndroid.stdout);
+
+  const required = [
+    'PlusJakartaSans-Variable.woff2',
+    'JetBrainsMono-Regular.woff2',
+    'OFL.txt',
+  ];
+  const htmlPaths = [
+    join(rootDir, 'SlideShowPro.html'),
+    join(rootDir, 'android', 'app', 'src', 'main', 'assets', 'SlideShowPro.html'),
+    join(rootDir, 'ui', 'index.html'),
+  ];
+  for (const htmlPath of htmlPaths) {
+    const html = fs.readFileSync(htmlPath, 'utf8');
+    const label = htmlPath.slice(rootDir.length);
+    assert.doesNotMatch(html, /fonts\.googleapis/i, label);
+    assert.doesNotMatch(html, /fonts\.gstatic/i, label);
+    assert.match(html, /@font-face/, label);
+    assert.match(html, /fonts\/PlusJakartaSans-Variable\.woff2/, label);
+    assert.match(html, /fonts\/JetBrainsMono-Regular\.woff2/, label);
+    assert.match(html, /font-display:\s*swap/, label);
+  }
+  assert.match(fs.readFileSync(join(rootDir, 'SlideShowPro.html'), 'utf8'), /#musicNow\{[^}]*font-family:\s*var\(--font-mono\)/);
+
+  for (const dir of [
+    join(rootDir, 'fonts'),
+    join(rootDir, 'ui', 'fonts'),
+    join(rootDir, 'android', 'app', 'src', 'main', 'assets', 'fonts'),
+  ]) {
+    for (const name of required) {
+      const path = join(dir, name);
+      assert.ok(fs.existsSync(path), path);
+      assert.ok(fs.statSync(path).size > 0, `${path} non-empty`);
+    }
+  }
+  const ofl = fs.readFileSync(join(rootDir, 'fonts', 'OFL.txt'), 'utf8');
+  assert.match(ofl, /SIL OPEN FONT LICENSE/i);
+  assert.match(ofl, /Plus Jakarta Sans/i);
+  assert.match(ofl, /JetBrains Mono/i);
 });
