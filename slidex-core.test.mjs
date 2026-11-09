@@ -1212,6 +1212,34 @@ test('cancel leaves shortcuts, playlists, and locate paths unchanged', () => {
   assert.equal(C.missingFilesNotice(0), '');
 });
 
+test('one Settings modal holds Ken Burns, shortcuts and Image Updates; no other settings modals', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const markup = html.slice(0, html.indexOf('<script'));
+  /* Exactly one settings dialog, with the three sections inside it. */
+  assert.equal((markup.match(/id="settings"/g) || []).length, 1);
+  const box = markup.slice(markup.indexOf('id="settings"'), markup.indexOf('<!-- Context menu -->'));
+  for (const id of ['setPane-kb', 'setPane-keys', 'setPane-adv', 'kbbody', 'kedbody', 'kedlist', 'kbslidelist', 'setImgUpd']) {
+    assert.ok(box.includes('id="' + id + '"'), id + ' is inside #settings');
+  }
+  /* The old separate modals and their own Close buttons are gone. */
+  for (const id of ['kbmodal', 'keditor', 'kbclose', 'kedclose', 'lbupdates-link']) {
+    assert.ok(!markup.includes('id="' + id + '"'), id + ' is not a separate surface');
+    assert.ok(!html.includes("g('" + id + "')"), id + ' is not wired');
+  }
+  /* Every way in opens the same modal. */
+  assert.match(html, /g\('bkb'\)\.onclick = toggleKBModal;/);
+  assert.match(html, /function toggleKBModal\(\) \{[^\n]*openSettings\('kb'\)/);
+  assert.match(html, /function toggleKeyEditor\(force\) \{[\s\S]{0,200}openSettings\('keys'\)/);
+  assert.match(html, /g\('bsettings'\)\.onclick = /);
+  assert.match(html, /g\('lbsettings'\)\.onclick = \(e\) => \{ e\.preventDefault\(\); openSettings\(\); \};/);
+  assert.match(html, /g\('setImgUpd'\)\.onclick = \(\) => openImageUpdatesPicker\(\);/);
+  /* Ctrl+, toggles it and Esc closes it. */
+  assert.match(html, /\(e\.ctrlKey \|\| e\.metaKey\) && !e\.altKey && !e\.shiftKey && e\.key === ','\)/);
+  assert.match(html, /if \(settingsOpen\(\)\) \{ closeSettings\(\); return; \}/);
+  /* The undocked Media Manager window still hides it. */
+  assert.match(html, /body\.ssp-playlist-window #settings,/);
+});
+
 test('HTML and JS have no bare confirm() and the four prompts await a dialog', () => {
   const bare = /(?<![\w$.])confirm\s*\(/;
   ['./SlideShowPro.html', './slidex-core.js', './demo/SlideShowPro.html'].forEach(rel => {
