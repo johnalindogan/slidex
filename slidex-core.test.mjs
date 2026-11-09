@@ -877,7 +877,7 @@ test('More tools toggles on plain d, ignores typing and modifier chords, and yie
   assert.match(html, /id:'moreTools'/);
   assert.match(html, /def:'d'/);
   assert.match(html, /className = 'pl-rename'/);
-  assert.match(html, /More tools \(/);
+  assert.match(html, /'Tools \(' \+ keyLabel\(k\)/);
 });
 
 function close(a, b, eps = 1e-6) {
@@ -1447,6 +1447,32 @@ test('the missing firewall rules message is shown before the panel opens', async
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(sandbox.firewallEl.textContent, sentence);
+});
+
+test('Tools panel has four labelled groups, every control keeps its ID, and rows show keys', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const start = html.indexOf('<div id="ctrls-overflow"');
+  const panel = html.slice(start, html.indexOf('<!-- Unified Media Dock -->', start));
+  assert.match(panel, /role="region" aria-label="Tools"/);
+  assert.match(html, /id="bmore"[^>]*>Tools<\/button>/, 'the bar button says Tools');
+  const groups = [...panel.matchAll(/<div class="tglbl" id="[^"]+">([^<]+)<\/div>/g)].map(m => m[1]);
+  assert.deepEqual(groups, ['Playback', 'Image', 'Motion &amp; view', 'Export &amp; create']);
+  for (const id of ['brev', 'bsd', 'slb', 'bsu', 'bmu', 'vsl', 'dsel', 'tsel', 'vskip', 'bru', 'bcol', 'bcrop', 'bmh', 'bmv', 'brcw', 'brccw',
+    'btheme', 'bhmax', 'bvmax', 'bfname', 'bss', 'bexport', 'bexportcrop', 'toolsFind']) {
+    assert.equal((html.match(new RegExp('id="' + id + '"', 'g')) || []).length, 1, id + ' appears once');
+    assert.ok(panel.includes('id="' + id + '"'), id + ' is in the Tools panel');
+  }
+  /* Every labelled row names its command; key badges point at real keymap ids. */
+  const labels = [...panel.matchAll(/<span class="tlbl">([^<]*)<\/span>/g)].map(m => m[1]);
+  assert.ok(labels.length >= 20 && labels.every(Boolean), 'rows have text labels');
+  const cmds = [...panel.matchAll(/data-cmd="(\w+)"/g)].map(m => m[1]);
+  for (const c of cmds) assert.match(html, new RegExp("\\{id:'" + c + "'"), c + ' is a keymap command');
+  assert.match(html, /querySelectorAll\('#ctrls-overflow \.kbd\[data-cmd\]'\)/);
+  /* Type-to-find. */
+  assert.equal(C.toolMatches('Mirror horizontal h', 'mirror'), true);
+  assert.equal(C.toolMatches('Mirror horizontal h', 'MIRROR hor'), true);
+  assert.equal(C.toolMatches('Rotate clockwise r', 'mirror'), false);
+  assert.equal(C.toolMatches('Screenshot s', '  '), true);
 });
 
 test('the TV unreachable banner comes only from cast_status', () => {
