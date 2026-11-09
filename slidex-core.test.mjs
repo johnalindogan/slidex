@@ -2823,6 +2823,14 @@ function swBlankLiterals(src) {
       while (k >= 0 && /[ \t\r\n]/.test(out[k])) k--;
       const prev = k >= 0 ? out[k] : '';
       const returnish = k >= 5 && out.slice(k - 5, k + 1) === 'return';
+      // Division, not regex: / after ++, --, ) or ] (Pia: i++ / 2 must not blank a write).
+      const afterInc = k >= 1 && ((out[k - 1] === '+' && prev === '+') || (out[k - 1] === '-' && prev === '-'));
+      const afterClose = prev === ')' || prev === ']';
+      if (afterInc || afterClose) {
+        out += c;
+        i++;
+        continue;
+      }
       if (k < 0 || /[(=:[,;!&|?+\-~*%^<>]/.test(prev) || returnish) {
         let j = i + 1;
         while (j < n) {
@@ -3337,6 +3345,9 @@ function swInjectFixture(html0, inj) {
   return html0.slice(0, brace + 1) + inj.code + html0.slice(brace + 1);
 }
 
+// Lexical scan known limits (runtime VM backstop catches these):
+// 1. Hoisted helper registered before the guard but declared after it.
+// 2. A / after ++/--/) /] misread as regex (mitigated above; still note as a class of risk).
 test('source scan: every persisted write in the page and core is covered by sspIsMainWindow before the write', () => {
   const html = swNoWriteHtml();
   const core = swNoWriteCore();
@@ -3376,6 +3387,722 @@ test('source scan fails on each no-write injection fixture (14 prior + 2 after s
   swSpanCache.clear();
   swBlankCacheByStr.clear();
   assert.equal(swScanAll(html0, core).filter(h => !h.ok).length, 0, 'real page must still pass');
+});
+
+
+// ---- Runtime VM backstop: second window must not persist ----
+// Lexical scan is the fast first check; this runs the real page scripts in
+// node:vm as playlist-2 and as main. A lexical scan has limits (hoisted
+// helpers registered before their guard, exotic parse edge cases); the
+// runtime recording Proxy is the backstop.
+
+const SW_RUNTIME_HANDLER_FLOOR = 25; // sensible floor; reported in the test
+
+function swExtractInlineScripts(html) {
+  const out = [];
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (/\bsrc\s*=/i.test(m[1] || '')) continue;
+    if (!(m[2] || '').trim()) continue;
+    out.push(m[2]);
+  }
+  return out;
+}
+
+function swRecordingStorage() {
+  const data = new Map();
+  const writes = [];
+  const api = {
+    getItem(k) {
+      const key = String(k);
+      return data.has(key) ? data.get(key) : null;
+    },
+    setItem(k, v) {
+      const key = String(k);
+      writes.push({ op: 'setItem', key, storage: 'local' });
+      data.set(key, String(v));
+    },
+    removeItem(k) {
+      const key = String(k);
+      writes.push({ op: 'removeItem', key, storage: 'local' });
+      data.delete(key);
+    },
+    clear() {
+      writes.push({ op: 'clear', key: '*', storage: 'local' });
+      data.clear();
+    },
+    key(i) { return [...data.keys()][i | 0] ?? null; },
+    get length() { return data.size; },
+  };
+  const proxy = new Proxy(api, {
+    get(t, prop, recv) {
+      if (prop === 'writes') return writes;
+      if (typeof prop === 'symbol') return Reflect.get(t, prop, recv);
+      if (prop in t) {
+        const v = t[prop];
+        return typeof v === 'function' ? v.bind(t) : v;
+      }
+      return t.getItem(prop);
+    },
+    set(t, prop, value) {
+      if (typeof prop === 'symbol') return Reflect.set(t, prop, value);
+      if (prop === 'length') return true;
+      writes.push({ op: 'prop-set', key: String(prop), storage: 'local' });
+      t.setItem(prop, value);
+      return true;
+    },
+    has(t, prop) { return prop in t || data.has(String(prop)); },
+    ownKeys() { return [...data.keys()]; },
+    getOwnPropertyDescriptor(t, prop) {
+      if (prop in t) return Reflect.getOwnPropertyDescriptor(t, prop);
+      if (data.has(String(prop))) return { configurable: true, enumerable: true, writable: true, value: data.get(String(prop)) };
+      return undefined;
+    },
+  });
+  return { proxy, writes, data, tagStorage(name) {
+    // Return a parallel sessionStorage that shares the writes log with a tag.
+    const sdata = new Map();
+    const sapi = {
+      getItem(k) { const key = String(k); return sdata.has(key) ? sdata.get(key) : null; },
+      setItem(k, v) { writes.push({ op: 'setItem', key: String(k), storage: name }); sdata.set(String(k), String(v)); },
+      removeItem(k) { writes.push({ op: 'removeItem', key: String(k), storage: name }); sdata.delete(String(k)); },
+      clear() { writes.push({ op: 'clear', key: '*', storage: name }); sdata.clear(); },
+      key(i) { return [...sdata.keys()][i | 0] ?? null; },
+      get length() { return sdata.size; },
+    };
+    return new Proxy(sapi, {
+      get(t, prop, recv) {
+        if (typeof prop === 'symbol') return Reflect.get(t, prop, recv);
+        if (prop in t) {
+          const v = t[prop];
+          return typeof v === 'function' ? v.bind(t) : v;
+        }
+        return t.getItem(prop);
+      },
+      set(t, prop, value) {
+        if (typeof prop === 'symbol') return Reflect.set(t, prop, value);
+        writes.push({ op: 'prop-set', key: String(prop), storage: name });
+        t.setItem(prop, value);
+        return true;
+      },
+    });
+  } };
+}
+
+function swStubElement(id, bag) {
+  const listeners = [];
+  const base = {
+    id,
+    nodeType: 1,
+    nodeName: (id === 'musicAudio' ? 'AUDIO' : 'DIV'),
+    tagName: (id === 'musicAudio' ? 'AUDIO' : 'DIV'),
+    style: new Proxy({}, { get: () => '', set: () => true }),
+    classList: {
+      _s: new Set(),
+      add(...xs) { xs.forEach(x => this._s.add(x)); },
+      remove(...xs) { xs.forEach(x => this._s.delete(x)); },
+      toggle(x, force) {
+        if (force === true) { this._s.add(x); return true; }
+        if (force === false) { this._s.delete(x); return false; }
+        if (this._s.has(x)) { this._s.delete(x); return false; }
+        this._s.add(x); return true;
+      },
+      contains(x) { return this._s.has(x); },
+    },
+    dataset: {},
+    children: [],
+    childNodes: [],
+    parentElement: null,
+    parentNode: null,
+    value: id === 'dsel' ? '10000' : (id === 'vskip' ? '5' : (id === 'tsel' ? 'fade' : '')),
+    textContent: '',
+    innerHTML: '',
+    innerText: '',
+    hidden: false,
+    disabled: false,
+    checked: false,
+    selectedIndex: 0,
+    options: [],
+    files: null,
+    href: '',
+    src: '',
+    currentTime: 0,
+    duration: NaN,
+    paused: true,
+    volume: 0.8,
+    muted: false,
+    title: '',
+    type: '',
+    name: id,
+    width: 0,
+    height: 0,
+    naturalWidth: 0,
+    naturalHeight: 0,
+    offsetWidth: 100,
+    offsetHeight: 100,
+    clientWidth: 100,
+    clientHeight: 100,
+    scrollTop: 0,
+    scrollLeft: 0,
+    tabIndex: 0,
+    onclick: null,
+    onchange: null,
+    oninput: null,
+    addEventListener(type, fn) {
+      listeners.push({ type, fn });
+      bag.domListeners.push({ id, type, fn });
+    },
+    removeEventListener() {},
+    dispatchEvent() { return true; },
+    appendChild(c) { this.children.push(c); return c; },
+    removeChild() { return null; },
+    insertBefore(c) { return c; },
+    replaceChild(c) { return c; },
+    remove() {},
+    focus() {},
+    blur() {},
+    click() {
+      const ev = swFakeEvent(base);
+      if (typeof base.onclick === 'function') base.onclick(ev);
+    },
+    play() { return Promise.resolve(); },
+    pause() {},
+    load() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getElementsByTagName() { return []; },
+    getElementsByClassName() { return []; },
+    closest() { return null; },
+    matches() { return false; },
+    contains() { return false; },
+    setAttribute() {},
+    getAttribute(n) { return n === 'id' ? id : null; },
+    removeAttribute() {},
+    hasAttribute() { return false; },
+    getBoundingClientRect() { return { top: 0, left: 0, width: 100, height: 100, bottom: 100, right: 100, x: 0, y: 0 }; },
+    getContext() {
+      return {
+        canvas: base, fillRect() {}, clearRect() {}, drawImage() {},
+        getImageData() { return { data: new Uint8ClampedArray(4), width: 1, height: 1 }; },
+        putImageData() {}, save() {}, restore() {}, scale() {}, rotate() {}, translate() {},
+        setTransform() {}, measureText() { return { width: 0 }; }, beginPath() {}, closePath() {},
+        fill() {}, stroke() {}, arc() {}, rect() {}, fillText() {},
+      };
+    },
+    toDataURL() { return 'data:image/png;base64,xx'; },
+    toBlob(cb) { if (typeof cb === 'function') cb(new Blob(['x'])); },
+  };
+  return new Proxy(base, {
+    set(t, prop, value) {
+      if (typeof prop === 'string' && prop.startsWith('on') && typeof value === 'function') {
+        bag.onHandlers.push({ id, prop, fn: value });
+      }
+      t[prop] = value;
+      return true;
+    },
+    get(t, prop) {
+      if (prop === '__listeners') return listeners;
+      if (prop in t) return t[prop];
+      return undefined;
+    },
+  });
+}
+
+function swFakeEvent(target) {
+  return {
+    target,
+    currentTarget: target,
+    type: 'change',
+    key: '',
+    code: '',
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    shiftKey: false,
+    button: 0,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+  };
+}
+
+/**
+ * Run the real page scripts as role 'main' | 'playlist'.
+ * Returns { writes, handlersRun, handlersFailed, handlerTotal, keys, sandbox }.
+ */
+function swRuntimeRun(html, role, opts = {}) {
+  const coreSrc = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+  let scripts = swExtractInlineScripts(html);
+  assert.ok(scripts.length >= 2, 'expected main + soundtrack inline scripts');
+  // Expose soundtrack save() for the direct-call phase.
+  scripts = scripts.map(s => s.includes('initSoundtrack')
+    ? s.replace('window.sspSoundtrackSync = sync;',
+      'window.sspSoundtrackSync = sync; window.__sspTestSoundtrackSave = save;')
+    : s);
+
+  const store = swRecordingStorage();
+  const bag = { onHandlers: [], domListeners: [], idb: [], fsWrites: [] };
+  const elements = new Map();
+  const el = (id) => {
+    if (!elements.has(id)) elements.set(id, swStubElement(id, bag));
+    return elements.get(id);
+  };
+
+  const timers = [];
+  let timerSeq = 1;
+  const pendingTimers = new Map();
+
+  const body = el('body');
+  body.tagName = 'BODY';
+  const documentStub = {
+    body,
+    documentElement: el('html'),
+    readyState: 'complete',
+    title: '',
+    hidden: false,
+    getElementById: (id) => el(String(id)),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    getElementsByTagName: () => [],
+    getElementsByClassName: () => [],
+    createElement: (tag) => {
+      const e = swStubElement('created-' + tag, bag);
+      e.tagName = String(tag).toUpperCase();
+      e.nodeName = e.tagName;
+      return e;
+    },
+    createElementNS: (_ns, tag) => documentStub.createElement(tag),
+    createTextNode: (t) => ({ nodeType: 3, textContent: String(t) }),
+    createDocumentFragment: () => ({ appendChild() {}, childNodes: [] }),
+    addEventListener: (type, fn) => { bag.domListeners.push({ id: 'document', type, fn }); },
+    removeEventListener() {},
+    dispatchEvent() { return true; },
+  };
+
+  const locationStub = {
+    search: role === 'playlist' ? '?sspWindow=playlist' : '',
+    hash: '',
+    href: role === 'playlist' ? 'https://app.local/?sspWindow=playlist' : 'https://app.local/',
+    pathname: '/',
+    origin: 'https://app.local',
+    protocol: 'https:',
+    host: 'app.local',
+    hostname: 'app.local',
+    port: '',
+    assign() {},
+    replace() {},
+    reload() {},
+  };
+
+  const tauriListen = async () => ({ unlisten: () => {} });
+  const sandbox = {
+    console,
+    Object, Array, String, Number, Boolean, Math, Date, JSON, RegExp, Error, TypeError, RangeError, SyntaxError,
+    Promise, Map, Set, WeakMap, WeakSet, Symbol, Proxy, Reflect,
+    Uint8Array, Uint8ClampedArray, ArrayBuffer, DataView, Blob, File,
+    TextEncoder, TextDecoder, URL, URLSearchParams, atob, btoa,
+    parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent,
+    structuredClone,
+    AbortController,
+    DOMException,
+    FileReader: class FileReader {
+      constructor() { this.onload = null; this.onerror = null; this.result = null; this.readyState = 0; }
+      readAsDataURL() { this.readyState = 2; this.result = 'data:application/octet-stream;base64,eA=='; if (typeof this.onload === 'function') this.onload({ target: this }); }
+      readAsArrayBuffer() { this.readyState = 2; this.result = new ArrayBuffer(1); if (typeof this.onload === 'function') this.onload({ target: this }); }
+      readAsText() { this.readyState = 2; this.result = ''; if (typeof this.onload === 'function') this.onload({ target: this }); }
+    },
+    setTimeout(fn, ms) {
+      const id = timerSeq++;
+      pendingTimers.set(id, { fn, ms: ms || 0 });
+      timers.push(id);
+      return id;
+    },
+    clearTimeout(id) { pendingTimers.delete(id); },
+    setInterval(fn, ms) {
+      const id = timerSeq++;
+      pendingTimers.set(id, { fn, ms: ms || 0, interval: true });
+      return id;
+    },
+    clearInterval(id) { pendingTimers.delete(id); },
+    requestAnimationFrame(fn) { return sandbox.setTimeout(fn, 0); },
+    cancelAnimationFrame(id) { sandbox.clearTimeout(id); },
+    queueMicrotask(fn) { Promise.resolve().then(fn); },
+    localStorage: store.proxy,
+    sessionStorage: store.tagStorage('session'),
+    document: documentStub,
+    location: locationStub,
+    navigator: {
+      userAgent: 'SlideXRuntimeTest',
+      storage: {
+        getDirectory: async () => {
+          bag.fsWrites.push({ op: 'navigator.storage.getDirectory' });
+          store.writes.push({ op: 'fs', key: 'navigator.storage.getDirectory', storage: 'idb' });
+          throw new Error('stub getDirectory');
+        },
+      },
+    },
+    indexedDB: {
+      open(name, version) {
+        bag.idb.push({ op: 'open', name, version });
+        store.writes.push({ op: 'idb-open', key: String(name), storage: 'idb' });
+        const req = {
+          result: null,
+          error: null,
+          onsuccess: null,
+          onerror: null,
+          onupgradeneeded: null,
+        };
+        // Don't auto-succeed: callers that write should hit recording via open itself.
+        sandbox.setTimeout(() => {
+          req.result = {
+            objectStoreNames: { contains: () => true },
+            createObjectStore: () => ({ createIndex() {} }),
+            transaction: () => ({
+              objectStore: () => ({
+                put: (v) => { store.writes.push({ op: 'idb-put', key: 'put', storage: 'idb' }); return {}; },
+                get: () => ({ onsuccess: null, onerror: null, result: null }),
+              }),
+              oncomplete: null,
+              onerror: null,
+            }),
+          };
+          if (typeof req.onupgradeneeded === 'function') {
+            try { req.onupgradeneeded({ target: req }); } catch (_) {}
+          }
+          if (typeof req.onsuccess === 'function') {
+            try { req.onsuccess({ target: req }); } catch (_) {}
+          }
+        }, 0);
+        return req;
+      },
+    },
+    __SSP_WINDOW_ROLE: role === 'playlist' ? 'playlist' : 'main',
+    __SSP_WINDOW_LABEL: role === 'playlist' ? 'playlist-2' : 'main',
+    __TAURI__: {
+      core: {
+        invoke: async () => null,
+        convertFileSrc: (p) => 'asset://' + p,
+      },
+      event: {
+        listen: tauriListen,
+        emit: async () => {},
+      },
+      webviewWindow: {
+        getCurrentWebviewWindow: () => ({
+          label: role === 'playlist' ? 'playlist-2' : 'main',
+        }),
+      },
+      app: { getVersion: async () => '0.1.19' },
+      dialog: {
+        open: async () => null,
+        save: async () => null,
+      },
+    },
+    __TAURI_INTERNALS__: {},
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }),
+    getComputedStyle: () => new Proxy({}, { get: () => '' }),
+    ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
+    MutationObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
+    performance: { now: () => Date.now() },
+    screen: { width: 1920, height: 1080 },
+    devicePixelRatio: 1,
+    innerWidth: 1280,
+    innerHeight: 720,
+    scrollX: 0,
+    scrollY: 0,
+    alert() {},
+    confirm() { return false; },
+    prompt() { return null; },
+    open() { return null; },
+    close() {},
+    getSelection: () => ({ rangeCount: 0, removeAllRanges() {}, addRange() {} }),
+    Image: class { constructor() { this.onload = null; this.onerror = null; this.src = ''; this.width = 0; this.height = 0; } },
+    HTMLElement: class {},
+    CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init && init.detail; } },
+    Event: class { constructor(type) { this.type = type; } },
+    showOpenFilePicker: undefined,
+    showSaveFilePicker: undefined,
+    showDirectoryPicker: undefined,
+  };
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  sandbox.addEventListener = (type, fn) => { bag.domListeners.push({ id: 'window', type, fn }); };
+  sandbox.removeEventListener = () => {};
+  sandbox.dispatchEvent = () => true;
+  sandbox.attachEvent = undefined;
+
+  // createWritable recording on any element/file handle used later
+  sandbox.__swBag = bag;
+  sandbox.__swRecordCreateWritable = () => {
+    store.writes.push({ op: 'createWritable', key: 'createWritable', storage: 'fs' });
+    return {
+      write: async () => {},
+      close: async () => {},
+      abort: async () => {},
+    };
+  };
+
+  // Patch FileSystemFileHandle-like createWritable via a global used if code paths reach it.
+  // saveExportBlob / saveScreenshotFile call handle.createWritable — stub handles when show* is missing.
+  // They early-return for playlist via sspIsMainWindow.
+
+  let loadError = null;
+  try {
+    vm.runInNewContext(coreSrc, sandbox, { filename: 'slidex-core.js' });
+  } catch (e) {
+    loadError = e;
+  }
+  assert.ok(sandbox.SlideXCore, 'SlideXCore must load' + (loadError ? ': ' + loadError.message : ''));
+
+  for (let i = 0; i < scripts.length; i++) {
+    try {
+      vm.runInNewContext(scripts[i], sandbox, { filename: 'inline-' + (i + 1) + '.js' });
+    } catch (e) {
+      // Classic scripts hoist function decls onto the sandbox; a late throw is OK
+      // as long as the save* APIs we need exist. Record and continue.
+      bag.loadThrow = bag.loadThrow || [];
+      bag.loadThrow.push({ script: i + 1, message: e && e.message });
+    }
+  }
+
+  // Ensure role stuck as playlist through the real path.
+  if (role === 'playlist') {
+    try {
+      sandbox.__SSP_WINDOW_ROLE = 'playlist';
+      if (typeof sandbox.refreshWindowRoleFromTauri === 'function') sandbox.refreshWindowRoleFromTauri();
+    } catch (_) {}
+    assert.equal(sandbox.sspIsMainWindow(), false, 'playlist role must make sspIsMainWindow false');
+  } else {
+    assert.equal(sandbox.sspIsMainWindow(), true, 'main role must make sspIsMainWindow true');
+  }
+
+  // Init playlist window path.
+  try {
+    if (typeof sandbox.initPlaylistWindowSync === 'function') sandbox.initPlaylistWindowSync();
+  } catch (_) {}
+  try {
+    if (typeof sandbox.enterPlaylistWindowShell === 'function' && role === 'playlist') {
+      sandbox.enterPlaylistWindowShell();
+    }
+  } catch (_) {}
+
+  async function flushAsync() {
+    // Flush microtasks and pending timers a few rounds (not intervals forever).
+    for (let round = 0; round < 8; round++) {
+      await Promise.resolve();
+      await Promise.resolve();
+      const due = [...pendingTimers.entries()].filter(([, t]) => !t.interval);
+      for (const [id, t] of due) {
+        pendingTimers.delete(id);
+        try { t.fn(); } catch (_) {}
+      }
+      await Promise.resolve();
+    }
+  }
+
+  // Direct save* calls (Pia's list).
+  const directCalls = [];
+  function callDirect(name, fn) {
+    directCalls.push(name);
+    try { return fn(); } catch (e) { bag.directErrors = bag.directErrors || []; bag.directErrors.push({ name, message: e && e.message }); }
+  }
+
+  return (async () => {
+    await flushAsync();
+
+    callDirect('saveKeyMap', () => sandbox.saveKeyMap && sandbox.saveKeyMap());
+    callDirect('persistVideoSkipSec', () => sandbox.persistVideoSkipSec && sandbox.persistVideoSkipSec(7));
+    callDirect('persistImageUpdatesSource', () => sandbox.persistImageUpdatesSource && sandbox.persistImageUpdatesSource({ v: 1 }));
+    callDirect('saveItemLS', () => sandbox.saveItemLS && sandbox.saveItemLS({ id: 't1', name: 't1.jpg', type: 'image', customDur: 5000 }));
+    callDirect('saveSessionBeforeExit', () => sandbox.saveSessionBeforeExit && sandbox.saveSessionBeforeExit(null));
+    callDirect('forgetEmptiedSession', () => sandbox.forgetEmptiedSession && sandbox.forgetEmptiedSession());
+    callDirect('removePlaylistFiles', () => {
+      if (!sandbox.removePlaylistFiles) return;
+      // Seed a tiny playlist so the helper has something to match.
+      try {
+        sandbox.items = [{ id: 't1', name: 't1.jpg', type: 'image', path: '/t/t1.jpg' }];
+        sandbox.cur = 0;
+        sandbox.selectedItems = sandbox.selectedItems || new Set();
+      } catch (_) {}
+      return sandbox.removePlaylistFiles(['t1.jpg'], true, false);
+    });
+    callDirect('soundtrack save', () => sandbox.__sspTestSoundtrackSave && sandbox.__sspTestSoundtrackSave());
+    callDirect('saveMetaIDB', () => sandbox.saveMetaIDB && sandbox.saveMetaIDB('k', 1));
+    callDirect('saveHandleIDB', () => sandbox.saveHandleIDB && sandbox.saveHandleIDB('h', {}));
+    callDirect('saveScreenshotFile', () => sandbox.saveScreenshotFile && sandbox.saveScreenshotFile('x.png', new Blob(['x'])));
+    callDirect('saveExportBlob', () => sandbox.saveExportBlob && sandbox.saveExportBlob('x.jpg', new Blob(['x'])));
+
+    await flushAsync();
+
+    // Fire every recorded on* and addEventListener handler.
+    let handlersRun = 0;
+    let handlersFailed = 0;
+    const allHandlers = [];
+    for (const h of bag.onHandlers) allHandlers.push({ kind: 'on', ...h, run: h.fn });
+    for (const h of bag.domListeners) allHandlers.push({ kind: 'addEventListener', id: h.id, prop: 'on' + h.type, run: h.fn });
+    // Also fire common element onchange/onclick if set but somehow missed
+    for (const [id, node] of elements) {
+      for (const prop of ['onclick', 'onchange', 'oninput', 'onkeydown', 'onkeyup']) {
+        if (typeof node[prop] === 'function' && !allHandlers.some(h => h.id === id && h.prop === prop)) {
+          allHandlers.push({ kind: 'on-direct', id, prop, run: node[prop] });
+        }
+      }
+    }
+
+    for (const h of allHandlers) {
+      try {
+        const target = elements.get(h.id) || el(h.id || 'unknown');
+        const ret = h.run.call(target, swFakeEvent(target));
+        if (ret && typeof ret.then === 'function') {
+          try { await ret; } catch (_) { handlersFailed++; }
+        }
+        handlersRun++;
+      } catch (_) {
+        handlersFailed++;
+        handlersRun++; // attempted
+      }
+    }
+
+    await flushAsync();
+
+    // Cancel leftover intervals so the process can exit cleanly.
+    for (const [id] of pendingTimers) pendingTimers.delete(id);
+
+    const keys = store.writes.filter(w => w.op === 'setItem' || w.op === 'removeItem' || w.op === 'prop-set' || w.op === 'clear' || w.op === 'idb-open' || w.op === 'idb-put' || w.op === 'createWritable' || w.op === 'fs').map(w => w.key);
+
+    return {
+      writes: store.writes.slice(),
+      keys,
+      handlersRun,
+      handlersFailed,
+      handlerTotal: allHandlers.length,
+      directCalls,
+      loadThrow: bag.loadThrow || [],
+      sspIsMain: typeof sandbox.sspIsMainWindow === 'function' ? sandbox.sspIsMainWindow() : null,
+      hasSaveKeyMap: typeof sandbox.saveKeyMap === 'function',
+      hasSaveItemLS: typeof sandbox.saveItemLS === 'function',
+    };
+  })();
+}
+
+function swInjectRuntimeFixture(html, code) {
+  // Append a trailing classic script so the fixture runs even if an earlier statement
+  // in the main inline script throws on a stub gap.
+  const tag = '<script>\n' + code + '\n</script>';
+  const body = html.lastIndexOf('</body>');
+  if (body !== -1) return html.slice(0, body) + tag + html.slice(body);
+  return html + tag;
+}
+
+function swInjectAfterSaveMetaIDB(html, code) {
+
+  const start = html.indexOf('async function saveMetaIDB');
+  assert.ok(start !== -1);
+  const enc = swEnclosingFn(html, start + 10);
+  assert.ok(enc);
+  return html.slice(0, enc.end) + code + html.slice(enc.end);
+}
+
+test('runtime: second window records no persisted writes; main records expected keys', async () => {
+  const html = swNoWriteHtml();
+  swSpanCache.clear();
+  swBlankCacheByStr.clear();
+
+  const child = await swRuntimeRun(html, 'playlist');
+  assert.ok(child.hasSaveKeyMap, 'saveKeyMap must exist after script load');
+  assert.ok(child.hasSaveItemLS, 'saveItemLS must exist after script load');
+  assert.equal(child.sspIsMain, false);
+  assert.ok(child.handlersRun >= SW_RUNTIME_HANDLER_FLOOR,
+    `too few handlers ran as playlist (${child.handlersRun} < ${SW_RUNTIME_HANDLER_FLOOR}); stub gaps may be hiding writes`);
+  assert.deepEqual(
+    child.writes,
+    [],
+    'second window wrote: ' + JSON.stringify(child.writes.slice(0, 20))
+  );
+
+  const main = await swRuntimeRun(html, 'main');
+  assert.equal(main.sspIsMain, true);
+  assert.ok(main.handlersRun >= SW_RUNTIME_HANDLER_FLOOR,
+    `too few handlers ran as main (${main.handlersRun} < ${SW_RUNTIME_HANDLER_FLOOR})`);
+  const mainKeys = [...new Set(main.writes.filter(w => w.op === 'setItem' || w.op === 'removeItem').map(w => w.key))].sort();
+  // Expected keys from the direct save* calls (and any init that legitimately saves on main).
+  for (const key of ['ssp_keymap', 'ssp_video_skip_sec', 'ssp_image_updates', 'sspSoundtrackV1']) {
+    assert.ok(mainKeys.includes(key) || main.writes.some(w => w.key === key), 'main should record ' + key + '; got ' + mainKeys.join(','));
+  }
+  // At least one of session / item / default-dur writes
+  assert.ok(
+    main.writes.some(w => w.key === 'ssp_autosave' || w.key === 'ssp_default_dur' || String(w.key).startsWith('ssp|')),
+    'main should record session/default-dur/item keys'
+  );
+
+  // Expose counts for the report via assert messages / stored on globalThis for the agent.
+  globalThis.__swRuntimeReport = {
+    childHandlersRun: child.handlersRun,
+    mainHandlersRun: main.handlersRun,
+    childHandlerTotal: child.handlerTotal,
+    mainHandlerTotal: main.handlerTotal,
+    mainKeys,
+    mainWriteOps: main.writes.map(w => w.op + ':' + w.key).slice(0, 40),
+    childWrites: child.writes.length,
+    handlerFloor: SW_RUNTIME_HANDLER_FLOOR,
+  };
+});
+
+test('runtime fixtures: hoisted helper and i++ / 2 shapes write as second window', async () => {
+  const html0 = swNoWriteHtml();
+
+  // 1. Honest shape: hoisted helper registered before the guard / declared after it.
+  // Lexical scan can miss this; runtime must catch the write when the listener fires.
+  const hoistedSafe = swInjectRuntimeFixture(html0, `
+document.addEventListener('change', onSkip);
+if (!sspIsMainWindow()) { /* register already happened */ }
+function onSkip(){ localStorage.setItem('fixture_hoisted', 'v'); }
+`);
+  const r1 = await swRuntimeRun(hoistedSafe, 'playlist');
+  assert.ok(
+    r1.writes.some(w => w.key === 'fixture_hoisted'),
+    'hoisted helper fixture must be caught at runtime; writes=' + JSON.stringify(r1.writes)
+  );
+
+  // 2. Honest shape: i++ / 2 on the same line as a write (old blanker treated / as regex).
+  const divslash = swInjectRuntimeFixture(html0, `
+document.addEventListener('change', () => { let i = 0; i++ / 2; localStorage.setItem('fixture_divslash', 'v'); });
+`);
+  const r2 = await swRuntimeRun(divslash, 'playlist');
+  assert.ok(
+    r2.writes.some(w => w.key === 'fixture_divslash'),
+    'i++ / 2 fixture must be caught at runtime; writes=' + JSON.stringify(r2.writes)
+  );
+});
+
+test('runtime mutation: removing a guard makes the second window record a write; main still writes', async () => {
+  const html0 = swNoWriteHtml();
+  const start = html0.indexOf('function saveKeyMap()');
+  assert.ok(start !== -1);
+  const guardedSnippet = html0.slice(start, start + 320);
+  assert.match(guardedSnippet, /if \(sspIsMainWindow\(\)\)/);
+  const html = html0.slice(0, start) + html0.slice(start).replace(
+    /function saveKeyMap\(\) \{\s*\/\/[^\n]*\n\s*if \(sspIsMainWindow\(\)\) \{\s*try \{ localStorage\.setItem\(KEYMAP_LS, JSON\.stringify\(keyMap\)\); \} catch \(_\) \{\}\s*\}\s*if \(typeof refreshMoreToolsTooltip === 'function'\) refreshMoreToolsTooltip\(\);\s*\}/,
+    `function saveKeyMap() {
+  try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}
+  if (typeof refreshMoreToolsTooltip === 'function') refreshMoreToolsTooltip();
+}`,
+    1
+  );
+  assert.doesNotMatch(html.slice(start, start + 220), /if \(sspIsMainWindow\(\)\)/);
+
+  const child = await swRuntimeRun(html, 'playlist');
+  assert.ok(
+    child.writes.some(w => w.key === 'ssp_keymap'),
+    'unguarded saveKeyMap must write as playlist; writes=' + JSON.stringify(child.writes.slice(0, 15))
+  );
+
+  const main = await swRuntimeRun(html0, 'main');
+  assert.ok(main.writes.some(w => w.key === 'ssp_keymap'), 'main control must still record ssp_keymap');
+  assert.ok(main.handlersRun >= SW_RUNTIME_HANDLER_FLOOR, 'main control handler floor');
 });
 
 
