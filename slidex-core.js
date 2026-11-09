@@ -1189,18 +1189,42 @@
   }
 
   /*
-   * Overlay saved keys on defaults. If More tools would share its key with
-   * another action, leave More tools unbound. An explicit saved '' stays unbound.
+   * Overlay saved keys on defaults. A saved key always wins: when a default
+   * (for example a command added after the user saved their map) uses a key
+   * the user saved for another command, the user keeps the key and the
+   * default command is left unbound, so no key is shared and the first match
+   * in the list never wins silently. If More tools would still share its key
+   * with another action, leave More tools unbound. An explicit saved '' stays
+   * unbound. Returns { map, unbound: [{ id, key, keptBy }] }.
    */
-  function resolveKeyMap(actions, saved) {
+  function resolveKeyMapReport(actions, saved) {
     var map = {};
+    var fromSaved = {};
     var list = actions || [];
-    list.forEach(function (a) { map[a.id] = a.def; });
-    if (saved && typeof saved === 'object') {
-      list.forEach(function (a) {
-        if (typeof saved[a.id] === 'string') map[a.id] = saved[a.id];
-      });
-    }
+    var hasSaved = !!(saved && typeof saved === 'object');
+    list.forEach(function (a) {
+      if (hasSaved && typeof saved[a.id] === 'string') {
+        map[a.id] = saved[a.id];
+        fromSaved[a.id] = true;
+      } else {
+        map[a.id] = a.def;
+      }
+    });
+    var savedOwner = Object.create(null);
+    list.forEach(function (a) {
+      var k = map[a.id];
+      if (fromSaved[a.id] && k && savedOwner[k] == null) savedOwner[k] = a.id;
+    });
+    var unbound = [];
+    list.forEach(function (a) {
+      var k = map[a.id];
+      if (fromSaved[a.id] || !k) return;
+      var owner = savedOwner[k];
+      if (owner != null && owner !== a.id) {
+        map[a.id] = '';
+        unbound.push({ id: a.id, key: k, keptBy: owner });
+      }
+    });
     var key = map.moreTools;
     if (key) {
       var clash = list.some(function (a) {
@@ -1208,7 +1232,29 @@
       });
       if (clash) map.moreTools = '';
     }
-    return map;
+    return { map: map, unbound: unbound };
+  }
+
+  function resolveKeyMap(actions, saved) {
+    return resolveKeyMapReport(actions, saved).map;
+  }
+
+  /* Keys used by more than one action's defaults (primary or co-default). Empty means none. */
+  function duplicateDefaultKeys(actions) {
+    var seen = Object.create(null);
+    var dup = [];
+    (actions || []).forEach(function (a) {
+      var keys = [a.def].concat(Array.isArray(a.coDefs) ? a.coDefs : []);
+      keys.forEach(function (k) {
+        if (k == null || k === '') return;
+        if (seen[k] != null && seen[k] !== a.id) {
+          if (dup.indexOf(k) === -1) dup.push(k);
+        } else {
+          seen[k] = a.id;
+        }
+      });
+    });
+    return dup;
   }
 
   function sessionItemCount(session) {
@@ -2189,6 +2235,8 @@
     toolMatches: toolMatches,
     nextMoreToolsOpen: nextMoreToolsOpen,
     resolveKeyMap: resolveKeyMap,
+    resolveKeyMapReport: resolveKeyMapReport,
+    duplicateDefaultKeys: duplicateDefaultKeys,
     sessionItemCount: sessionItemCount,
     shouldSaveSessionOnClose: shouldSaveSessionOnClose,
     saveBeforeExitThenAck: saveBeforeExitThenAck,
