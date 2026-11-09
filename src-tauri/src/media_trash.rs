@@ -135,17 +135,41 @@ fn file_label(path: &str) -> String {
         .to_string()
 }
 
+/// A `subst` letter points at `\??\X:\folder` (local) or `\??\UNC\server\share`.
+fn device_target_is_subst_local(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase().replace('/', "\\");
+    let Some(rest) = lower.strip_prefix(r"\??\") else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// A drive Windows maps to a share (`net use`) resolves through the redirector,
+/// not a `subst` UNC target.
+fn device_target_is_redirector(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase().replace('/', "\\");
+    lower.contains(r"\device\mup") || lower.contains("lanmanredirector")
+}
+
 fn drive_refuse_message(path: &str, facts: &DriveFacts) -> String {
     let name = file_label(path);
+    if facts.drive_type == DRIVE_REMOTE || device_target_is_redirector(&facts.device_target) {
+        return format!(
+            "Couldn't move {name} to the Recycle Bin. It's on a network drive, which has no Recycle Bin. Nothing was deleted."
+        );
+    }
     if device_target_is_network(&facts.device_target) {
         return format!(
             "Couldn't move {name} to the Recycle Bin. The drive is a substitute for a network share, which has no Recycle Bin. Nothing was deleted."
         );
     }
+    if device_target_is_subst_local(&facts.device_target) {
+        return format!(
+            "Couldn't move {name} to the Recycle Bin. Its drive letter was made with subst, which has no Recycle Bin. Open the file from its real folder to recycle it. Nothing was deleted."
+        );
+    }
     match facts.drive_type {
-        DRIVE_REMOTE => format!(
-            "Couldn't move {name} to the Recycle Bin. It's on a network drive, which has no Recycle Bin. Nothing was deleted."
-        ),
         DRIVE_REMOVABLE => format!(
             "Couldn't move {name} to the Recycle Bin. It's on a removable drive, which has no Recycle Bin. Nothing was deleted."
         ),
@@ -313,7 +337,7 @@ mod windows_bin {
     use windows::{
         core::{implement, HRESULT, PCWSTR},
         Win32::{
-            Foundation::{E_ABORT, RPC_E_CHANGED_MODE, S_OK},
+            Foundation::{E_ABORT, RPC_E_CHANGED_MODE},
             Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW, QueryDosDeviceW},
             System::Com::{
                 CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
@@ -536,7 +560,9 @@ mod windows_bin {
                 pfo.GetAnyOperationsAborted().map_err(|err| err.to_string())
             }
         })();
-        if hr == S_OK {
+        // S_OK and S_FALSE (already initialized here) both need a matching
+        // CoUninitialize. RPC_E_CHANGED_MODE did not add a reference.
+        if hr.is_ok() {
             unsafe { CoUninitialize() };
         }
         let outcome = outcome?;
@@ -651,6 +677,41 @@ mod tests {
         );
         assert!(subst.message.contains("network share"), "{}", subst.message);
         assert!(subst.moved.is_empty());
+
+        // `net use Z:` reports DRIVE_REMOTE and a redirector target. That is a
+        // network drive, not a substitute.
+        let net_use = trash_user_media_with(
+            &[r"Z:\Media\clip.mp4".to_string()],
+            |_path| DriveFacts {
+                drive_type: DRIVE_REMOTE,
+                device_target: r"\Device\LanmanRedirector\;Z:0000000000012345\localhost\Users".into(),
+            },
+            |_| panic!("mapped drive must not be deleted"),
+        );
+        assert!(net_use.message.contains("It's on a network drive"), "{}", net_use.message);
+        assert!(!net_use.message.contains("substitute"), "{}", net_use.message);
+
+        // `subst X: C:\Photos` is refused (fail closed) with the real reason.
+        let subst_local = trash_user_media_with(
+            &[r"X:\photo.jpg".to_string()],
+            |_path| DriveFacts {
+                drive_type: DRIVE_NO_ROOT_DIR,
+                device_target: r"\??\C:\Photos".into(),
+            },
+            |_| panic!("subst drive must not be deleted"),
+        );
+        assert!(subst_local.message.contains("subst"), "{}", subst_local.message);
+        assert!(!subst_local.message.contains("not on a fixed drive"), "{}", subst_local.message);
+        assert!(subst_local.message.contains("Nothing was deleted"), "{}", subst_local.message);
+        assert!(subst_local.moved.is_empty());
+    }
+
+    #[test]
+    fn com_is_released_for_s_ok_and_s_false() {
+        let src = include_str!("media_trash.rs").replace("\r\n", "\n");
+        let at = src.find("unsafe { CoUninitialize() }").expect("CoUninitialize call");
+        let guard = src[..at].rfind("if hr").expect("guard");
+        assert!(src[guard..at].starts_with("if hr.is_ok()"), "{}", &src[guard..at]);
     }
 
     #[test]

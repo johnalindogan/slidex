@@ -1053,7 +1053,7 @@ fn read_text_file(path: String, allowed: State<'_, AllowedMedia>) -> Result<Stri
 }
 
 
-/// 0.1.18 keeps the second window off. The JS flag hides the button; this
+/// 0.1.19 keeps the second window off. The JS flag hides the button; this
 /// command is the gate that nothing else can skip.
 const UNDOCK_MAIN_WINDOW: bool = false;
 
@@ -1061,7 +1061,7 @@ pub fn undock_blocked_reason() -> Option<&'static str> {
     if UNDOCK_MAIN_WINDOW {
         None
     } else {
-        Some("Undock is off in 0.1.18")
+        Some("Undock is off in 0.1.19")
     }
 }
 
@@ -1130,12 +1130,15 @@ fn focus_playlist_window(app: AppHandle) -> Result<(), String> {
 }
 
 
-#[tauri::command]
+/// `async` so the mDNS scan (up to 8 s) runs off the main thread and the window
+/// keeps answering while the Cast panel looks for a TV.
+#[tauri::command(async)]
 fn cast_discover(timeout_ms: Option<u64>) -> Result<cast::CastDiscoverResult, String> {
     cast::discover_devices(timeout_ms)
 }
 
-#[tauri::command]
+/// `async`: reads the adapters on a worker thread, never the main thread.
+#[tauri::command(async)]
 fn cast_network_fingerprint() -> Result<String, String> {
     Ok(cast::network_fingerprint())
 }
@@ -1219,7 +1222,8 @@ fn cast_status(state: State<'_, cast::CastState>) -> Result<cast::CastLiveStatus
     Ok(state.status())
 }
 
-#[tauri::command]
+/// `async` because the firewall check runs PowerShell and must not block the UI.
+#[tauri::command(async)]
 fn cast_firewall_status() -> Result<cast::CastFirewallStatus, String> {
     Ok(cast::firewall_status())
 }

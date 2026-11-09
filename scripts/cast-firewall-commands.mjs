@@ -806,6 +806,33 @@ if (process.platform === 'win32') {
   assertFixture('wrong program', runFixture(sysDir, apostrophe, ruleRecord('C:\\Other\\slideshowpro.exe', 'Private', 'LocalSubnet')), 'status=nomatch');
   assertFixture('public only', runFixture(sysDir, apostrophe, ruleRecord(apostrophe, 'Public', 'LocalSubnet')), 'status=nomatch');
   assertFixture('missing localsubnet', runFixture(sysDir, apostrophe, ruleRecord(apostrophe, 'Private', 'Any')), 'status=nomatch');
+  // The rule pair the Windows "Allow access" prompt creates: any port, any remote.
+  const promptRule = (program, action, profile = 'Private, Public') => ['TCP', 'UDP'].map((protocol) => ({
+    name: 'slideshowpro.exe',
+    enabled: true,
+    direction: 'Inbound',
+    action,
+    profile,
+    program,
+    remote: 'Any',
+    protocol,
+    localport: 'Any',
+  }));
+  const appOnly = runFixture(sysDir, apostrophe, promptRule(apostrophe, 'Allow'));
+  assertFixture('windows prompt rule', appOnly, 'status=nomatch');
+  assertFixture('windows prompt rule', appOnly, 'app_rule=allow');
+  const named = runFixture(sysDir, apostrophe, ruleRecord(apostrophe, 'Private', 'LocalSubnet'));
+  if (named.includes('app_rule=')) fail(`named match must not print app_rule:\n${named}`);
+  for (const [label, records] of [
+    ['prompt rule for another exe', promptRule('C:\\Other\\slideshowpro.exe', 'Allow')],
+    ['prompt rule public only', promptRule(apostrophe, 'Allow', 'Public')],
+    ['prompt allow plus block', [...promptRule(apostrophe, 'Allow'), ...promptRule(apostrophe, 'Block')]],
+    ['prompt rule tcp only', promptRule(apostrophe, 'Allow').slice(0, 1)],
+  ]) {
+    const text = runFixture(sysDir, apostrophe, records);
+    assertFixture(label, text, 'status=nomatch');
+    if (text.includes('app_rule=allow')) fail(`${label}: must not report app_rule=allow\n${text}`);
+  }
   console.log('CAST_FIREWALL_PS1_FIXTURES=ok');
 }
 

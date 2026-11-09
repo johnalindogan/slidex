@@ -1215,6 +1215,17 @@
     return !!(o.loaded || o.dirty);
   }
 
+  /**
+   * The user removed or recycled the last item. The saved session still lists
+   * it, so the welcome screen would offer "Continue · 1 file" for a file that is
+   * gone. Forget that session. Returns true when it was cleared.
+   */
+  function forgetEmptiedSession(storage, remainingCount) {
+    if ((remainingCount | 0) > 0) return false;
+    try { storage.removeItem('ssp_autosave'); } catch (e) { return false; }
+    return true;
+  }
+
   function saveBeforeExitThenAck(storage, durationMs, session, ack, opts) {
     storage.setItem('ssp_default_dur', String(durationMs));
     var write = true;
@@ -1491,7 +1502,7 @@
   }
 
   var CAST_CONNECT_TIMEOUT_MS = 15000;
-  /** 0.1.18 keeps Undock off. The second window is rebuilt in 0.2.0. */
+  /** 0.1.19 keeps Undock off. The second window is rebuilt in 0.2.0. */
   var UNDOCK_MAIN_WINDOW = false;
 
   function castFailureMessage(tv) {
@@ -1672,14 +1683,28 @@
     return slash.indexOf('\\unc\\') >= 0 || slash.indexOf('\\device\\mup') >= 0 || slash.indexOf('lanmanredirector') >= 0 || slash.indexOf('\\\\') === 0;
   }
 
+  // `net use` letters resolve through the redirector; `subst` letters point at \??\.
+  function deviceTargetIsRedirector(target) {
+    var lower = String(target || '').toLowerCase().replace(/\//g, '\\');
+    return lower.indexOf('\\device\\mup') >= 0 || lower.indexOf('lanmanredirector') >= 0;
+  }
+  function deviceTargetIsSubstLocal(target) {
+    var lower = String(target || '').trim().toLowerCase().replace(/\//g, '\\');
+    return /^\\\?\?\\[a-z]:/.test(lower);
+  }
+
   function driveRefuseMessage(file) {
     var name = (file && file.name) || 'this file';
-    if (file && deviceTargetIsNetwork(file.deviceTarget)) {
+    var kind = file && file.driveType;
+    var target = file && file.deviceTarget;
+    if (kind === DRIVE_REMOTE || deviceTargetIsRedirector(target)) {
+      return "Couldn't move " + name + " to the Recycle Bin. It's on a network drive, which has no Recycle Bin. Nothing was deleted.";
+    }
+    if (file && deviceTargetIsNetwork(target)) {
       return "Couldn't move " + name + " to the Recycle Bin. The drive is a substitute for a network share, which has no Recycle Bin. Nothing was deleted.";
     }
-    var kind = file && file.driveType;
-    if (kind === DRIVE_REMOTE) {
-      return "Couldn't move " + name + " to the Recycle Bin. It's on a network drive, which has no Recycle Bin. Nothing was deleted.";
+    if (kind != null && kind !== DRIVE_FIXED && deviceTargetIsSubstLocal(target)) {
+      return "Couldn't move " + name + " to the Recycle Bin. Its drive letter was made with subst, which has no Recycle Bin. Open the file from its real folder to recycle it. Nothing was deleted.";
     }
     if (kind === DRIVE_REMOVABLE) {
       return "Couldn't move " + name + " to the Recycle Bin. It's on a removable drive, which has no Recycle Bin. Nothing was deleted.";
@@ -2122,6 +2147,7 @@
     sessionItemCount: sessionItemCount,
     shouldSaveSessionOnClose: shouldSaveSessionOnClose,
     saveBeforeExitThenAck: saveBeforeExitThenAck,
+    forgetEmptiedSession: forgetEmptiedSession,
     missingFilesNotice: missingFilesNotice,
     confirmMeansYes: confirmMeansYes,
     resetShortcutsIfConfirmed: resetShortcutsIfConfirmed,
