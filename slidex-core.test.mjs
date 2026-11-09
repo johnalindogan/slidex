@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 
-const context = { console, Uint8Array, Date, Object, Math, String, Number, Array };
+const context = { console, Uint8Array, Float32Array, Float64Array, Date, Object, Math, String, Number, Array };
 context.globalThis = context;
 vm.runInNewContext(fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8'), context);
 const C = context.SlideXCore;
@@ -587,6 +587,7 @@ test('the cast timer skips unsupported files without another photo wait', () => 
     isV() { return false; },
     nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
     getEDur() { return 10000; },
+    slideMs() { return sandbox.getEDur(); },
     setTimeout(fn, ms) { const id = seq++; timers.push({ id, fn, ms }); return id; },
     clearTimeout() {},
     goTo(i, source) { visits.push({ i, source }); sandbox.cur = i; },
@@ -2359,4 +2360,499 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
+
+test('removing a song above the playing one keeps it playing', () => {
+  assert.equal(C.loadedIndexAfterRemove(0, 2), 1);
+  assert.equal(C.loadedIndexAfterRemove(2, 2), -1);
+  assert.equal(C.loadedIndexAfterRemove(3, 2), 2);
+  assert.equal(C.loadedIndexAfterRemove(0, -1), -1);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const rm = html.slice(html.indexOf('function removeAt(i)'), html.indexOf('function addEntries('));
+  assert.match(rm, /loadedIdx = C\.loadedIndexAfterRemove\(i, loadedIdx\)/);
+  assert.doesNotMatch(rm, /i < loadedIdx\) \{ audio\.pause/);
+});
+
+function clickTrack(bpm, offset, secs, { sr = 22050, noise = 0.05, accentBeat = 0 } = {}) {
+  const x = new Float32Array(Math.round(secs * sr));
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5);
+  for (let i = 0; i < x.length; i++) x[i] = noise * rnd();
+  const p = 60 / bpm;
+  for (let k = 0; offset + k * p < secs; k++) {
+    const a = k % 4 === accentBeat ? 1 : 0.55;
+    const s0 = Math.round((offset + k * p) * sr);
+    for (let j = 0; j < 400 && s0 + j < x.length; j++) x[s0 + j] += a * Math.exp(-j / 80) * Math.sin(j * 0.3);
+  }
+  return x;
+}
+
+test('beat analysis finds tempo, first beat and downbeat of a click track', () => {
+  for (const [bpm, off] of [[120, 0.25], [90, 0.1], [128, 0.4], [174, 0.05]]) {
+    const r = C.analyzeBeats(clickTrack(bpm, off, 40), 22050);
+    assert.equal(r.ok, true, `${bpm}`);
+    const m = C.tempoMatch(r.grid.bpm, bpm, 0.5);
+    assert.ok(m > 0, `${bpm} got ${r.grid.bpm}`);
+    // The first beat lands on a true beat (half tempo keeps every other beat).
+    const truePeriod = 60 / bpm * (m === 2 ? 0.5 : 1);
+    const phase = ((r.grid.offset - off) % truePeriod + truePeriod) % truePeriod;
+    assert.ok(Math.min(phase, truePeriod - phase) < 0.03, `${bpm} offset ${r.grid.offset}`);
+    assert.equal(r.grid.beatsPerBar, 4);
+  }
+  const shifted = C.analyzeBeats(clickTrack(120, 0.25, 40, { accentBeat: 2 }), 22050);
+  assert.equal(shifted.grid.barPhase, 2);
+});
+
+test('beat analysis gives up cleanly on noise, silence and short clips', () => {
+  let seed = 7;
+  const noise = new Float32Array(30 * 22050).map(() => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5));
+  assert.equal(C.analyzeBeats(noise, 22050).reason, 'tempo-unclear');
+  assert.equal(C.analyzeBeats(new Float32Array(30 * 22050), 22050).ok, false);
+  assert.equal(C.analyzeBeats(clickTrack(120, 0, 5), 22050).reason, 'too-short');
+  assert.equal(C.analyzeBeats(null, 22050).reason, 'no-audio');
+  const mono = C.mixToMono([Float32Array.from([1, 0]), Float32Array.from([0, 1])]);
+  assert.deepEqual([...mono], [0.5, 0.5]);
+});
+
+test('beat grid lists and snaps to beats and bars', () => {
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0.25, beatsPerBar: 4, barPhase: 1, duration: 60 });
+  assert.equal(grid.period, 0.5);
+  assert.deepEqual([...C.gridTimes(grid, 0, 1.5, 'beat')], [0.25, 0.75, 1.25]);
+  assert.deepEqual([...C.gridTimes(grid, 0, 5, 'bar')], [0.75, 2.75, 4.75]);
+  assert.equal(C.snapToGrid(grid, 1.1, 'beat'), 1.25);
+  assert.equal(C.snapToGrid(grid, 3.9, 'bar'), 4.75);
+  assert.equal(C.snapToGrid(grid, 3.7, 'bar'), 2.75);
+  assert.equal(C.buildBeatGrid({ bpm: 0 }), null);
+  assert.equal(C.buildBeatGrid({ bpm: 120, offset: 1.3 }).offset.toFixed(2), '0.30');
+});
+
+test('beat sync keeps slide times near the setting and falls back off the grid', () => {
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0.25, beatsPerBar: 4, barPhase: 0, duration: 60 });
+  // 5 s slide from 10.1 s: target 15.1 → nearest beat 15.25.
+  assert.equal(C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 5000, unit: 'beat' }), 5150);
+  // nearest bar to 15.1 is 14.25 (bars at 0.25 + 2k).
+  assert.equal(C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 5000, unit: 'bar' }), 4150);
+  // Never under half the setting: 600 ms slide can't snap to a beat 50 ms away.
+  const short = C.beatSyncDelayMs({ grid, now: 0.2, targetMs: 600, unit: 'beat' });
+  assert.ok(short >= 300 && short <= 1100, `${short}`);
+  // Bars far longer than a short slide fall back to beats.
+  assert.equal(C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 1000, unit: 'bar' }),
+    C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 1000, unit: 'beat' }));
+  // Past the end of the song, or no grid: the user's time unchanged.
+  assert.equal(C.beatSyncDelayMs({ grid, now: 58, targetMs: 5000, unit: 'beat' }), 5000);
+  assert.equal(C.beatSyncDelayMs({ grid: null, now: 10, targetMs: 5000, unit: 'beat' }), 5000);
+  assert.equal(C.beatSyncDelayMs({ grid, now: NaN, targetMs: 5000, unit: 'beat' }), 5000);
+  assert.equal(C.nextBeatSyncMode('off'), 'beat');
+  assert.equal(C.nextBeatSyncMode('beat'), 'bar');
+  assert.equal(C.nextBeatSyncMode('bar'), 'off');
+});
+
+test('beat sync is wired into the slide timer, off by default, PC only', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.match(sched, /const ms = slideMs\(cur\);/);
+  assert.match(html, /var beatMode = 'off';/);
+  assert.match(html, /id="musicBeat"/);
+  const snap = html.slice(html.indexOf('window.sspBeatSnapMs = function'), html.indexOf('window.sspBeatSnapMs = function') + 400);
+  assert.match(snap, /return C\.beatSnapDelay\(\{\s*mode: beatMode, audioPaused: audio\.paused, casting: !!window\.__sspCastActive,\s*grid: currentGrid\(\), now: audio\.currentTime, targetMs: ms, offsetMs: syncOffsetMs\s*\}\)/);
+  assert.match(html, /new Offline\(1, 1, 22050\)/);
+});
+
+test('progress bar and Ken Burns use the same beat-snapped slide length as the timer', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const fn = html.slice(html.indexOf('function slideMs(i)'), html.indexOf('/* ── Zoom / Pan ── */'));
+  assert.match(fn, /if \(idx !== cur \|\| typeof window\.sspBeatSnapMs !== 'function'\) return base;/);
+  assert.match(fn, /const ms = window\.sspBeatSnapMs\(base\);/);
+  assert.match(fn, /Promise\.resolve\(\)\.then\(\(\) => \{ slideMsMemo = null; \}\)/);
+  const prog = html.slice(html.indexOf('function startProg()'), html.indexOf('function startVProg('));
+  assert.match(prog, /const dur = slideMs\(cur\);/);
+  assert.doesNotMatch(prog, /getEDur/);
+  const kb = html.slice(html.indexOf('function startKB(i)'), html.indexOf('function startProg()'));
+  assert.ok((kb.match(/const dur = slideMs\(i\);/g) || []).length >= 2);
+  assert.doesNotMatch(kb, /getEDur/);
+  const comp = html.slice(html.indexOf('function startCompKB(i)'), html.indexOf('function startCompKB(i)') + 600);
+  assert.match(comp, /const dur = slideMs\(i\);/);
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.doesNotMatch(sched, /getEDur|sspBeatSnapMs/);
+  // Only the timer, Ken Burns and the progress bar ask for the slide length; cast keeps getEDur.
+  assert.equal((html.match(/window\.sspBeatSnapMs\(/g) || []).length, 1);
+});
+
+test('tempo half or double counts as a match', () => {
+  assert.equal(C.tempoMatch(120.2, 120, 0.5), 1);
+  assert.equal(C.tempoMatch(60.1, 120, 0.5), 0.5);
+  assert.equal(C.tempoMatch(240.5, 120, 0.5), 2);
+  assert.equal(C.tempoMatch(100, 120, 0.5), 0);
+  assert.equal(C.tempoMatch(0, 120), 0);
+});
+
+test('5-minute synced song: no drift, every change within 50 ms of a beat', () => {
+  const bpm = 123.4, off = 0.37, secs = 300;
+  const r = C.analyzeBeats(clickTrack(bpm, off, secs), 22050);
+  assert.equal(r.ok, true);
+  const m = C.tempoMatch(r.grid.bpm, bpm, 0.5);
+  assert.ok(m > 0, `tempo ${r.grid.bpm}`);
+  const truePeriod = 60 / bpm * (m === 2 ? 0.5 : 1);
+  const errToBeat = (t) => { const ph = ((t - off) % truePeriod + truePeriod) % truePeriod; return Math.min(ph, truePeriod - ph); };
+  for (const unit of ['beat', 'bar']) {
+    for (const slide of [2000, 4000, 7000]) {
+      let now = 0.6, seed = 3, changes = 0, worst = 0;
+      while (true) {
+        const ms = C.beatSnapDelay({ mode: unit, audioPaused: false, casting: false, grid: r.grid, now, targetMs: slide });
+        if (now + ms / 1000 > secs - 1) break;
+        assert.ok(ms >= slide * 0.5 && ms <= slide * 1.5 + r.grid.period * 4000, `${unit} ${slide}: ${ms}`);
+        seed = (seed * 16807) % 2147483647;
+        const late = (seed % 16) / 1000; // setTimeout fires 0–15 ms late
+        now += ms / 1000 + late;
+        worst = Math.max(worst, errToBeat(now));
+        changes++;
+      }
+      assert.ok(changes > secs * 1000 / (slide * 1.6), `${unit} ${slide}: ${changes} changes`);
+      assert.ok(worst < 0.05, `${unit} ${slide}: worst ${Math.round(worst * 1000)} ms`);
+    }
+  }
+});
+
+test('beat sync off gives exactly the #46 slide times, and fallbacks never skip or double a slide', async () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const memo = html.slice(html.indexOf('let slideMsMemo = null;'), html.indexOf('/* ── Zoom / Pan ── */'));
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0.1, duration: 300 });
+  const state = { mode: 'off', audioPaused: false, casting: false, grid, now: 10 };
+  const timers = [], visits = [];
+  const sandbox = {
+    SlideXCore: C, cur: 0, playing: true, tmr: null, reversePlay: false,
+    items: Array.from({ length: 6 }, (_, i) => ({ name: `p${i}.jpg` })),
+    getMediaItems() { return sandbox.items; },
+    isV() { return false; },
+    nextMI() { return (sandbox.cur + 1) % sandbox.items.length; },
+    getEDur(i) { return 3000 + 500 * ((i ?? sandbox.cur) % 3); },
+    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
+    clearTimeout() {},
+    goTo(i, source) { visits.push(i); sandbox.cur = i; },
+    Promise,
+    window: {},
+  };
+  sandbox.window.SlideXCore = C;
+  vm.runInNewContext(memo + '\n' + sched, sandbox);
+  // #46 had no snap hook at all; "off" with the hook must match it.
+  sandbox.schedNext();
+  const noHook = timers[0].ms;
+  sandbox.window.sspBeatSnapMs = (ms) => C.beatSnapDelay({ ...state, targetMs: ms });
+  timers.length = 0;
+  sandbox.schedNext();
+  assert.equal(timers[0].ms, noHook);
+  assert.equal(timers[0].ms, sandbox.getEDur(0));
+  // Walk a show through on → paused → on → casting → unclear (no grid) → on.
+  const plan = [
+    ['beat', {}], ['off', {}], ['bar', {}], ['beat', { audioPaused: true }], ['beat', {}],
+    ['bar', { casting: true }], ['beat', { grid: null }], ['bar', {}], ['off', {}], ['beat', {}],
+  ];
+  timers.length = 0; visits.length = 0;
+  sandbox.cur = 0;
+  let expected = 0;
+  for (const [mode, extra] of plan) {
+    await new Promise((r) => setImmediate(r)); // each slide starts in its own timer task
+    Object.assign(state, { mode, audioPaused: false, casting: false, grid }, extra);
+    timers.length = 0;
+    sandbox.schedNext();
+    assert.equal(timers.length, 1, 'exactly one timer per slide');
+    const base = sandbox.getEDur(sandbox.cur);
+    const fallback = mode === 'off' || state.audioPaused || state.casting || !state.grid;
+    if (fallback) assert.equal(timers[0].ms, base, `${mode} ${JSON.stringify(extra)}`);
+    else assert.ok(timers[0].ms >= base * 0.5 && timers[0].ms <= base * 1.5 + 2000);
+    state.now += timers[0].ms / 1000;
+    const before = visits.length;
+    const fn = timers[0].fn;
+    timers.length = 0;
+    fn();
+    assert.equal(visits.length, before + 1, 'one slide change per timer');
+    expected = (expected + 1) % sandbox.items.length;
+    assert.equal(visits[visits.length - 1], expected, 'no skipped slide');
+    assert.equal(timers.length, 1, 'the next slide arms one timer');
+  }
+  // Songs over 12 minutes never get a grid, so they fall back like "tempo unclear".
+  assert.equal(C.BEAT_MAX_SECONDS, 720);
+  assert.equal(C.analyzeBeats(new Float32Array(1), 1 / 721).reason, 'too-long');
+  assert.match(html, /if \(ab\.duration > C\.BEAT_MAX_SECONDS\) \{\s*writeBeatCache\(cacheKey, \{ ok: false, reason: 'too-long' \}\);\s*finish\(\{ state: 'unclear', reason: 'too-long' \}\);\s*return;\s*\}/);
+});
+
+test('beat analysis never starts from the slide path and runs one song ahead', () => {
+  // Window: free when paused; while playing only after the transition with time to spare.
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: false }), true);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: 300, remainingMs: 4000, workMs: 500 }), false);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: 1000, remainingMs: 4000, workMs: 500 }), true);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: 1000, remainingMs: 700, workMs: 500 }), false);
+  assert.equal(C.analysisWindowOk({ slideshowPlaying: true, sinceSlideStartMs: NaN, remainingMs: 4000, workMs: 1 }), false);
+  assert.equal(C.analysisWorkMs(300), 950);
+  // Targets: current, then the next song; done songs are skipped.
+  const q = { ...C.queueAddTracks(C.createAudioQueue(), ['a.mp3', 'b.mp3', 'c.mp3']).queue, index: 2 };
+  assert.deepEqual([...C.beatAnalysisTargets(q, () => false)], ['c.mp3', 'a.mp3']);
+  assert.deepEqual([...C.beatAnalysisTargets({ ...q, repeat: 'off' }, () => false)], ['c.mp3', 'a.mp3']);
+  assert.deepEqual([...C.beatAnalysisTargets({ ...q, index: 0 }, (p) => p === 'a.mp3')], ['b.mp3']);
+  assert.deepEqual([...C.beatAnalysisTargets({ ...q, repeat: 'one', index: 1 }, () => false)], ['b.mp3', 'c.mp3']);
+  assert.equal(C.beatAnalysisTargets(C.createAudioQueue(), () => false).length, 0);
+  // Wiring.
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const between = (a, b) => html.slice(html.indexOf(a), html.indexOf(b, html.indexOf(a)));
+  for (const [name, body] of [
+    ['schedNext', between('function schedNext()', 'function goTo(')],
+    ['goTo', between('function goTo(', 'function updPlayBtn()')],
+    ['showSlide', between('function showSlide(', 'function startKB(i)')],
+    ['startKB/startProg', between('function startKB(i)', 'function startVProg(')],
+    ['updPlayBtn', between('function updPlayBtn()', 'function togglePlay()')],
+    ['soundtrack sync', between('  function sync() {', 'window.sspSoundtrackSync = sync;')],
+    ['snap hook', between('window.sspBeatSnapMs = function', '  };')],
+  ]) assert.doesNotMatch(body, /pumpAnalysis|analyzeBeats|decodeTrack/, name);
+  assert.equal((html.match(/C\.analyzeBeats\(/g) || []).length, 1);
+  const pump = between('function pumpAnalysis()', 'function currentGrid()');
+  assert.match(pump, /C\.beatAnalysisTargets\(q,/);
+  assert.match(pump, /whenSafe\(C\.analysisWorkMs\(ab\.duration\), function \(\) \{[\s\S]*C\.analyzeBeats\(/);
+  assert.match(between('function whenSafe(', 'function decodeTrack('), /if \(analysisWindow\(workMs\)\) \{ fn\(\); return; \}/);
+  assert.match(between('function addEntries(', 'async function addSongs('), /setQueue\(r\.queue\);\s*pumpAnalysis\(\);/);
+  assert.match(between("audio.addEventListener('playing'", "audio.addEventListener('pause'"), /pumpAnalysis\(\);/);
+  assert.match(between("el('musicBeat').onclick", "el('musicRepeat').onclick"), /pumpAnalysis\(\);/);
+});
+
+test('below the 2.2 confidence bar slides keep the unsynced time', () => {
+  assert.equal(C.BEAT_MIN_CONFIDENCE, 2.2);
+  const mk = (confidence) => C.buildBeatGrid({ bpm: 120, offset: 0.1, duration: 300, confidence });
+  const s = { mode: 'beat', audioPaused: false, casting: false, now: 10.03, targetMs: 3000 };
+  const snapped = C.beatSnapDelay({ ...s, grid: mk(2.2) });
+  assert.notEqual(snapped, 3000, 'at the bar it snaps');
+  assert.equal(C.beatSnapDelay({ ...s, grid: mk(2.19) }), 3000);
+  assert.equal(C.beatSnapDelay({ ...s, mode: 'bar', grid: mk(1.4) }), 3000);
+  assert.equal(C.beatSnapDelay({ ...s, grid: mk(0) }), 3000);
+  // A hand-set grid (no measured confidence) is trusted.
+  assert.equal(C.buildBeatGrid({ bpm: 120 }).confidence, null);
+  assert.equal(C.beatSnapDelay({ ...s, grid: mk(undefined) }), snapped);
+  assert.equal(C.beatGridUsable(mk(2.5)), true);
+  assert.equal(C.beatGridUsable(mk(2.0)), false);
+  assert.equal(C.beatGridUsable(null), false);
+  // The analyzer itself applies the same bar.
+  const noisy = C.analyzeBeats(clickTrack(120, 0.25, 40), 22050, { minConfidence: 1e9 });
+  assert.equal(noisy.ok, false);
+  assert.equal(noisy.reason, 'tempo-unclear');
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /b\.state === 'ok' && C\.beatGridUsable\(b\.grid\) \? b\.grid : null/);
+});
+
+test('beat cache key v2: path + size + mtime + analyzer version', () => {
+  const st = { size: 4096, mtimeMs: 1762700000123 };
+  const k = C.beatCacheKey('C:/Music/Song.mp3', st);
+  assert.equal(C.BEAT_CACHE_KEY_VERSION, 2);
+  assert.equal(k, 'k2|c:\\music\\song.mp3|4096|m1762700000123|a' + C.BEAT_ANALYZER_VERSION);
+  assert.equal(C.beatCacheKey('c:\\music\\SONG.mp3', st), k, 'same file, same key');
+  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', { ...st, size: 4097 }), k, 'size change misses');
+  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', { ...st, mtimeMs: st.mtimeMs + 1 }), k, 'same-size edit (new mtime) misses');
+  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', st, C.BEAT_ANALYZER_VERSION + 1), k, 'new analyzer misses');
+  // mtime wins over a fingerprint; the fingerprint is only the no-stat fallback.
+  assert.equal(C.beatCacheKey('C:/Music/Song.mp3', { ...st, fingerprint: 'deadbeef' }), k);
+  assert.equal(C.beatCacheKey('a.mp3', { size: 10, fingerprint: 'deadbeef' }), 'k2|a.mp3|10|fdeadbeef|a' + C.BEAT_ANALYZER_VERSION);
+  // Nothing to key on: no cache (never a size-only key).
+  assert.equal(C.beatCacheKey('a.mp3', { size: 10 }), null);
+  assert.equal(C.beatCacheKey('a.mp3', { size: 10, fingerprint: 'nothex!' }), null);
+  assert.equal(C.beatCacheKey('a.mp3', 4096), null);
+  assert.equal(C.beatCacheKey('a.mp3', null), null);
+  assert.equal(C.beatCacheKey('', st), null);
+  assert.equal(C.beatCacheKey('a.mp3', { size: 0, mtimeMs: 5 }), null);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /var BEAT_CACHE_KEY = 'sspBeatCacheV2';/);
+});
+
+test('track stat: File metadata first, then the Rust audio_file_stat reply', () => {
+  assert.deepEqual({ ...C.trackStatFrom({ size: 10, mtimeMs: 20 }, { size: 1, mtime_ms: 2 }) }, { size: 10, mtimeMs: 20 });
+  assert.deepEqual({ ...C.trackStatFrom({ path: 'C:/a.mp3' }, { size: 1234, mtime_ms: 1762700000000 }) }, { size: 1234, mtimeMs: 1762700000000 });
+  assert.equal(C.trackStatFrom({ path: 'C:/a.mp3' }, null), null);
+  assert.equal(C.trackStatFrom({ path: 'C:/a.mp3' }, { size: 1234, mtime_ms: 0 }), null);
+  // Browser picks carry File.size / lastModified through the queue.
+  const q = C.queueAddTracks(C.createAudioQueue(), [{ path: 'file:a.mp3:9', name: 'a.mp3', url: 'blob:x', size: 9, mtimeMs: 77 }]).queue;
+  assert.equal(q.tracks[0].size, 9);
+  assert.equal(q.tracks[0].mtimeMs, 77);
+  // Fallback fingerprint: stable, and changes with head, tail or size.
+  const head = new Uint8Array([1, 2, 3]), tail = new Uint8Array([9, 8]);
+  const fp = C.beatFingerprint(head, tail, 100);
+  assert.match(fp, /^[0-9a-f]{8}$/);
+  assert.equal(C.beatFingerprint(new Uint8Array([1, 2, 3]), new Uint8Array([9, 8]), 100), fp);
+  assert.notEqual(C.beatFingerprint(new Uint8Array([1, 2, 4]), tail, 100), fp);
+  assert.notEqual(C.beatFingerprint(head, new Uint8Array([9, 7]), 100), fp);
+  assert.notEqual(C.beatFingerprint(head, tail, 101), fp);
+  assert.notEqual(C.beatFingerprint(tail, head, 100), C.beatFingerprint(head, tail, 100));
+  assert.equal(C.BEAT_FINGERPRINT_BYTES, 65536);
+  // Rust side: the command exists, is limited to registered audio files, and is permitted.
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  assert.match(lib, /fn audio_file_stat\(path: String, allowed: State<'_, AllowedMedia>\)/);
+  assert.match(lib, /audio_stat::stat_audio_path\(Path::new\(&path\), \|p\| is_path_allowed\(p, &allowed\)\)/);
+  // The stat route returns fixed strings only: no canonicalize_path (its error names the path)
+  // and no OS error text (which can carry the path).
+  const rs = fs.readFileSync(new URL('./src-tauri/src/audio_stat.rs', import.meta.url), 'utf8');
+  const route = lib.slice(lib.indexOf('fn audio_file_stat('), lib.indexOf('fn read_media_file('));
+  assert.doesNotMatch(route, /canonicalize_path|to_string\(\)|format!/);
+  assert.doesNotMatch(rs, /map_err\(\|e\|/);
+  assert.match(rs, /map_err\(\|_\| ERR_NOT_RESOLVABLE\.to_string\(\)\)/);
+  assert.match(rs, /map_err\(\|_\| ERR_STAT_FAILED\.to_string\(\)\)/);
+  assert.match(lib, /generate_handler!\[[\s\S]*audio_file_stat,/);
+  assert.match(rs, /pub mtime_ms: u64/);
+  assert.match(rs, /if !allowed\(canonical\) \{\s*return Err/);
+  assert.doesNotMatch(rs, /fs::read\(|File::open\(canonical/);
+  const cap = JSON.parse(fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8'));
+  assert.ok(cap.permissions.includes('allow-audio-file-stat'));
+  const perm = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  assert.match(perm, /identifier = "allow-audio-file-stat"[\s\S]*?commands\.allow = \["audio_file_stat"\]/);
+});
+
+test('beat results round-trip through the cache', () => {
+  const k = C.beatCacheKey('C:/Music/Song.mp3', { size: 4096, mtimeMs: 1 });
+  const r = C.analyzeBeats(clickTrack(120, 0.25, 40), 22050);
+  assert.equal(r.ok, true);
+  let store = C.beatCacheWrite({}, k, C.beatCacheEntry(r));
+  store = C.parseBeatCache(JSON.stringify(store)); // survives localStorage
+  const hit = C.beatCacheRead(store, k);
+  assert.equal(hit.state, 'ok');
+  for (const f of ['bpm', 'period', 'offset', 'beatsPerBar', 'barPhase', 'duration', 'confidence']) {
+    assert.ok(Math.abs(hit.grid[f] - r.grid[f]) < 1e-9, f);
+  }
+  const s = { mode: 'beat', audioPaused: false, casting: false, now: 12.3, targetMs: 4000 };
+  assert.equal(C.beatSnapDelay({ ...s, grid: hit.grid }), C.beatSnapDelay({ ...s, grid: r.grid }));
+  // Unclear songs are cached too, so they aren't re-analysed either.
+  const k2 = C.beatCacheKey('b.mp3', { size: 99, mtimeMs: 5 });
+  store = C.beatCacheWrite(store, k2, C.beatCacheEntry({ ok: false, reason: 'tempo-unclear' }));
+  assert.deepEqual({ ...C.beatCacheRead(store, k2) }, { state: 'unclear', reason: 'tempo-unclear' });
+  // A stored grid under the bar reads back as unclear.
+  store = C.beatCacheWrite(store, 'low', { ok: 1, bpm: 120, offset: 0, beatsPerBar: 4, barPhase: 0, duration: 60, confidence: 1.5 });
+  assert.equal(C.beatCacheRead(store, 'low').state, 'unclear');
+  assert.equal(C.beatCacheRead(store, 'missing'), null);
+  assert.equal(C.beatCacheRead(store, '__proto__'), null);
+  assert.deepEqual({ ...C.parseBeatCache('not json') }, {});
+  assert.deepEqual({ ...C.parseBeatCache('[1]') }, {});
+  // Bounded: oldest entries drop, a rewrite moves the key to newest.
+  let big = {};
+  for (let i = 0; i < 5; i++) big = C.beatCacheWrite(big, 'k' + i, { ok: 0 }, 3);
+  assert.deepEqual(Object.keys(big), ['k2', 'k3', 'k4']);
+  big = C.beatCacheWrite(big, 'k2', { ok: 0 }, 3);
+  assert.deepEqual(Object.keys(big), ['k3', 'k4', 'k2']);
+});
+
+function loadAnalysisPump({ tauri, stat, cache = {}, statFails = false, fetchBytes = 300000 }) {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('  var analysisBusy = false;'), html.indexOf('  function currentGrid() {'));
+  const log = [];
+  const store = { ...cache };
+  const bytes = new Uint8Array(fetchBytes).map((_, i) => i & 255);
+  const sandbox = {
+    C, console: { warn() {} }, Promise, setTimeout, log, store,
+    q: C.queueAddTracks(C.createAudioQueue(), [tauri ? 'C:/Music/Song.mp3' : { path: 'file:s.mp3:1', name: 's.mp3', url: 'blob:s', ...(stat || {}) }]).queue,
+    beats: Object.create(null), beatMode: 'beat',
+    render() {},
+    readBeatCache() { return { ...store }; },
+    writeBeatCache(key, res) { log.push('write:' + key); store[key] = C.beatCacheEntry(res); },
+    sspIsTauri() { return tauri; },
+    tauriInvoke(cmd, args) {
+      log.push('invoke:' + cmd);
+      if (cmd === 'audio_file_stat') return statFails ? Promise.reject(new Error('path not in allowed set')) : Promise.resolve({ size: 4096, mtime_ms: 1762700000123 });
+      return Promise.resolve([]);
+    },
+    srcFor(t) { return t.url || 'asset://' + t.path; },
+    fetch(url) {
+      log.push('fetch:' + url);
+      return Promise.resolve({
+        ok: true,
+        blob() {
+          return Promise.resolve({
+            size: bytes.length,
+            slice(a, b) { log.push('slice:' + a + '-' + b); return { arrayBuffer: () => Promise.resolve(bytes.slice(a, b).buffer) }; },
+            arrayBuffer() { log.push('read-body'); return Promise.resolve(bytes.buffer); },
+          });
+        },
+        arrayBuffer() { log.push('read-body'); return Promise.resolve(bytes.buffer); },
+      });
+    },
+    window: { OfflineAudioContext: function () { this.decodeAudioData = () => { log.push('decode'); return Promise.reject(new Error('stub')); }; } },
+  };
+  vm.runInNewContext(src + '\nthis.pumpAnalysis = pumpAnalysis;', sandbox);
+  return sandbox;
+}
+const settle = () => new Promise((r) => setTimeout(r, 20));
+const okEntry = (r) => C.beatCacheEntry(r);
+
+test('a cache hit reads no file bytes: the cache is checked before the fetch', async () => {
+  const r = C.analyzeBeats(clickTrack(120, 0.25, 40), 22050);
+  // Tauri: stat via audio_file_stat (size + mtime), hit → no fetch, no read, no decode.
+  const key = C.beatCacheKey('C:/Music/Song.mp3', { size: 4096, mtimeMs: 1762700000123 });
+  let sb = loadAnalysisPump({ tauri: true, cache: { [key]: okEntry(r) } });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, ['invoke:register_allowed_paths', 'invoke:audio_file_stat']);
+  assert.equal(sb.beats['C:/Music/Song.mp3'].state, 'ok');
+  // Browser: File.size + lastModified on the track, hit → nothing at all.
+  const bkey = C.beatCacheKey('file:s.mp3:1', { size: 5000, mtimeMs: 42 });
+  sb = loadAnalysisPump({ tauri: false, stat: { size: 5000, mtimeMs: 42 }, cache: { [bkey]: okEntry(r) } });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, []);
+  assert.equal(sb.beats['file:s.mp3:1'].state, 'ok');
+  // Miss with a stat: fetch, read, decode (stub fails) — one fetch, no fingerprint slices.
+  sb = loadAnalysisPump({ tauri: true });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, ['invoke:register_allowed_paths', 'invoke:audio_file_stat', 'fetch:asset://C:/Music/Song.mp3', 'read-body', 'decode']);
+  // No stat (refused): last-resort head + tail fingerprint; a hit then skips the body read.
+  const fp = C.beatFingerprint(new Uint8Array(65536).map((_, i) => i & 255),
+    new Uint8Array(300000).map((_, i) => i & 255).slice(300000 - 65536), 300000);
+  const fkey = C.beatCacheKey('C:/Music/Song.mp3', { size: 300000, fingerprint: fp });
+  sb = loadAnalysisPump({ tauri: true, statFails: true, cache: { [fkey]: okEntry(r) } });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, ['invoke:register_allowed_paths', 'invoke:audio_file_stat', 'fetch:asset://C:/Music/Song.mp3', 'slice:0-65536', 'slice:234464-300000']);
+  assert.equal(sb.beats['C:/Music/Song.mp3'].state, 'ok');
+  // Source order: stat and cache lookup come before the fetch.
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const pump = html.slice(html.indexOf('function pumpAnalysis()'), html.indexOf('function currentGrid()'));
+  const statAt = pump.indexOf('statTrack(t).then');
+  const hitAt = pump.indexOf('C.beatCacheRead(readBeatCache(), cacheKey)');
+  const fetchAt = pump.indexOf('return fetchTrackBlob(t)');
+  assert.ok(statAt > 0 && hitAt > statAt && fetchAt > hitAt, 'stat → cache lookup → fetch');
+  assert.match(pump, /if \(hit\) \{ finish\(hit\); return; \}/);
+  assert.match(pump, /writeBeatCache\(cacheKey, res\);/);
+  assert.match(pump, /writeBeatCache\(cacheKey, \{ ok: false, reason: 'too-long' \}\);/);
+  assert.doesNotMatch(html, /buf\.byteLength/);
+  // Songs are registered with Rust when added and when restored, so the stat can answer.
+  assert.match(html, /registerSongs\(q\.tracks\.map\(function \(t\) \{ return t\.path; \}\)\);/);
+  assert.match(html, /registerSongs\(r\.queue\.tracks\.slice\(q\.tracks\.length\)/);
+  assert.match(html, /size: f\.size, mtimeMs: f\.lastModified/);
+});
+
+test('sync offset shifts slide changes later by the speaker lag, clamped and saved', () => {
+  assert.equal(C.clampSyncOffsetMs('120'), 120);
+  assert.equal(C.clampSyncOffsetMs(123), 120);
+  assert.equal(C.clampSyncOffsetMs(9999), C.SYNC_OFFSET_MAX_MS);
+  assert.equal(C.clampSyncOffsetMs(-9999), C.SYNC_OFFSET_MIN_MS);
+  assert.equal(C.clampSyncOffsetMs(null), 0);
+  assert.equal(C.clampSyncOffsetMs('junk'), 0);
+  assert.equal(C.clampSyncOffsetMs(undefined), 0);
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0, duration: 300, confidence: 5 });
+  const base = { mode: 'beat', audioPaused: false, casting: false, grid, targetMs: 3000 };
+  for (const off of [0, 80, 150, -100]) {
+    for (const now of [10, 10.13, 47.71]) {
+      const ms = C.beatSnapDelay({ ...base, now, offsetMs: off });
+      // The change lands where a beat is heard: (now + delay) - lag is on the grid.
+      const heard = now + ms / 1000 - off / 1000;
+      const ph = ((heard % 0.5) + 0.5) % 0.5;
+      assert.ok(Math.min(ph, 0.5 - ph) < 0.002, `off ${off} now ${now}: ${ms}`);
+      assert.ok(ms >= 1500 && ms <= 4500);
+    }
+  }
+  // No offset means exactly the old behaviour.
+  assert.equal(C.beatSnapDelay({ ...base, now: 10.13 }), C.beatSnapDelay({ ...base, now: 10.13, offsetMs: 0 }));
+  // Off, casting and paused ignore the offset.
+  assert.equal(C.beatSnapDelay({ ...base, mode: 'off', now: 10, offsetMs: 200 }), 3000);
+  assert.equal(C.beatSnapDelay({ ...base, casting: true, now: 10, offsetMs: 200 }), 3000);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /<input type="range" id="musicOffset" min="-200" max="400" step="10"/);
+  assert.match(html, /var OFFSET_KEY = 'sspBeatOffsetV1';/);
+  assert.match(html, /localStorage\.setItem\(OFFSET_KEY, String\(syncOffsetMs\)\)/);
+  assert.match(html, /el\('musicOffsetRow'\)\.hidden = beatMode === 'off';/);
+  // "Saved" stays on the label across re-renders while the value matches what was stored.
+  assert.match(html, /\(savedOffsetMs === syncOffsetMs \? ' \\u00b7 Saved' : ''\)/);
+  assert.equal((html.match(/el\('musicOffsetLbl'\)\.textContent = offsetLabel\(\);/g) || []).length, 3);
 });

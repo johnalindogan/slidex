@@ -840,6 +840,11 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 #musicEmpty{font-size:12px;color:rgba(255,255,255,.6);padding:8px 2px;}
 #musicEmpty b{color:#fff;display:block;margin-bottom:2px;}
 #musicVol{flex:1;accent-color:#fff;}
+#musicOffset{flex:1;accent-color:#fff;}
+#musicOffsetLbl{font-size:11px;color:rgba(255,255,255,.75);white-space:nowrap;min-width:150px;}
+#musicBpm{font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap;}
+#musicBpm.live{border-color:rgba(159,208,255,.6);color:#cfe7ff;}
+#musicBpm.warn{border-color:rgba(232,179,90,.6);color:#f3d29b;}
 #fimusic{display:none;}
 #castPanel{display:none;position:fixed;right:16px;bottom:16px;z-index:9999;width:320px;max-width:calc(100vw - 32px);background:#1a2230;border:1px solid rgba(90,180,255,.35);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.45);padding:14px 14px 12px;color:#e8eef7;font:13px/1.4 system-ui,sans-serif;}
 #castPanel.open{display:block;}
@@ -3261,6 +3266,20 @@ const getItemDur = i => {
   return (item && item.customDur) || getDur();
 };
 const getEDur = i => getItemDur(i != null ? i : cur) / getSpd();
+/* The current slide's real length: the beat-snapped delay when beat sync applies, else getEDur.
+   Ken Burns, the progress bar and schedNext() run in the same task when a slide starts, so the
+   value is computed once and shared until the task ends; they all end on the same beat. */
+let slideMsMemo = null;
+function slideMs(i) {
+  const idx = i != null ? i : cur;
+  const base = getEDur(idx);
+  if (idx !== cur || typeof window.sspBeatSnapMs !== 'function') return base;
+  if (slideMsMemo && slideMsMemo.i === idx && slideMsMemo.base === base) return slideMsMemo.ms;
+  const ms = window.sspBeatSnapMs(base);
+  slideMsMemo = { i: idx, base, ms };
+  Promise.resolve().then(() => { slideMsMemo = null; });
+  return ms;
+}
 
 /* ── Zoom / Pan ── */
 function updZoom() { g('zlb').textContent = Math.round(zoom * 100) + '%'; }
@@ -3696,7 +3715,7 @@ function startCompKB(i) {
   const mc2 = g('maxcomp2'), med2 = mc2?.querySelector('img');
   const p = getKBPreset(i);
   if (!p) { updCompT(); return; }
-  const dur = getEDur(i); let st = null;
+  const dur = slideMs(i); let st = null;
   function step(ts) {
     if (!st) st = ts;
     const t = Math.min((ts - st) / dur, 1), ev = kbEase(t);
@@ -5774,7 +5793,7 @@ function startKB(i) {
       return;
     }
     if (!p) { writeMax(Math.max(1, zoom).toFixed(4), panX.toFixed(1), panY.toFixed(1)); return; }
-    const dur = getEDur(i); let st = null;
+    const dur = slideMs(i); let st = null;
     function stepMax(ts) {
       if (!st) st = ts;
       const t = Math.min((ts - st) / dur, 1), ev = kbEase(t);
@@ -5791,7 +5810,7 @@ function startKB(i) {
   const ends = SlideXCore.wholeImageEndpoints(
     { fs: p.fs, ts: p.ts, fx: p.fx, fy: p.fy, tx: p.tx, ty: p.ty }, 1, 1
   );
-  const dur = getEDur(i); let st = null;
+  const dur = slideMs(i); let st = null;
   const box = layoutFrame(sl, item);
   function step(ts) {
     if (!st) st = ts;
@@ -5811,7 +5830,7 @@ function startKB(i) {
 function startProg() {
   clearInterval(ptmr); ps = Date.now(); g('pb').style.width = '0%';
   setSeekBarMode(false);
-  const dur = getEDur();
+  const dur = slideMs(cur);
   ptmr = setInterval(() => {
     const pct = Math.min(((Date.now()-ps)/dur)*100,100);
     g('pb').style.width = pct.toFixed(1) + '%';
@@ -5917,7 +5936,7 @@ function waitForVideoFrame(video) {
 
 function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
-  const ms = getEDur(cur);
+  const ms = slideMs(cur);
   tmr = setTimeout(() => {
     if (window.__sspCastActive && window.SlideXCore && typeof window.SlideXCore.nextIndexSkippingUnsupported === "function") {
       var skipTo = window.SlideXCore.nextIndexSkippingUnsupported(cur, getMediaItems(), {
@@ -8233,13 +8252,18 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="musicClear" title="Remove all songs">Clear</button>
     <button type="button" id="musicClose" title="Close (Esc)" aria-label="Close">&#x2715;</button>
   </div>
-  <div id="musicNow" aria-live="polite"></div>
+  <div class="mrow"><div id="musicNow" aria-live="polite"></div><span class="msp"></span><span id="musicBpm" hidden></span></div>
   <div class="mrow">
     <button type="button" id="musicPrev" title="Previous song" aria-label="Previous song">&#x2039;</button>
     <button type="button" id="musicPlay" title="Music on or off. Music plays while the slideshow plays.">Music on</button>
     <button type="button" id="musicNext" title="Next song" aria-label="Next song">&#x203A;</button>
     <button type="button" id="musicRepeat" title="Repeat">Repeat all</button>
+    <button type="button" id="musicBeat" title="Change slides on the music's beat. Slide times stay close to your setting.">Beat sync off</button>
     <input type="range" id="musicVol" min="0" max="1" step="0.05" value="0.8" title="Music volume" aria-label="Music volume">
+  </div>
+  <div class="mrow" id="musicOffsetRow" hidden>
+    <label for="musicOffset" id="musicOffsetLbl">Sync offset · 0 ms</label>
+    <input type="range" id="musicOffset" min="-200" max="400" step="10" value="0" title="Use if speakers or HDMI lag: slides change this much later than the beat in the file." aria-label="Sync offset in milliseconds">
   </div>
   <div id="musicList" role="listbox" aria-label="Music playlist"></div>
   <div id="musicEmpty"><b>No music yet</b>Add songs to play under your slideshow. Local files only. SlideX never uploads anything or uses streaming services.</div>
@@ -8266,6 +8290,27 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   var loadedIdx = -1;
   var bad = Object.create(null);
   var lastNowText = '';
+  var BEAT_KEY = 'sspBeatSyncV1';
+  var beatMode = 'off';
+  try { var bm = localStorage.getItem(BEAT_KEY); if (C.BEAT_SYNC_MODES.indexOf(bm) >= 0) beatMode = bm; } catch (_) {}
+  var beats = Object.create(null); // track path -> { state: 'analyzing'|'ok'|'unclear'|'failed', grid }
+  var BEAT_CACHE_KEY = 'sspBeatCacheV2';
+  try { localStorage.removeItem('sspBeatCacheV1'); } catch (_) {} // v1 keys had no mtime
+  var OFFSET_KEY = 'sspBeatOffsetV1';
+  var syncOffsetMs = 0, savedOffsetMs = null;
+  try {
+    var so = localStorage.getItem(OFFSET_KEY);
+    syncOffsetMs = C.clampSyncOffsetMs(so);
+    if (so != null) savedOffsetMs = syncOffsetMs;
+  } catch (_) {}
+  function offsetLabel() {
+    return 'Sync offset \u00b7 ' + syncOffsetMs + ' ms' + (savedOffsetMs === syncOffsetMs ? ' \u00b7 Saved' : '');
+  }
+  function readBeatCache() { try { return C.parseBeatCache(localStorage.getItem(BEAT_CACHE_KEY)); } catch (_) { return {}; } }
+  function writeBeatCache(key, res) {
+    if (!key) return;
+    try { localStorage.setItem(BEAT_CACHE_KEY, JSON.stringify(C.beatCacheWrite(readBeatCache(), key, C.beatCacheEntry(res)))); } catch (_) {}
+  }
 
   function el(id) { return document.getElementById(id); }
   function save() {
@@ -8316,6 +8361,148 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   }
   window.sspSoundtrackSync = sync;
 
+  /* Beat sync (off by default). Each song is analysed once per session, in this webview:
+     fetch + decode at 22.05 kHz (async, off the slide timer), then the CPU step
+     (mix to mono + SlideXCore.analyzeBeats) waits for a safe window: never during a slide
+     change and never with too little slide time left. Analysis starts when songs are added,
+     when a song starts (the current one and the next one, one ahead) and when beat sync is
+     turned on. Nothing on the slide path starts it. Any failure keeps the normal timer. */
+  var analysisBusy = false;
+  function analysisWindow(workMs) {
+    var show = typeof playing !== 'undefined' && !!playing && typeof sessionLoaded !== 'undefined' && !!sessionLoaded;
+    var since = Infinity, left = Infinity;
+    if (show) {
+      if (typeof isV === 'function' && isV(cur)) {
+        var v = typeof getSl === 'function' ? getSl(cur)?.querySelector('video') : null;
+        left = v && Number.isFinite(v.duration) ? (v.duration - v.currentTime) * 1000 : 0;
+      } else {
+        since = typeof ps === 'number' ? Date.now() - ps : 0;
+        left = (typeof slideMs === 'function' ? slideMs(cur) : 0) - since;
+      }
+    }
+    return C.analysisWindowOk({ slideshowPlaying: show, sinceSlideStartMs: since, remainingMs: left, workMs: workMs });
+  }
+  function whenSafe(workMs, fn) {
+    if (analysisWindow(workMs)) { fn(); return; }
+    setTimeout(function () { whenSafe(workMs, fn); }, 150);
+  }
+  /* Songs the app plays are registered with Rust, so audio_file_stat (size + mtime, no read)
+     answers for them and refuses anything else. Restored songs register at startup. */
+  var songsRegistered = Promise.resolve();
+  function registerSongs(paths) {
+    var list = (paths || []).filter(function (p) { return typeof p === 'string' && p && p.indexOf('file:') !== 0; });
+    if (!sspIsTauri() || !list.length) return songsRegistered;
+    songsRegistered = songsRegistered.then(function () {
+      return tauriInvoke('register_allowed_paths', { paths: list });
+    }).catch(function (e) { console.warn('[music] register failed', e); });
+    return songsRegistered;
+  }
+  registerSongs(q.tracks.map(function (t) { return t.path; }));
+  /** { size, mtimeMs } without reading the file: File metadata first, then the Rust stat. */
+  function statTrack(t) {
+    var known = C.trackStatFrom(t, null);
+    if (known) return Promise.resolve(known);
+    if (!sspIsTauri() || t.url) return Promise.resolve(null);
+    return songsRegistered.then(function () {
+      return tauriInvoke('audio_file_stat', { path: t.path });
+    }).then(function (reply) { return C.trackStatFrom(null, reply); }, function (e) {
+      console.warn('[music] stat failed', e);
+      return null;
+    });
+  }
+  function fetchTrackBlob(t) {
+    var src = srcFor(t);
+    if (!src || typeof fetch !== 'function') return Promise.reject(new Error('no source'));
+    return fetch(src).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.blob();
+    });
+  }
+  /** Last-resort key when there is no stat: first and last 64 KB of the blob, plus its size. */
+  function fingerprintBlob(blob) {
+    var n = C.BEAT_FINGERPRINT_BYTES, size = blob.size;
+    return Promise.all([
+      blob.slice(0, Math.min(n, size)).arrayBuffer(),
+      blob.slice(Math.max(0, size - n), size).arrayBuffer()
+    ]).then(function (parts) {
+      return { size: size, fingerprint: C.beatFingerprint(new Uint8Array(parts[0]), new Uint8Array(parts[1]), size) };
+    });
+  }
+  function decodeTrack(buf) {
+    var Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!Offline) return Promise.reject(new Error('no decoder'));
+    return Promise.resolve().then(function () {
+      var ctx = new Offline(1, 1, 22050);
+      return new Promise(function (resolve, reject) {
+        var p = ctx.decodeAudioData(buf, resolve, reject);
+        if (p && typeof p.then === 'function') p.then(resolve, reject);
+      });
+    });
+  }
+  function pumpAnalysis() {
+    if (beatMode === 'off' || analysisBusy) return;
+    var path = C.beatAnalysisTargets(q, function (p) { return !!beats[p]; })[0];
+    var t = path && q.tracks.find(function (x) { return x.path === path; });
+    if (!t) return;
+    analysisBusy = true;
+    beats[path] = { state: 'analyzing' };
+    render();
+    function finish(result) {
+      analysisBusy = false;
+      if (beats[path]) beats[path] = result; // removed meanwhile → dropped
+      render();
+      pumpAnalysis();
+    }
+    var cacheKey = null;
+    function analyseBlob(blob) {
+      return blob.arrayBuffer().then(decodeTrack).then(function (ab) {
+        if (ab.duration > C.BEAT_MAX_SECONDS) {
+          writeBeatCache(cacheKey, { ok: false, reason: 'too-long' });
+          finish({ state: 'unclear', reason: 'too-long' });
+          return;
+        }
+        whenSafe(C.analysisWorkMs(ab.duration), function () {
+          var chans = [];
+          for (var c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
+          var res = C.analyzeBeats(C.mixToMono(chans), ab.sampleRate);
+          writeBeatCache(cacheKey, res);
+          finish(res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason });
+        });
+      });
+    }
+    // The cache is checked before any fetch: a hit on path + size + mtime reads no file bytes.
+    statTrack(t).then(function (stat) {
+      cacheKey = C.beatCacheKey(t.path, stat);
+      var hit = cacheKey && C.beatCacheRead(readBeatCache(), cacheKey);
+      if (hit) { finish(hit); return; }
+      return fetchTrackBlob(t).then(function (blob) {
+        if (cacheKey) return analyseBlob(blob);
+        // No stat at all: key on a head + tail fingerprint, then look again before decoding.
+        return fingerprintBlob(blob).then(function (fp) {
+          cacheKey = C.beatCacheKey(t.path, fp);
+          var fpHit = cacheKey && C.beatCacheRead(readBeatCache(), cacheKey);
+          if (fpHit) { finish(fpHit); return; }
+          return analyseBlob(blob);
+        });
+      });
+    }).catch(function (e) {
+      console.warn('[music] beat analysis failed', e);
+      finish({ state: 'failed' });
+    });
+  }
+  function currentGrid() {
+    var t = q.tracks[loadedIdx];
+    var b = t && beats[t.path];
+    return b && b.state === 'ok' && C.beatGridUsable(b.grid) ? b.grid : null;
+  }
+  /** slideMs() asks for the slide delay. Beat sync covers this PC only; while casting the TV keeps fixed timing. */
+  window.sspBeatSnapMs = function (ms) {
+    return C.beatSnapDelay({
+      mode: beatMode, audioPaused: audio.paused, casting: !!window.__sspCastActive,
+      grid: currentGrid(), now: audio.currentTime, targetMs: ms, offsetMs: syncOffsetMs
+    });
+  };
+
   function setQueue(next) { q = next; save(); sync(); }
   function go(index, restart) {
     if (index === q.index && restart) { try { audio.currentTime = 0; } catch (_) {} }
@@ -8340,6 +8527,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     step(1, false);
   });
   audio.addEventListener('playing', function () {
+    pumpAnalysis(); // song started: make sure it and the next one are analysed
     var t = q.tracks[loadedIdx];
     if (t) delete bad[t.path];
     render();
@@ -8366,6 +8554,18 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     el('musicPlay').textContent = q.on ? 'Music on' : 'Music off';
     el('musicPlay').classList.toggle('on', q.on);
     el('musicRepeat').textContent = q.repeat === 'one' ? 'Repeat one' : (q.repeat === 'off' ? 'Repeat off' : 'Repeat all');
+    el('musicBeat').textContent = beatMode === 'bar' ? 'Beat sync: every bar' : (beatMode === 'beat' ? 'Beat sync: every beat' : 'Beat sync off');
+    el('musicBeat').classList.toggle('on', beatMode !== 'off');
+    el('musicOffsetRow').hidden = beatMode === 'off';
+    el('musicOffset').value = String(syncOffsetMs);
+    el('musicOffsetLbl').textContent = offsetLabel();
+    var chip = el('musicBpm'), bt = t && beats[t.path];
+    chip.hidden = beatMode === 'off' || !bt;
+    chip.className = '';
+    if (bt && bt.state === 'ok') { chip.textContent = Math.round(bt.grid.bpm) + ' BPM'; chip.className = 'live'; chip.title = 'Slides change on the beat'; }
+    else if (bt && bt.state === 'analyzing') { chip.textContent = 'Analyzing\u2026'; chip.title = 'Finding the beat. Slides keep their normal timing until it is ready.'; }
+    else if (bt && bt.state === 'unclear') { chip.textContent = bt.reason === 'too-long' ? 'Too long to sync' : 'Tempo unclear'; chip.className = 'warn'; chip.title = 'The beat in this song isn\u2019t clear, so slides keep their normal timing.'; }
+    else if (bt) { chip.textContent = 'Can\u2019t sync'; chip.className = 'warn'; chip.title = 'Couldn\u2019t read this song for beat sync. Slides keep their normal timing.'; }
     el('musicVol').value = String(q.volume);
     el('musicEmpty').hidden = q.tracks.length > 0;
     el('musicClear').disabled = !q.tracks.length;
@@ -8401,15 +8601,20 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (!t) return;
     if (t.url) { try { URL.revokeObjectURL(t.url); } catch (_) {} }
     delete bad[t.path];
-    if (i === loadedIdx || i < loadedIdx) { audio.pause(); loadedIdx = -1; }
+    delete beats[t.path];
+    // Removing a song above the playing one only shifts its row; it keeps playing.
+    if (i === loadedIdx) audio.pause();
+    loadedIdx = C.loadedIndexAfterRemove(i, loadedIdx);
     var next = C.queueRemoveAt(q, i);
     if (!next.tracks.length) loadTrack(-1);
     setQueue(next);
   }
   function addEntries(entries) {
     var r = C.queueAddTracks(q, entries);
+    registerSongs(r.queue.tracks.slice(q.tracks.length).map(function (t) { return t.path; }));
     if (r.skipped.length) toast(r.skipped.length + ' file(s) can\u2019t be used: ' + r.skipped.slice(0, 3).join(', '));
     setQueue(r.queue);
+    pumpAnalysis();
   }
   async function addSongs() {
     if (sspIsTauri()) {
@@ -8432,7 +8637,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var files = Array.prototype.slice.call(this.files || []);
     this.value = '';
     addEntries(files.map(function (f) {
-      return { path: 'file:' + f.name + ':' + f.size, name: f.name, url: URL.createObjectURL(f) };
+      return { path: 'file:' + f.name + ':' + f.size, name: f.name, url: URL.createObjectURL(f), size: f.size, mtimeMs: f.lastModified };
     }));
   };
 
@@ -8456,6 +8661,21 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   el('musicPlay').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { on: !q.on })); });
   el('musicPrev').onclick = blurAfter(function () { step(-1, false); });
   el('musicNext').onclick = blurAfter(function () { step(1, false); });
+  el('musicBeat').onclick = blurAfter(function () {
+    beatMode = C.nextBeatSyncMode(beatMode);
+    try { localStorage.setItem(BEAT_KEY, beatMode); } catch (_) {}
+    sync();
+    pumpAnalysis();
+  });
+  el('musicOffset').oninput = function () {
+    syncOffsetMs = C.clampSyncOffsetMs(this.value);
+    el('musicOffsetLbl').textContent = offsetLabel();
+  };
+  el('musicOffset').onchange = function () {
+    syncOffsetMs = C.clampSyncOffsetMs(this.value);
+    try { localStorage.setItem(OFFSET_KEY, String(syncOffsetMs)); savedOffsetMs = syncOffsetMs; } catch (_) {}
+    el('musicOffsetLbl').textContent = offsetLabel();
+  };
   el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });
   el('musicVol').oninput = function () {
     q = Object.assign({}, q, { volume: C.clampVolume(this.value) });
