@@ -387,7 +387,6 @@ body.ssp-playlist-window {
   background: #0a0a0c;
 }
 body.ssp-playlist-window #dz,
-body.ssp-playlist-window #viewer,
 body.ssp-playlist-window #ctrls,
 body.ssp-playlist-window #cpanel,
 body.ssp-playlist-window #ctrls-overflow,
@@ -440,8 +439,85 @@ body.ssp-playlist-window #dock-tree-view {
 body.ssp-playlist-window #dock-timeline-view {
   display: flex;
 }
+/* #media-dock lives inside #viewer. Hiding #viewer here made the 0.1.x window black,
+   so the second window keeps #viewer and hides its other children instead. */
+body.ssp-playlist-window #viewer {
+  display: block !important;
+  width: 100vw;
+  height: 100vh;
+  background: #0a0a0c;
+}
+body.ssp-playlist-window #viewer > :not(#media-dock) {
+  display: none !important;
+}
 body.ssp-main-undocked #media-dock {
   display: none !important;
+}
+#swBar, #swBanner, #swSkeleton {
+  display: none;
+}
+body.ssp-playlist-window #swBar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 48px;
+  flex-shrink: 0;
+  padding: 0 16px;
+  background: #111;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+}
+body.ssp-playlist-window #swBar .sw-sp { flex: 1; }
+body.ssp-playlist-window #swBar button {
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+body.ssp-playlist-window #swBar button[hidden] { display: none; }
+.sw-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.85);
+}
+.sw-chip::before { content: '○'; }
+.sw-chip.live { color: #9fd0ff; border-color: rgba(159, 208, 255, 0.5); }
+.sw-chip.live::before { content: '●'; }
+.sw-chip.err { color: #ff9b9b; border-color: rgba(220, 60, 60, 0.7); }
+.sw-chip.err::before { content: '✕'; }
+#swAgo, #swMain { color: rgba(255, 255, 255, 0.6); }
+body.ssp-playlist-window #swBanner:not([hidden]) {
+  display: block;
+  padding: 8px 16px;
+  background: rgba(220, 60, 60, 0.15);
+  border-bottom: 1px solid rgba(220, 60, 60, 0.5);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 12px;
+}
+body.ssp-playlist-window.sw-opening #swSkeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+}
+body.ssp-playlist-window.sw-opening #swSkeleton > div {
+  height: 44px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+}
+body.ssp-playlist-window.sw-opening #dock-body {
+  display: none !important;
+}
+body.ssp-playlist-window.sw-unlinked #dock-body {
+  opacity: 0.6;
 }
 #plundock, #pldockback {
   display: none;
@@ -453,7 +529,7 @@ body.ssp-playlist-window #plundock {
   display: none !important;
 }
 body.ssp-playlist-window #pldockback {
-  display: inline-flex !important;
+  display: none !important;
 }
 body.ssp-playlist-window #dock-toggle-btn {
   display: none !important;
@@ -1205,6 +1281,16 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 
   <!-- Unified Media Dock -->
   <div id="media-dock" class="collapsed">
+    <!-- Second window only: link state, main status, Dock back -->
+    <div id="swBar" role="toolbar" aria-label="Second window">
+      <span id="swStatus" class="sw-chip" role="status">Connecting to main window…</span>
+      <span id="swAgo"></span>
+      <span id="swMain"></span>
+      <span class="sw-sp"></span>
+      <button id="swReconnect" hidden>Reconnect</button>
+      <button id="swDock" title="Dock back into the main window (Ctrl+Shift+U)">Dock back</button>
+    </div>
+    <div id="swBanner" role="alert" hidden></div>
     <!-- Dock Header -->
     <div id="dock-hdr">
       <div class="dock-title-group">
@@ -1223,7 +1309,7 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
         <button id="plload" title="Load playlist">&#128194;</button>
         <button id="musicTab" title="Music: songs that play under the slideshow">Music</button>
         <button id="pllocate" title="Locate folder for missing items" hidden>Locate folder…</button>
-        <button id="plundock" title="Undock Media Manager">Undock</button>
+        <button id="plundock" title="Open in window (Ctrl+Shift+U)">Open in window</button>
         <button id="pldockback" title="Dock back to main window">Dock</button>
       </div>
       <button id="dock-toggle-btn" title="Expand/Collapse Panel">
@@ -1231,6 +1317,8 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
       </button>
     </div>
     
+    <!-- Second window only: placeholder rows until the first snapshot arrives -->
+    <div id="swSkeleton" aria-hidden="true"><div></div><div></div><div></div><div></div><div></div></div>
     <!-- Dock Body -->
     <div id="dock-body">
       <!-- Left Panel: Folder/Playlist tree structure -->
@@ -1550,7 +1638,12 @@ async function sspConfirm(message) {
   return result === true;
 }
 
-/* ── P3: undocked playlist window role + live sync ── */
+/* ── Second window (0.2.0): the main window owns the state ──
+ * Main keeps the playlist, selection and playback. It sends sw://snapshot
+ * {v, state} when the second window opens and after every change, plus
+ * sw://beat every 2 s. The second window renders a copy and sends only
+ * sw://intent {op}. It never writes items, localStorage or playback itself.
+ * SlideXCore.createSwHub / createSwChild hold the protocol (unit-tested). */
 let SSP_WINDOW_ROLE = (function () {
   try {
     const q = new URLSearchParams(location.search || '');
@@ -1569,20 +1662,22 @@ let SSP_WINDOW_ROLE = (function () {
   return 'main';
 })();
 let SSP_IS_PLAYLIST_WINDOW = SSP_WINDOW_ROLE === 'playlist';
-/** Undock is off in 0.1.19. The second window is rebuilt in 0.2.0. The code stays. */
-const SSP_UNDOCK_ENABLED = false;
+/** 0.2.0: Undock is back. The second window is a remote for the main window. */
+const SSP_UNDOCK_ENABLED = true;
 if (SSP_UNDOCK_ENABLED) document.body.classList.add('ssp-undock-enabled');
-let playlistUndocked = false;
-let plSyncSeq = 0;
-let plSyncApplied = 0;
-let plSyncMute = false;
-let plSyncTimer = null;
-let plSyncChannel = null;
-let plSyncReceived = false;
-let _plUndockPushTimer = null;
-let _plChildRequestTimer = null;
-const PL_SYNC_HANDSHAKE_TRIES = 12;
-const PL_SYNC_HANDSHAKE_MS = 80;
+let playlistUndocked = false;   // main: the second window is open
+let swChildAlive = false;       // main: a playlist window exists and has not reported sw://closed
+let swClosedWaiters = [];
+let swOpening = false;
+let swHub = null;               // main only
+let swChild = null;             // second window only
+let swSnapTimer = null;
+let swBeatTimer = null;
+let swHelloTimer = null;
+let swTickTimer = null;
+let swChildBusy = false;
+let swChildPending = false;
+let swChildShownV = 0;
 
 /** Late-bind role from Tauri window label when URL query/hash was stripped. */
 function refreshWindowRoleFromTauri() {
@@ -1611,76 +1706,14 @@ function refreshWindowRoleFromTauri() {
   return false;
 }
 
-function stopUndockSyncPush() {
-  if (_plUndockPushTimer) {
-    clearTimeout(_plUndockPushTimer);
-    _plUndockPushTimer = null;
-  }
-}
-
-/** Main: push playlist state repeatedly for ~1s so child listeners cannot miss create race. */
-function startUndockSyncPush() {
-  stopUndockSyncPush();
-  let tries = 0;
-  const tick = () => {
-    _plUndockPushTimer = null;
-    if (!playlistUndocked) return;
-    try { broadcastPlaylistSync(); } catch (_) {}
-    tries += 1;
-    if (tries < PL_SYNC_HANDSHAKE_TRIES) {
-      _plUndockPushTimer = setTimeout(tick, PL_SYNC_HANDSHAKE_MS);
-    }
-  };
-  tick();
-}
-
-function stopChildSyncRequest() {
-  if (_plChildRequestTimer) {
-    clearTimeout(_plChildRequestTimer);
-    _plChildRequestTimer = null;
-  }
-}
-
-/** Child: request sync repeatedly until a payload is applied or ~1s elapses. */
-function startChildSyncRequest() {
-  stopChildSyncRequest();
-  plSyncReceived = false;
-  let tries = 0;
-  const tick = () => {
-    _plChildRequestTimer = null;
-    if (!SSP_IS_PLAYLIST_WINDOW || plSyncReceived) return;
-    try { requestPlaylistSync(); } catch (_) {}
-    tries += 1;
-    if (tries < PL_SYNC_HANDSHAKE_TRIES) {
-      _plChildRequestTimer = setTimeout(tick, PL_SYNC_HANDSHAKE_MS);
-    }
-  };
-  tick();
-}
-
-async function emitPlaylistSyncAck(payload) {
-  if (!SSP_IS_PLAYLIST_WINDOW) return;
-  const ack = {
-    v: 1,
-    type: 'ack',
-    origin: SSP_WINDOW_ROLE,
-    seq: payload && typeof payload.seq === 'number' ? payload.seq : plSyncApplied,
-    itemCount: items.length
-  };
-  try {
-    if (plSyncChannel) plSyncChannel.postMessage(ack);
-  } catch (_) {}
+function swEmit(ev, payload) {
   try {
     if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
-      await window.__TAURI__.event.emit('ssp-pl-ack', ack);
+      const p = window.__TAURI__.event.emit(ev, payload);
+      if (p && typeof p.catch === 'function') p.catch(e => console.warn(ev + ' emit failed', e));
     }
-  } catch (_) {}
+  } catch (e) { console.warn(ev + ' emit failed', e); }
 }
-try {
-  if (typeof BroadcastChannel !== 'undefined') {
-    plSyncChannel = new BroadcastChannel('ssp-playlist-sync');
-  }
-} catch (_) { plSyncChannel = null; }
 
 function playlistChromeOpen() {
   if (SSP_IS_PLAYLIST_WINDOW) return true;
@@ -1694,53 +1727,312 @@ function itemSyncKey(it) {
   return 'm:' + (it.path || '') + ':' + (it.id || '') + ':' + (it.name || '');
 }
 
-function getLiveSyncPayload() {
-  const snap = getPlaylistSnapshot();
-  try {
-    (snap.items || []).forEach(it => {
-      if (it && it.imageUpdates && it.imageUpdates.thumbnailUrl) {
-        delete it.imageUpdates.thumbnailUrl;
-      }
-    });
-  } catch (_) {}
+function swMediaIds() { return getMediaItems().map(it => it.id); }
+function swItemIndexById(id) { return items.findIndex(it => it && it.id === id); }
+function swMediaIndexById(id) { return getMediaItems().findIndex(it => it.id === id); }
+
+/** Main: the state the second window renders. */
+function swMainState() {
+  // Only what the list shows: no colour, crop or thumbnail data, so snapshots stay small.
+  const listItems = items.map(it => {
+    if (it.type === 'folder') return { type: 'folder', id: it.id, name: it.name, open: it.open !== false };
+    return {
+      id: it.id,
+      type: it.type,
+      name: it.name,
+      path: it.path || undefined,
+      imageUpdates: { customDur: it.customDur, kbPreset: it.kbPreset }
+    };
+  });
+  const mi = getMediaItems();
+  const ids = mi.map(it => it.id);
+  const curItem = mi[cur];
   return {
-    v: 1,
-    seq: ++plSyncSeq,
-    origin: SSP_WINDOW_ROLE,
-    cur,
-    selected: Array.from(selectedItems),
-    lastClickedMI,
-    search: plSearchQuery || '',
-    snap
+    items: listItems,
+    curId: curItem ? curItem.id : null,
+    selectedIds: SlideXCore.swIndicesToIds(ids, Array.from(selectedItems)),
+    lastId: lastClickedMI >= 0 && ids[lastClickedMI] != null ? ids[lastClickedMI] : null,
+    playing: !!playing,
+    count: mi.length,
+    index: curItem ? cur : -1,
+    nowName: curItem ? (curItem.name || '') : ''
   };
 }
 
-function playlistSyncActive() {
-  return SSP_IS_PLAYLIST_WINDOW || playlistUndocked || !!(plSyncChannel && SSP_IS_PLAYLIST_WINDOW);
-}
-
+/** Main: something changed, so send the second window a fresh snapshot. The second window never broadcasts. */
 function notifyPlaylistSync() {
-  if (plSyncMute) return;
-  if (!(SSP_IS_PLAYLIST_WINDOW || playlistUndocked)) return;
-  clearTimeout(plSyncTimer);
-  plSyncTimer = setTimeout(broadcastPlaylistSync, 48);
+  if (SSP_IS_PLAYLIST_WINDOW) return;
+  if (!swHub || !swHub.isOpen) return;
+  clearTimeout(swSnapTimer);
+  swSnapTimer = setTimeout(() => {
+    swSnapTimer = null;
+    if (swHub && swHub.isOpen) swHub.changed();
+  }, 48);
 }
 
-async function broadcastPlaylistSync() {
-  if (plSyncMute) return;
-  if (!(SSP_IS_PLAYLIST_WINDOW || playlistUndocked)) return;
-  let payload;
-  try { payload = getLiveSyncPayload(); } catch (e) { console.warn('sync payload failed', e); return; }
-  try {
-    if (plSyncChannel) plSyncChannel.postMessage(payload);
-  } catch (_) {}
-  try {
-    if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
-      await window.__TAURI__.event.emit('ssp-pl-sync', payload);
+/** Main: run one validated intent from the second window on main's own state. */
+function swApplyIntent(intent) {
+  switch (intent.op) {
+    case 'goTo': {
+      const mi = swMediaIndexById(intent.id);
+      if (mi < 0) return false;
+      if (intent.clearSelection) { selectedItems.clear(); lastClickedMI = mi; updSelBadge(); }
+      goTo(mi, 'user');
+      return true;
     }
-  } catch (e) { console.warn('ssp-pl-sync emit failed', e); }
+    case 'select': {
+      const ids = swMediaIds();
+      selectedItems = new Set(SlideXCore.swIdsToIndices(ids, intent.ids));
+      const last = intent.lastId == null ? [] : SlideXCore.swIdsToIndices(ids, [intent.lastId]);
+      lastClickedMI = last.length ? last[0] : -1;
+      if (playlistChromeOpen()) renderPlaylist(); else updSelBadge();
+      return true;
+    }
+    case 'step':
+      if (!getMediaItems().length) return false;
+      goTo(cur + intent.dir, 'user');
+      return true;
+    case 'togglePlay':
+      if (!getMediaItems().length) return false;
+      togglePlay();
+      return true;
+    case 'reorder': {
+      const next = SlideXCore.swApplyOrder(items, intent.order);
+      if (!next) return false;
+      const selIds = SlideXCore.swIndicesToIds(swMediaIds(), Array.from(selectedItems));
+      const lastIds = lastClickedMI >= 0 ? SlideXCore.swIndicesToIds(swMediaIds(), [lastClickedMI]) : [];
+      applyReorderResult({ moved: true, items: next, clearedSelection: false });
+      const ids = swMediaIds();
+      selectedItems = new Set(SlideXCore.swIdsToIndices(ids, selIds));
+      const last = SlideXCore.swIdsToIndices(ids, lastIds);
+      lastClickedMI = last.length ? last[0] : -1;
+      if (playlistChromeOpen()) renderPlaylist();
+      return true;
+    }
+    case 'remove': {
+      const idxs = intent.ids.map(swItemIndexById).filter(i => i >= 0).sort((a, b) => b - a);
+      if (!idxs.length) return false;
+      idxs.forEach(idx => {
+        const it = items[idx];
+        if (!it) return;
+        if (it.type === 'folder') items.splice(idx, 1);
+        else removeItem(idx, false);
+      });
+      if (playlistChromeOpen()) renderPlaylist(); else { try { buildPlRows(); } catch (_) {} }
+      autoSave();
+      return true;
+    }
+    case 'toggleFolder': {
+      const it = items[swItemIndexById(intent.id)];
+      if (!it || it.type !== 'folder') return false;
+      it.open = it.open === false;
+      if (playlistChromeOpen()) renderPlaylist(); else { try { buildPlRows(); } catch (_) {} }
+      schedAutoSave();
+      return true;
+    }
+    case 'renameFolder': {
+      const it = items[swItemIndexById(intent.id)];
+      if (!it || it.type !== 'folder') return false;
+      it.name = intent.name;
+      if (playlistChromeOpen()) renderPlaylist();
+      autoSave();
+      return true;
+    }
+    case 'setDuration': {
+      const it = items[swItemIndexById(intent.id)];
+      if (!it || it.type !== 'image') return false;
+      it.customDur = intent.ms;
+      saveItemLS(it);
+      schedAutoSave();
+      return true;
+    }
+    case 'setKenBurns': {
+      const it = items[swItemIndexById(intent.id)];
+      if (!it || it.type !== 'image') return false;
+      it.kbPreset = intent.preset === 'auto' ? undefined : intent.preset;
+      saveItemLS(it);
+      schedAutoSave();
+      if (swMediaIndexById(intent.id) === cur) applyKBNow();
+      return true;
+    }
+    case 'tool': {
+      const b = g(intent.id);
+      if (!b || b.hidden || b.disabled) return false;
+      b.click();
+      return true;
+    }
+    case 'dock':
+      dockPlaylistWindow();
+      return true;
+    default:
+      return false;
+  }
 }
 
+function swEnsureHub() {
+  if (swHub) return swHub;
+  if (!window.SlideXCore || !SlideXCore.createSwHub) return null;
+  swHub = SlideXCore.createSwHub({ send: swEmit, snapshot: swMainState, apply: swApplyIntent });
+  return swHub;
+}
+
+/** Main: wait until the old window has reported sw://closed (or the timeout passes). */
+function swWaitChildClosed(ms) {
+  if (!swChildAlive) return Promise.resolve(true);
+  return new Promise(resolve => {
+    let timer = null;
+    const done = () => { clearTimeout(timer); resolve(true); };
+    timer = setTimeout(() => {
+      swClosedWaiters = swClosedWaiters.filter(f => f !== done);
+      resolve(false);
+    }, ms);
+    swClosedWaiters.push(done);
+  });
+}
+
+function applyUndockedMainChrome() {
+  document.body.classList.toggle('ssp-main-undocked', !SSP_IS_PLAYLIST_WINDOW && playlistUndocked);
+  const bplt = g('bplt');
+  if (bplt && !SSP_IS_PLAYLIST_WINDOW) {
+    bplt.classList.toggle('on', playlistUndocked || dockExpanded);
+    bplt.title = playlistUndocked ? 'Show the Media Manager window' : 'Playlist';
+  }
+}
+
+async function undockPlaylistWindow() {
+  if (!SSP_UNDOCK_ENABLED) return;
+  if (SSP_IS_PLAYLIST_WINDOW) return;
+  if (!sspIsTauri()) {
+    showToast('Open in window needs the SlideX desktop app.', 3500);
+    return;
+  }
+  if (playlistUndocked) {
+    tauriInvoke('focus_playlist_window').catch(() => swOnChildClosed());
+    return;
+  }
+  if (swOpening) return;
+  swOpening = true;
+  try {
+    // A window that is still closing would be focused instead of rebuilt.
+    if (swChildAlive) await swWaitChildClosed(2000);
+    if (!swEnsureHub()) return;
+    try {
+      await tauriInvoke('open_playlist_window');
+    } catch (e) {
+      console.warn(e);
+      showToast('Could not open the Media Manager window: ' + (e && e.message ? e.message : e), 5000);
+      return;
+    }
+    swChildAlive = true;
+    playlistUndocked = true;
+    dockExpanded = false;
+    const dock = g('media-dock');
+    if (dock) {
+      dock.classList.remove('expanded');
+      dock.classList.add('collapsed');
+    }
+    applyUndockedMainChrome();
+    // The window may not be listening yet; it says hello when ready and gets a snapshot then.
+    swHub.open();
+    clearInterval(swBeatTimer);
+    swBeatTimer = setInterval(() => { if (swHub) swHub.beat(); }, SlideXCore.SW_BEAT_MS);
+    showToast('Media Manager opened in its own window. Drag it to your other screen.', 2600);
+  } finally {
+    swOpening = false;
+  }
+}
+
+/** Main: take the Media Manager back. Idempotent; returns true when it was undocked. */
+function swRedockMain(toast) {
+  if (!playlistUndocked) return false;
+  playlistUndocked = false;
+  if (swHub) swHub.close();
+  clearInterval(swBeatTimer); swBeatTimer = null;
+  clearTimeout(swSnapTimer); swSnapTimer = null;
+  applyUndockedMainChrome();
+  dockExpanded = true;
+  const dock = g('media-dock');
+  if (dock) {
+    dock.classList.add('expanded');
+    dock.classList.remove('collapsed');
+  }
+  g('bplt') && g('bplt').classList.add('on');
+  renderPlaylist();
+  if (toast) showToast('Media Manager is back here. Order and selection kept.', 2600);
+  return true;
+}
+
+/** Main: Rust reports the playlist window is gone (Dock back, native close, or crash). */
+function swOnChildClosed() {
+  swChildAlive = false;
+  const waiters = swClosedWaiters;
+  swClosedWaiters = [];
+  waiters.forEach(f => { try { f(); } catch (_) {} });
+  swRedockMain(true);
+}
+
+async function dockPlaylistWindow() {
+  if (SSP_IS_PLAYLIST_WINDOW) {
+    // This window holds no state of its own, so there is nothing to flush first.
+    if (swChild) swChild.intent('dock');
+    // If main does not answer (link dropped), close anyway; main re-docks on sw://closed.
+    setTimeout(() => {
+      tauriInvoke('close_playlist_window').catch(() => { try { window.close(); } catch (_) {} });
+    }, 600);
+    return;
+  }
+  swRedockMain(true);
+  try { await tauriInvoke('close_playlist_window'); } catch (_) {}
+}
+
+/** Second window: send one intent to main. Refused while not linked (except Dock back). */
+function swChildIntent(op, args) {
+  if (!SSP_IS_PLAYLIST_WINDOW || !swChild) return false;
+  const sent = swChild.intent(op, args);
+  if (!sent && swChild.link !== 'linked' && op !== 'dock') {
+    showToast('Not linked to the main window. Editing is paused.', 2200);
+  }
+  swRenderBar();
+  return sent;
+}
+
+function swChildGoToIndex(i) {
+  const mi = getMediaItems();
+  if (!mi.length) return false;
+  const idx = ((i % mi.length) + mi.length) % mi.length;
+  return swChildIntent('goTo', { id: mi[idx].id });
+}
+
+function swRenderBar() {
+  if (!SSP_IS_PLAYLIST_WINDOW || !swChild || !window.SlideXCore) return;
+  const link = swChild.link;
+  const st = swChild.state;
+  const t = SlideXCore.swLinkText(link, swChild.lastHeardAgo());
+  document.body.classList.toggle('sw-opening', !st);
+  document.body.classList.toggle('sw-unlinked', link === 'unlinked');
+  const chip = g('swStatus');
+  if (chip) {
+    chip.textContent = t.chip;
+    chip.className = 'sw-chip ' + (link === 'linked' ? 'live' : (link === 'unlinked' ? 'err' : ''));
+  }
+  const ago = g('swAgo');
+  if (ago) ago.textContent = link === 'unlinked' ? (t.ago || '') : '';
+  const main = g('swMain');
+  if (main) {
+    main.textContent = st && link === 'linked'
+      ? ('Main: ' + (st.playing ? 'playing ' : 'paused ') + (st.count ? (st.index + 1) + ' / ' + st.count : 'empty') + (st.nowName ? ' · ' + st.nowName : ''))
+      : '';
+  }
+  const banner = g('swBanner');
+  if (banner) {
+    banner.textContent = t.banner || '';
+    banner.hidden = !t.banner;
+  }
+  const rc = g('swReconnect');
+  if (rc) rc.hidden = link !== 'unlinked';
+}
+
+/** Second window only: turn a snapshot into this window's render copy of the items. */
 async function applyLivePlaylistSnapshot(snap) {
   snap = migrateSnapshot(snap);
   if (!snap || !Array.isArray(snap.items)) return 'empty';
@@ -1847,7 +2139,7 @@ async function applyLivePlaylistSnapshot(snap) {
   items = next.filter(Boolean);
   items.forEach(it => initItem(it));
   if (SSP_IS_PLAYLIST_WINDOW) {
-    // Keep a lightweight stage model for filmstrip thumbs; no autoplay in the dock window.
+    // Keep a lightweight stage model for filmstrip thumbs; no autoplay in the second window.
     try { buildSlideDOM(); } catch (_) {}
   } else {
     rebuildSlides(typeof cur === 'number' ? cur : 0);
@@ -1855,170 +2147,57 @@ async function applyLivePlaylistSnapshot(snap) {
   return 'rebuild';
 }
 
-async function applyLiveSync(payload) {
-  if (!payload || payload.v !== 1) return;
-  if (payload.origin === SSP_WINDOW_ROLE) return;
-  if (typeof payload.seq === 'number' && payload.seq <= plSyncApplied) return;
-  if (typeof payload.seq === 'number') plSyncApplied = payload.seq;
-  plSyncMute = true;
+/** Second window: show the newest snapshot. Snapshots are applied one at a time, newest wins. */
+async function swChildApply() {
+  if (swChildBusy) { swChildPending = true; return; }
+  swChildBusy = true;
   try {
-    await applyLivePlaylistSnapshot(payload.snap || { items: [] });
-    const miLen = getMediaItems().length;
-    cur = Math.max(0, Math.min(payload.cur | 0, Math.max(0, miLen - 1)));
-    selectedItems = new Set(Array.isArray(payload.selected) ? payload.selected : []);
-    lastClickedMI = payload.lastClickedMI != null ? payload.lastClickedMI : -1;
-    plSearchQuery = payload.search || '';
-    const searchEl = g('dock-search');
-    if (searchEl && searchEl.value !== plSearchQuery) searchEl.value = plSearchQuery;
-    if (!SSP_IS_PLAYLIST_WINDOW && miLen) {
-      try {
-        applySlideSettings(cur);
-        showSlide(cur);
-        const sc = g('sc');
-        if (sc) sc.textContent = (cur + 1) + '/' + miLen;
-        try { updStripActive(cur); scrollStripTo(cur, false); } catch (_) {}
-      } catch (_) {}
-    } else if (SSP_IS_PLAYLIST_WINDOW && miLen) {
-      try { updStripActive(cur); scrollStripTo(cur, false); } catch (_) {}
-    }
-    if (playlistChromeOpen()) renderPlaylist();
-    else {
-      try { buildPlRows(); } catch (_) {}
-      updSelBadge();
-    }
-    if (SSP_IS_PLAYLIST_WINDOW) {
-      try { updPlCur(); } catch (_) {}
-    }
-    plSyncReceived = true;
-    stopChildSyncRequest();
-    try { emitPlaylistSyncAck(payload); } catch (_) {}
-  } catch (e) {
-    console.warn('applyLiveSync failed', e);
-  } finally {
-    plSyncMute = false;
-  }
-}
-
-function requestPlaylistSync() {
-  try {
-    if (plSyncChannel) plSyncChannel.postMessage({ v: 1, type: 'request', origin: SSP_WINDOW_ROLE });
-  } catch (_) {}
-  try {
-    if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
-      window.__TAURI__.event.emit('ssp-pl-request', { origin: SSP_WINDOW_ROLE });
-    }
-  } catch (_) {}
-}
-
-function applyUndockedMainChrome() {
-  document.body.classList.toggle('ssp-main-undocked', !SSP_IS_PLAYLIST_WINDOW && playlistUndocked);
-  const bplt = g('bplt');
-  if (bplt && !SSP_IS_PLAYLIST_WINDOW) {
-    bplt.classList.toggle('on', playlistUndocked || dockExpanded);
-    bplt.title = playlistUndocked ? 'Focus undocked Media Manager' : 'Playlist';
-  }
-}
-
-async function undockPlaylistWindow() {
-  if (!SSP_UNDOCK_ENABLED) return;
-  if (SSP_IS_PLAYLIST_WINDOW) return;
-  if (!sspIsTauri()) {
-    showToast('Undock requires the SlideX desktop app.', 3500);
-    return;
-  }
-  try {
-    await tauriInvoke('open_playlist_window');
-  } catch (e) {
-    console.warn(e);
-    showToast('Could not open playlist window: ' + (e && e.message ? e.message : e), 5000);
-    return;
-  }
-  playlistUndocked = true;
-  dockExpanded = false;
-  const dock = g('media-dock');
-  if (dock) {
-    dock.classList.remove('expanded');
-    dock.classList.add('collapsed');
-  }
-  applyUndockedMainChrome();
-  notifyPlaylistSync();
-  startUndockSyncPush();
-  // Detect close → dock chrome back without losing playlist state.
-  tryBindPlaylistWindowClosed();
-  showToast('Media Manager undocked.', 2200);
-}
-
-let _plCloseBound = false;
-function tryBindPlaylistWindowClosed(attempt) {
-  if (_plCloseBound || !window.__TAURI__) return;
-  const WW = window.__TAURI__.webviewWindow && window.__TAURI__.webviewWindow.WebviewWindow;
-  if (!WW || !WW.getByLabel) return;
-  const n = attempt || 0;
-  // open_playlist_window returns before build() finishes — retry until label exists.
-  WW.getByLabel('playlist').then(w => {
-    if (!w) {
-      if (n < 50) setTimeout(() => tryBindPlaylistWindowClosed(n + 1), 40);
-      return;
-    }
-    if (_plCloseBound) return;
-    _plCloseBound = true;
-    const onClosed = () => {
-      _plCloseBound = false;
-      stopUndockSyncPush();
-      if (!playlistUndocked) return;
-      playlistUndocked = false;
-      applyUndockedMainChrome();
-      // Restore dock chrome expanded so toolbar/list return to main.
-      dockExpanded = true;
-      const dock = g('media-dock');
-      if (dock) {
-        dock.classList.add('expanded');
-        dock.classList.remove('collapsed');
-      }
-      const bplt = g('bplt');
-      if (bplt) bplt.classList.add('on');
+    do {
+      swChildPending = false;
+      const st = swChild && swChild.state;
+      const v = swChild ? swChild.version : 0;
+      if (!st || v === swChildShownV) continue;
+      // Work on a plain copy; the snapshot itself stays frozen.
+      await applyLivePlaylistSnapshot({ sspVersion: 1, items: JSON.parse(JSON.stringify(st.items || [])) });
+      const ids = swMediaIds();
+      const curIdx = st.curId == null ? -1 : ids.indexOf(st.curId);
+      cur = curIdx >= 0 ? curIdx : 0;
+      selectedItems = new Set(SlideXCore.swIdsToIndices(ids, st.selectedIds || []));
+      const last = st.lastId == null ? [] : SlideXCore.swIdsToIndices(ids, [st.lastId]);
+      lastClickedMI = last.length ? last[0] : -1;
+      swChildShownV = v;
       renderPlaylist();
-      showToast('Media Manager docked.', 2000);
-    };
-    try { w.once('tauri://destroyed', onClosed); } catch (_) {}
-    try { w.once('tauri://close-requested', onClosed); } catch (_) {}
-  }).catch(() => {
-    if (n < 50) setTimeout(() => tryBindPlaylistWindowClosed(n + 1), 40);
-  });
+      try { updStripActive(cur); scrollStripTo(cur, false); } catch (_) {}
+      swRenderBar();
+    } while (swChildPending);
+  } catch (e) {
+    console.warn('second window render failed', e);
+  } finally {
+    swChildBusy = false;
+  }
 }
 
-async function dockPlaylistWindow() {
-  if (SSP_IS_PLAYLIST_WINDOW) {
-    // Push latest state then ask main to restore chrome / close us.
-    try { await broadcastPlaylistSync(); } catch (_) {}
-    try {
-      if (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) {
-        await window.__TAURI__.event.emit('ssp-pl-dock', { origin: 'playlist' });
-      }
-    } catch (_) {}
-    try { await tauriInvoke('close_playlist_window'); } catch (_) {
-      try { window.close(); } catch (__) {}
-    }
+/** Second window: keys become intents. Stage keys (mirror, zoom, colour…) do nothing here. */
+function swChildKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (e.shiftKey) return; // Recycle Bin stays in the main window
+    e.preventDefault();
+    const it = getMediaItems()[cur];
+    if (it) swChildIntent('remove', { ids: [it.id] });
     return;
   }
-  // Main: close child if any and show dock.
-  stopUndockSyncPush();
-  playlistUndocked = false;
-  applyUndockedMainChrome();
-  try { await tauriInvoke('close_playlist_window'); } catch (_) {}
-  dockExpanded = true;
-  const dock = g('media-dock');
-  if (dock) {
-    dock.classList.add('expanded');
-    dock.classList.remove('collapsed');
-  }
-  g('bplt') && g('bplt').classList.add('on');
-  renderPlaylist();
+  const id = findMappedId(e.key);
+  if (id === 'next' || id === 'prev') { e.preventDefault(); swChildIntent('step', { dir: id === 'next' ? 1 : -1 }); }
+  else if (id === 'play') { e.preventDefault(); swChildIntent('togglePlay'); }
+  else if (id === 'addMedia') { e.preventDefault(); swChildIntent('tool', { id: 'pladd' }); }
+  else if (id === 'playlist') { e.preventDefault(); togglePL(); }
 }
 
 function enterPlaylistWindowShell() {
   if (!SSP_IS_PLAYLIST_WINDOW) return;
-  document.body.classList.add('ssp-playlist-window');
+  if (swChild) return;
+  document.body.classList.add('ssp-playlist-window', 'sw-opening');
   document.title = 'SlideX — Media Manager';
   const dock = g('media-dock');
   if (dock) {
@@ -2026,70 +2205,46 @@ function enterPlaylistWindowShell() {
     dock.classList.remove('collapsed');
   }
   dockExpanded = true;
-  // Hide landing / force app shell if present
-  try {
-    if (dz) dz.style.display = 'none';
-    if (viewer) viewer.style.display = 'none';
-  } catch (_) {}
-  const ctrls = g('ctrls');
-  if (ctrls) ctrls.style.display = 'none';
-  // Show toolbar/list chrome immediately; items fill in via handshake.
+  try { if (dz) dz.style.display = 'none'; } catch (_) {}
+  // Toolbar buttons run in the main window, so dialogs and pickers stay with the state.
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest ? e.target.closest('#dock-btns button') : null;
+    if (!b || !SlideXCore.SW_TOOL_IDS.includes(b.id)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    swChildIntent('tool', { id: b.id });
+  }, true);
+  if (g('swDock')) g('swDock').onclick = () => dockPlaylistWindow();
+  if (g('swReconnect')) g('swReconnect').onclick = () => { if (swChild) swChild.hello(); };
+  swChild = SlideXCore.createSwChild({ send: swEmit });
+  swRenderBar();
   try { renderPlaylist(); } catch (_) {}
-  try { g('dock-search') && g('dock-search').focus(); } catch (_) {}
-  startChildSyncRequest();
+  swChild.hello();
+  swHelloTimer = setInterval(() => { if (swChild && !swChild.state) swChild.hello(); }, SlideXCore.SW_HELLO_RETRY_MS);
+  swTickTimer = setInterval(() => { if (swChild) { swChild.tick(); swRenderBar(); } }, 1000);
 }
 
 function initPlaylistWindowSync() {
   if (sspIsTauri()) document.body.classList.add('ssp-tauri');
   try { refreshWindowRoleFromTauri(); } catch (_) {}
-  if (plSyncChannel) {
-    plSyncChannel.onmessage = (ev) => {
-      const data = ev && ev.data;
-      if (!data) return;
-      if (data.type === 'request') {
-        if (data.origin !== SSP_WINDOW_ROLE && (playlistUndocked || !SSP_IS_PLAYLIST_WINDOW)) {
-          broadcastPlaylistSync();
-        }
-        return;
-      }
-      if (data.type === 'ack') {
-        if (!SSP_IS_PLAYLIST_WINDOW && playlistUndocked) stopUndockSyncPush();
-        return;
-      }
-      applyLiveSync(data);
-    };
-  }
   function bindTauriEvents() {
     if (!(window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen)) return false;
     try { refreshWindowRoleFromTauri(); } catch (_) {}
-    window.__TAURI__.event.listen('ssp-pl-sync', (event) => {
-      applyLiveSync(event && event.payload);
-    }).catch(() => {});
-    window.__TAURI__.event.listen('ssp-pl-request', (event) => {
-      const origin = event && event.payload && event.payload.origin;
-      if (origin === SSP_WINDOW_ROLE) return;
-      if (SSP_IS_PLAYLIST_WINDOW) return; // main answers
-      if (playlistUndocked || items.length) broadcastPlaylistSync();
-    }).catch(() => {});
-    window.__TAURI__.event.listen('ssp-pl-ack', (event) => {
-      const origin = event && event.payload && event.payload.origin;
-      if (origin === SSP_WINDOW_ROLE) return;
-      if (!SSP_IS_PLAYLIST_WINDOW && playlistUndocked) stopUndockSyncPush();
-    }).catch(() => {});
-    if (!SSP_IS_PLAYLIST_WINDOW) {
-      window.__TAURI__.event.listen('ssp-pl-dock', () => {
-        stopUndockSyncPush();
-        playlistUndocked = false;
-        applyUndockedMainChrome();
-        dockExpanded = true;
-        const dock = g('media-dock');
-        if (dock) {
-          dock.classList.add('expanded');
-          dock.classList.remove('collapsed');
-        }
-        g('bplt') && g('bplt').classList.add('on');
-        renderPlaylist();
+    const E = SlideXCore.SW_EVENTS;
+    const listen = window.__TAURI__.event.listen;
+    if (SSP_IS_PLAYLIST_WINDOW) {
+      listen(E.snapshot, (event) => {
+        if (swChild && swChild.onSnapshot(event && event.payload)) swChildApply();
+        swRenderBar();
       }).catch(() => {});
+      listen(E.beat, (event) => {
+        if (swChild) swChild.onBeat(event && event.payload);
+        swRenderBar();
+      }).catch(() => {});
+    } else {
+      listen(E.hello, (event) => { if (swHub) swHub.onHello(event && event.payload); }).catch(() => {});
+      listen(E.intent, (event) => { if (swHub) swHub.onIntent(event && event.payload); }).catch(() => {});
+      listen(E.closed, () => swOnChildClosed()).catch(() => {});
     }
     return true;
   }
@@ -4034,6 +4189,7 @@ document.addEventListener('click', e => {
 function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
   if (!item) return;
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
   recordPlaylistEdit('Remove');
   if (clearLS) [item.id, item.name].filter(Boolean).forEach(key => localStorage.removeItem(lsKey(key)));
   items.splice(itemsIdx, 1);
@@ -4221,6 +4377,8 @@ let autoSaveTimer = null;
 function schedAutoSave() { sessionDirty = true; clearTimeout(autoSaveTimer); autoSaveTimer = setTimeout(autoSave, 1500); }
 function saveSessionBeforeExit(ack) {
   clearTimeout(autoSaveTimer);
+  // The second window shares localStorage with main but owns no state, so it never saves.
+  if (SSP_IS_PLAYLIST_WINDOW) return;
   const sel = g('dsel');
   const parsed = sel ? parseInt(sel.value, 10) : NaN;
   const ms = Number.isFinite(parsed) ? parsed : (window.SlideXCore ? SlideXCore.DEFAULT_IMAGE_DURATION_MS : 10000);
@@ -4937,6 +5095,7 @@ function finishAdd(newItems, opts) {
 }
 
 function shufflePlaylist() {
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('tool', { id: 'plshuffle' }); return; }
   recordPlaylistEdit('Shuffle');
   // Reorder the actual items model (Fisher–Yates). Stage/filmstrip/Next follow via rebuildSlides.
   for (let i = items.length - 1; i > 0; i--) {
@@ -5306,7 +5465,8 @@ function togglePL() {
   if (playlistUndocked) {
     // Focus the undocked Media Manager instead of re-expanding local chrome.
     if (sspIsTauri()) {
-      tauriInvoke('focus_playlist_window').catch(() => undockPlaylistWindow());
+      // If the window is gone without a sw://closed, take the Media Manager back here.
+      tauriInvoke('focus_playlist_window').catch(() => swOnChildClosed());
     }
     return;
   }
@@ -5488,6 +5648,12 @@ function createPlFolderRow(row) {
     const finish = (commit) => {
       if (closed) return;
       closed = true;
+      if (SSP_IS_PLAYLIST_WINDOW) {
+        const next = inp.value.trim();
+        if (commit && next && next !== item.name) swChildIntent('renameFolder', { id: item.id, name: next });
+        renderPlaylist();
+        return;
+      }
       if (commit) item.name = inp.value.trim() || item.name;
       renderPlaylist();
       if (commit) autoSave();
@@ -5499,12 +5665,17 @@ function createPlFolderRow(row) {
     };
   };
   const del = document.createElement('button'); del.className = 'pf-del'; del.textContent = '✕';
-  del.onclick = e => { e.stopPropagation(); items.splice(itemsIdx, 1); renderPlaylist(); autoSave(); };
+  del.onclick = e => {
+    e.stopPropagation();
+    if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
+    items.splice(itemsIdx, 1); renderPlaylist(); autoSave();
+  };
   div.onclick = (e) => {
     if (e.target.closest && e.target.closest('button,input,.pl-rename')) return;
     if (toggleTimer) clearTimeout(toggleTimer);
     toggleTimer = setTimeout(() => {
       toggleTimer = null;
+      if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('toggleFolder', { id: item.id }); return; }
       item.open = item.open === false ? true : false;
       renderPlaylist();
       notifyPlaylistSync();
@@ -5559,7 +5730,11 @@ function createPlMediaRow(row) {
       if ((item.customDur ?? getDur()) === v) opt.selected = true;
       sel.appendChild(opt);
     });
-    sel.onchange = e => { e.stopPropagation(); item.customDur = parseInt(sel.value); saveItemLS(item); schedAutoSave(); };
+    sel.onchange = e => {
+      e.stopPropagation();
+      if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('setDuration', { id: item.id, ms: parseInt(sel.value, 10) }); return; }
+      item.customDur = parseInt(sel.value); saveItemLS(item); schedAutoSave();
+    };
     sel.onclick = e => e.stopPropagation();
     durRow.appendChild(lbl); durRow.appendChild(sel); info.appendChild(durRow);
 
@@ -5572,7 +5747,11 @@ function createPlMediaRow(row) {
       if ((ov === undefined && v === 'auto') || (ov !== undefined && String(ov) === String(v))) opt.selected = true;
       kbsel.appendChild(opt);
     });
-    kbsel.onchange = e => { e.stopPropagation(); item.kbPreset = kbsel.value === 'auto' ? undefined : parseInt(kbsel.value); saveItemLS(item); schedAutoSave(); if (thisMI === cur) applyKBNow(); };
+    kbsel.onchange = e => {
+      e.stopPropagation();
+      if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('setKenBurns', { id: item.id, preset: kbsel.value === 'auto' ? 'auto' : parseInt(kbsel.value, 10) }); return; }
+      item.kbPreset = kbsel.value === 'auto' ? undefined : parseInt(kbsel.value); saveItemLS(item); schedAutoSave(); if (thisMI === cur) applyKBNow();
+    };
     kbsel.onclick = e => e.stopPropagation();
     kbRow.appendChild(kblbl); kbRow.appendChild(kbsel); info.appendChild(kbRow);
   }
@@ -5583,6 +5762,19 @@ function createPlMediaRow(row) {
   div.onclick = e => {
     if (item.missing || item.unavailable) {
       showToast((item.name || 'Item') + ' is missing.', 2500);
+      return;
+    }
+    if (SSP_IS_PLAYLIST_WINDOW) {
+      // Selection and the shown slide belong to main; ask for them.
+      if (e.shiftKey && lastClickedMI >= 0) {
+        const lo = Math.min(lastClickedMI, thisMI), hi = Math.max(lastClickedMI, thisMI);
+        const want = new Set(selectedItems);
+        for (let k = lo; k <= hi; k++) want.add(k);
+        const ids = swMediaIds();
+        swChildIntent('select', { ids: SlideXCore.swIndicesToIds(ids, Array.from(want)), lastId: ids[lastClickedMI] || null });
+      } else {
+        swChildIntent('goTo', { id: item.id, clearSelection: true });
+      }
       return;
     }
     if (e.shiftKey && lastClickedMI >= 0) {
@@ -5830,6 +6022,7 @@ function onReorderPointerEnd(e) {
 
 function applyReorderResult(result) {
   if (!result || !result.moved) return;
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('reorder', { order: result.items.map(it => it.id) }); return; }
   recordPlaylistEdit('Reorder');
   const beforeItems = items;
   const beforeCur = cur;
@@ -6221,6 +6414,7 @@ function schedNext() {
 }
 
 function goTo(i, source) {
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildGoToIndex(i); return; }
   clearTimeout(tmr); clearInterval(ptmr);
   if (kbId) { cancelAnimationFrame(kbId); kbId = null; }
   if (compKbId) { cancelAnimationFrame(compKbId); compKbId = null; }
@@ -6312,8 +6506,10 @@ function updPlayBtn() {
     ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>'
     : '<polygon points="5 3 19 12 5 21 5 3"/>';
   if (typeof window.sspSoundtrackSync === 'function') window.sspSoundtrackSync();
+  try { notifyPlaylistSync(); } catch (_) {}
 }
 function togglePlay() {
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('togglePlay'); return; }
   playing = !playing; updPlayBtn();
   if (window.__sspCastActive) {
     pauseVids();
@@ -6777,12 +6973,23 @@ document.addEventListener('keydown', e => {
     e.preventDefault(); return;
   }
 
+  /* Ctrl+Shift+U: open the Media Manager in its own window, or dock it back (either window). */
+  if (window.SlideXCore && SlideXCore.isDockToggleKey && SlideXCore.isDockToggleKey(e)) {
+    e.preventDefault();
+    if (SSP_IS_PLAYLIST_WINDOW || playlistUndocked) dockPlaylistWindow();
+    else if (SSP_UNDOCK_ENABLED) undockPlaylistWindow();
+    return;
+  }
+
   /* Escape: close shortcut editor, exit watch mode, close overflow, or clear selection (fixed) */
   if (e.key === 'Escape') {
     if (settingsOpen()) { closeSettings(); return; }
     if (watchMode) { toggleWatchMode(); return; }
     if (g('ctrls-overflow')?.classList.contains('open')) { setOverflowOpen(false); return; }
-    if (selectedItems.size > 0) { selectedItems.clear(); updSelBadge(); if (playlistChromeOpen()) renderPlaylist(); }
+    if (selectedItems.size > 0) {
+      if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('select', { ids: [], lastId: null }); return; }
+      selectedItems.clear(); updSelBadge(); if (playlistChromeOpen()) renderPlaylist();
+    }
     return;
   }
 
@@ -6800,6 +7007,9 @@ document.addEventListener('keydown', e => {
     || (e.target && (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA'));
   if (editing) return;
 
+  /* Second window: keys become intents for main; stage keys do nothing here. */
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildKey(e); return; }
+
   /* Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) undo and redo playlist edits. Text fields keep their own undo. */
   const undoAct = window.SlideXCore && SlideXCore.undoKeyAction ? SlideXCore.undoKeyAction(e) : null;
   if (undoAct && (getMediaItems().length || playlistUndoPending())) { e.preventDefault(); undoPlaylistEdit(undoAct === 'redo'); return; }
@@ -6811,8 +7021,8 @@ document.addEventListener('keydown', e => {
       setOverflowOpen(SlideXCore.nextMoreToolsOpen(!!g('ctrls-overflow')?.classList.contains('open')), true);
       return;
     }
-    // Undocked Media Manager: still allow Add / playlist focus with empty list.
-    if (SSP_IS_PLAYLIST_WINDOW || playlistUndocked) {
+    // Media Manager open in its own window: still allow Add / playlist focus with an empty list.
+    if (playlistUndocked) {
       const idEmpty = findMappedId(e.key);
       if (idEmpty === 'addMedia') { e.preventDefault(); g('pladd').click(); return; }
       if (idEmpty === 'playlist') { e.preventDefault(); togglePL(); return; }

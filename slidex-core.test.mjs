@@ -1646,6 +1646,7 @@ test('a photo timer then a video FINISHED leaves cur on item 3', () => {
     notifyPlaylistSync() {},
     playCurVid() {},
     startVProg() {},
+    SSP_IS_PLAYLIST_WINDOW: false,
     window: { __sspCastActive: true },
   };
   vm.runInNewContext(`
@@ -2503,24 +2504,373 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.equal(C.castFailureMessage('Living Room TV'), failed.message);
 });
 
-test('the Undock button stays in the code and is not shown in 0.1.19', () => {
-  assert.equal(C.UNDOCK_MAIN_WINDOW, false);
+const swIds = (list) => Array.from(list, it => it.id);
+
+test('Undock is back in 0.2.0 as "Open in window", behind one flag on each side', () => {
+  assert.equal(C.UNDOCK_MAIN_WINDOW, true);
   assert.equal(C.undockControlShown(false), false);
   assert.equal(C.undockControlShown(true), true);
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
-  assert.match(html, /id="plundock"/);
-  assert.match(html, /const SSP_UNDOCK_ENABLED = false/);
+  assert.match(html, /<button id="plundock" title="Open in window \(Ctrl\+Shift\+U\)">Open in window<\/button>/);
+  assert.match(html, /const SSP_UNDOCK_ENABLED = true;/);
   assert.match(html, /if \(SSP_UNDOCK_ENABLED\) document\.body\.classList\.add\('ssp-undock-enabled'\)/);
   assert.match(html, /body\.ssp-tauri\.ssp-undock-enabled #plundock/);
-  assert.doesNotMatch(html, /body\.ssp-tauri #plundock \{/);
-  const undockFn = html.slice(html.indexOf('async function undockPlaylistWindow'), html.indexOf('let _plCloseBound'));
+  const undockFn = html.slice(html.indexOf('async function undockPlaylistWindow'), html.indexOf('function swRedockMain'));
   assert.match(undockFn, /if \(!SSP_UNDOCK_ENABLED\) return/);
-  assert.match(html, /function undockPlaylistWindow/);
-  assert.match(html, /open_playlist_window/);
+  assert.match(undockFn, /open_playlist_window/);
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  assert.match(lib, /const UNDOCK_MAIN_WINDOW: bool = true;/);
   const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
   assert.match(open, /undock_blocked_reason/);
-  assert.match(lib, /Undock is off in 0\.1\.19/);
+});
+
+test('second-window intents are allow-listed and keep only the fields each op needs', () => {
+  const N = C.swNormalizeIntent;
+  assert.equal(N(null), null);
+  assert.equal(N({ op: 'setItems', items: [] }), null, 'no op can hand main a whole list');
+  assert.equal(N({ op: 'eval', code: '1' }), null);
+  assert.deepEqual({ ...N({ op: 'goTo', id: 'a', extra: 1 }) }, { op: 'goTo', id: 'a', clearSelection: false });
+  assert.equal(N({ op: 'goTo', id: 3 }), null);
+  assert.deepEqual({ ...N({ op: 'step', dir: -1 }) }, { op: 'step', dir: -1 });
+  assert.equal(N({ op: 'step', dir: 5 }), null);
+  assert.deepEqual(Array.from(N({ op: 'reorder', order: ['b', 'a'] }).order), ['b', 'a']);
+  assert.equal(N({ op: 'reorder', order: ['a', 'a'] }), null, 'duplicate ids');
+  assert.equal(N({ op: 'reorder', order: [] }), null);
+  assert.equal(N({ op: 'remove', ids: [] }), null);
+  assert.deepEqual(Array.from(N({ op: 'select', ids: [] }).ids), []);
+  assert.equal(N({ op: 'select', ids: ['a'], lastId: 7 }), null);
+  assert.equal(N({ op: 'renameFolder', id: 'f', name: '   ' }), null);
+  assert.equal(N({ op: 'renameFolder', id: 'f', name: ' Day 1 ' }).name, 'Day 1');
+  assert.equal(N({ op: 'setDuration', id: 'a', ms: 7000 }), null, 'only the durations the menu offers');
+  assert.equal(N({ op: 'setDuration', id: 'a', ms: 6000 }).ms, 6000);
+  assert.equal(N({ op: 'setKenBurns', id: 'a', preset: 'auto' }).preset, 'auto');
+  assert.equal(N({ op: 'setKenBurns', id: 'a', preset: 2.5 }), null);
+  assert.equal(N({ op: 'tool', id: 'plshuffle' }).id, 'plshuffle');
+  assert.equal(N({ op: 'tool', id: 'bru' }), null, 'only Media Manager toolbar buttons');
+  assert.equal(N({ op: 'tool', id: 'ctx-del' }), null, 'never the Recycle Bin');
+  assert.deepEqual({ ...N({ op: 'dock', origin: 'x' }) }, { op: 'dock' });
+});
+
+test('the second window keeps a frozen copy and never sends state back', () => {
+  const sent = [];
+  let t = 1000;
+  const child = C.createSwChild({ send: (ev, p) => sent.push([ev, p]), now: () => t });
+  assert.equal(child.link, 'opening');
+  assert.equal(child.intent('goTo', { id: 'a' }), false, 'no edits before the first snapshot');
+  child.hello();
+  assert.equal(child.onSnapshot({ v: 3, origin: 'main', state: { items: [{ id: 'a' }, { id: 'b' }], curId: 'a' } }), true);
+  assert.equal(child.link, 'linked');
+  const st = child.state;
+  assert.ok(Object.isFrozen(st) && Object.isFrozen(st.items) && Object.isFrozen(st.items[0]));
+  assert.throws(() => { st.items.push({ id: 'z' }); }, /not extensible/);
+  assert.throws(() => { st.items[0].id = 'z'; }, /read only/);
+  assert.throws(() => { st.curId = 'b'; }, /read only/);
+  assert.equal(child.state.items.length, 2);
+  // Older, equal or foreign snapshots never replace the copy.
+  assert.equal(child.onSnapshot({ v: 2, origin: 'main', state: { items: [] } }), false);
+  assert.equal(child.onSnapshot({ v: 9, origin: 'playlist', state: { items: [] } }), false);
+  assert.equal(child.state.items.length, 2);
+  assert.equal(child.intent('reorder', { order: ['b', 'a'] }), true);
+  assert.equal(child.intent('setItems', { items: [] }), false);
+  assert.equal(child.state.items[0].id, 'a', 'sending an intent does not touch the copy');
+  const kinds = sent.map(([ev]) => ev);
+  assert.ok(kinds.every(ev => ev === C.SW_EVENTS.hello || ev === C.SW_EVENTS.intent), kinds.join(','));
+  const intent = sent.find(([ev]) => ev === C.SW_EVENTS.intent)[1];
+  assert.equal(intent.origin, 'playlist');
+  assert.equal(intent.baseV, 3);
+  assert.deepEqual(Array.from(intent.order), ['b', 'a']);
+});
+
+test('main applies an intent on its own state and then broadcasts a new snapshot', () => {
+  const sent = [];
+  const model = { items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }], cur: 0 };
+  const applied = [];
+  const hub = C.createSwHub({
+    send: (ev, p) => sent.push([ev, p]),
+    snapshot: () => ({ items: model.items.map(it => ({ id: it.id })), curId: model.items[model.cur].id }),
+    apply: (intent) => {
+      applied.push(intent.op);
+      if (intent.op === 'reorder') {
+        const next = C.swApplyOrder(model.items, intent.order);
+        if (!next) return false;
+        model.items = next;
+        return true;
+      }
+      if (intent.op === 'goTo') { model.cur = model.items.findIndex(it => it.id === intent.id); return true; }
+      if (intent.op === 'togglePlay') throw new Error('boom');
+      return false;
+    }
+  });
+  assert.equal(hub.onIntent({ op: 'goTo', id: 'b', origin: 'playlist' }).reason, 'closed', 'nothing before open');
+  assert.equal(sent.length, 0);
+  const first = hub.open();
+  assert.equal(first.v, 1);
+  assert.equal(sent[0][0], C.SW_EVENTS.snapshot);
+  const r = hub.onIntent({ op: 'reorder', order: ['c', 'a', 'b'], origin: 'playlist' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(swIds(model.items), ['c', 'a', 'b']);
+  const snap = sent[sent.length - 1];
+  assert.equal(snap[0], C.SW_EVENTS.snapshot);
+  assert.equal(snap[1].v, 2);
+  assert.deepEqual(swIds(snap[1].state.items), ['c', 'a', 'b']);
+  // A stale order (an item main no longer has) is refused, and main resends its truth.
+  const before = sent.length;
+  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'x'], origin: 'playlist' }).ok, false);
+  assert.deepEqual(swIds(model.items), ['c', 'a', 'b']);
+  assert.equal(sent.length, before + 1);
+  assert.equal(sent[sent.length - 1][1].v, 3);
+  // Invalid ops never reach apply; intents from main itself are ignored.
+  const nApplied = applied.length;
+  assert.equal(hub.onIntent({ op: 'setItems', items: [], origin: 'playlist' }).reason, 'invalid');
+  assert.equal(hub.onIntent({ op: 'goTo', id: 'a', origin: 'main' }).reason, 'origin');
+  assert.equal(applied.length, nApplied);
+  // An apply that throws changes nothing and still answers with a snapshot.
+  const n2 = sent.length;
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist' }).ok, false);
+  assert.equal(sent.length, n2 + 1);
+  assert.equal(hub.beat().v, hub.version);
+});
+
+test('a reorder from the second window applies only as an exact permutation of main\'s items', () => {
+  const a = { id: 'a' }, b = { id: 'b' }, c = { id: 'c' };
+  const items = [a, b, c];
+  const next = C.swApplyOrder(items, ['c', 'a', 'b']);
+  assert.equal(next.length, 3);
+  assert.ok(next[0] === c && next[1] === a && next[2] === b, 'same objects, so per-slide settings travel with them');
+  assert.deepEqual(items, [a, b, c], 'input untouched');
+  assert.equal(C.swApplyOrder(items, ['a', 'b', 'c']), null, 'no move');
+  assert.equal(C.swApplyOrder(items, ['a', 'b']), null, 'missing item');
+  assert.equal(C.swApplyOrder(items, ['a', 'b', 'c', 'd']), null, 'extra item');
+  assert.equal(C.swApplyOrder(items, ['a', 'a', 'b']), null, 'duplicate');
+  assert.equal(C.swApplyOrder([{ id: 'a' }, {}], ['a', 'x']), null, 'main item without id');
+  assert.deepEqual(Array.from(C.swIdsToIndices(['a', 'b', 'c'], ['c', 'x', 'a'])), [2, 0]);
+  assert.deepEqual(Array.from(C.swIndicesToIds(['a', 'b', 'c'], [2, 9, 0, 2])), ['c', 'a']);
+});
+
+test('the link drops after 6 s without word from main, and edits pause until it is back', () => {
+  const sent = [];
+  let t = 0;
+  const child = C.createSwChild({ send: (ev, p) => sent.push([ev, p]), now: () => t });
+  t = 7000;
+  child.tick();
+  assert.equal(child.link, 'unlinked', 'never stuck on Connecting');
+  assert.equal(C.swLinkText('opening').chip, 'Connecting to main window…');
+  child.onSnapshot({ v: 1, origin: 'main', state: { items: [{ id: 'a' }] } });
+  assert.equal(child.link, 'linked');
+  t += C.SW_BEAT_MS;
+  child.onBeat({ v: 1, origin: 'main' });
+  t += C.SW_LINK_TIMEOUT_MS - 1;
+  assert.equal(child.tick(), false);
+  assert.equal(child.link, 'linked');
+  t += 2;
+  assert.equal(child.tick(), true);
+  assert.equal(child.link, 'unlinked');
+  const text = C.swLinkText('unlinked', child.lastHeardAgo());
+  assert.equal(text.chip, 'Not linked');
+  assert.match(text.banner, /Editing is paused/);
+  const n = sent.length;
+  assert.equal(child.intent('remove', { ids: ['a'] }), false);
+  assert.equal(child.intent('dock'), true, 'Dock back still works');
+  assert.equal(sent.length, n + 1);
+  // A beat with a newer version brings the link back and asks for the snapshot it missed.
+  t += 1;
+  assert.equal(child.onBeat({ v: 4, origin: 'main' }), true);
+  assert.equal(child.link, 'linked');
+  assert.equal(sent[sent.length - 1][0], C.SW_EVENTS.hello);
+  assert.equal(child.intent('remove', { ids: ['a'] }), true);
+});
+
+test('closing and reopening the second window is safe and never loses main\'s order', () => {
+  const toChild = [];
+  const toMain = [];
+  const model = { items: ['a', 'b', 'c'].map(id => ({ id })), cur: 0 };
+  const hub = C.createSwHub({
+    send: (ev, p) => toChild.push([ev, p]),
+    snapshot: () => ({ items: model.items.map(it => ({ id: it.id })), curId: model.items[model.cur].id }),
+    apply: (intent) => {
+      if (intent.op === 'reorder') {
+        const next = C.swApplyOrder(model.items, intent.order);
+        if (!next) return false;
+        model.items = next;
+        return true;
+      }
+      if (intent.op === 'dock') { hub.close(); return true; }
+      return false;
+    }
+  });
+  const deliver = (child) => {
+    while (toChild.length) {
+      const [ev, p] = toChild.shift();
+      if (ev === C.SW_EVENTS.snapshot) child.onSnapshot(p);
+      if (ev === C.SW_EVENTS.beat) child.onBeat(p);
+    }
+  };
+  const pump = () => {
+    while (toMain.length) {
+      const [ev, p] = toMain.shift();
+      if (ev === C.SW_EVENTS.hello) hub.onHello(p);
+      if (ev === C.SW_EVENTS.intent) hub.onIntent(p);
+    }
+  };
+  // Open: main's first snapshot is lost because the window is not listening yet.
+  hub.open();
+  toChild.length = 0;
+  const child1 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]) });
+  child1.hello(); pump(); deliver(child1);
+  assert.deepEqual(swIds(child1.state.items), ['a', 'b', 'c'], 'hello fixes the create race');
+  child1.intent('reorder', { order: ['c', 'b', 'a'] }); pump(); deliver(child1);
+  assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
+  assert.deepEqual(swIds(child1.state.items), ['c', 'b', 'a']);
+  // Dock back: main keeps its order; nothing has to be flushed from the window.
+  child1.intent('dock'); pump();
+  assert.equal(hub.isOpen, false);
+  assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
+  const vAtClose = hub.version;
+  // Late messages from the closed window change nothing and get no answer.
+  toChild.length = 0;
+  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'c'], origin: 'playlist' }).reason, 'closed');
+  assert.equal(hub.onHello({ origin: 'playlist', v: 0 }), null);
+  assert.equal(hub.beat(), null);
+  assert.equal(toChild.length, 0);
+  assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
+  // Reopen: a fresh window gets main's current order, with a higher version.
+  const again = hub.open();
+  assert.ok(again.v > vAtClose);
+  const child2 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]) });
+  deliver(child2);
+  assert.deepEqual(swIds(child2.state.items), ['c', 'b', 'a']);
+  // Opening twice in a row only re-sends the snapshot.
+  hub.open(); deliver(child2);
+  assert.deepEqual(swIds(child2.state.items), ['c', 'b', 'a']);
+});
+
+test('page code in the second window asks main instead of writing items, selection or playback', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const fn = (start, end) => {
+    const at = html.indexOf(start);
+    assert.ok(at !== -1, start);
+    return html.slice(at, html.indexOf(end, at));
+  };
+  const src = [
+    fn('function removeItem(itemsIdx, clearLS)', '/* ── Context menu ── */'),
+    fn('function shufflePlaylist()', '/* ── Slide DOM'),
+    fn('function applyReorderResult(result)', '/** Map pointer Y inside #pllist'),
+    fn('function goTo(i, source)', '  clearTimeout(tmr); clearInterval(ptmr);\n  if (kbId)') + '}',
+    fn('function togglePlay()', '  playing = !playing; updPlayBtn();') + '}',
+    fn('function swChildGoToIndex(i)', 'function swRenderBar()'),
+    fn('function saveSessionBeforeExit(ack)', 'function autoSave()'),
+  ].join('\n');
+  const intents = [];
+  const writes = [];
+  const store = {
+    getItem: () => null,
+    setItem: (k) => writes.push(k),
+    removeItem: (k) => writes.push(k)
+  };
+  const startItems = [{ id: 'a', type: 'image' }, { id: 'b', type: 'image' }, { id: 'c', type: 'image' }];
+  const sandbox = {
+    SSP_IS_PLAYLIST_WINDOW: true,
+    items: startItems.slice(),
+    cur: 1,
+    playing: true,
+    selectedItems: new Set([0]),
+    autoSaveTimer: null,
+    localStorage: store,
+    clearTimeout() {},
+    getMediaItems() { return sandbox.items.filter(it => it.type !== 'folder'); },
+    swChildIntent(op, args) { intents.push([op, args]); return true; },
+    getPlaylistSnapshot() { writes.push('snapshot'); return { items: [] }; },
+    rebuildSlides() { writes.push('rebuild'); },
+    updPlayBtn() { writes.push('playbtn'); },
+    lsKey: (k) => k,
+    g: () => null,
+  };
+  vm.runInNewContext(src + '\nthis.api = { removeItem, shufflePlaylist, applyReorderResult, goTo, togglePlay, saveSessionBeforeExit };', sandbox);
+  const api = sandbox.api;
+  api.removeItem(0, true);
+  api.shufflePlaylist();
+  api.applyReorderResult({ moved: true, items: [startItems[2], startItems[0], startItems[1]] });
+  api.goTo(4);
+  api.togglePlay();
+  api.saveSessionBeforeExit(() => writes.push('ack'));
+  assert.deepEqual(swIds(sandbox.items), ['a', 'b', 'c'], 'items untouched');
+  assert.equal(sandbox.cur, 1);
+  assert.equal(sandbox.playing, true);
+  assert.deepEqual(Array.from(sandbox.selectedItems), [0]);
+  assert.deepEqual(writes, [], 'no rebuild, no localStorage, no premature exit ack');
+  assert.deepEqual(intents.map(([op]) => op), ['remove', 'tool', 'reorder', 'goTo', 'togglePlay']);
+  assert.deepEqual(Array.from(intents[0][1].ids), ['a']);
+  assert.equal(intents[1][1].id, 'plshuffle');
+  assert.deepEqual(Array.from(intents[2][1].order), ['c', 'a', 'b']);
+  assert.equal(intents[3][1].id, 'b', 'goTo(4) wraps to the 2nd item by id');
+});
+
+test('Ctrl+Shift+U opens the second window and docks it back', () => {
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: true, key: 'U', code: 'KeyU' }), true);
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: true, key: 'u' }), true);
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: false, key: 'u' }), false);
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: true, altKey: true, key: 'U' }), false);
+  assert.equal(C.isDockToggleKey({ shiftKey: true, key: 'U' }), false);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const keydown = html.slice(html.indexOf('/* Ctrl+Shift+U: open the Media Manager'), html.indexOf('/* Escape: close shortcut editor'));
+  assert.match(keydown, /SlideXCore\.isDockToggleKey\(e\)/);
+  assert.match(keydown, /if \(SSP_IS_PLAYLIST_WINDOW \|\| playlistUndocked\) dockPlaylistWindow\(\);/);
+  assert.match(keydown, /else if \(SSP_UNDOCK_ENABLED\) undockPlaylistWindow\(\);/);
+});
+
+test('in the page, the second window only sends intents and main owns every write', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const body = (name) => {
+    const at = html.indexOf(name);
+    assert.ok(at !== -1, name);
+    return html.slice(at, at + 400);
+  };
+  // The old two-way sync is gone: no window pushes whole playlists at the other.
+  assert.doesNotMatch(html, /ssp-pl-sync|ssp-pl-dock|ssp-pl-ack|ssp-playlist-sync|applyLiveSync/);
+  assert.match(body('function notifyPlaylistSync()'), /if \(SSP_IS_PLAYLIST_WINDOW\) return;/);
+  const save = html.slice(html.indexOf('function saveSessionBeforeExit(ack)'), html.indexOf('function autoSave()'));
+  assert.ok(save.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') !== -1);
+  assert.ok(save.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < save.indexOf('getPlaylistSnapshot()'), 'returns before reading or writing the session');
+  assert.match(body('function goTo(i, source)'), /^function goTo\(i, source\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildGoToIndex\(i\); return; \}/);
+  assert.match(body('function togglePlay()'), /^function togglePlay\(\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('togglePlay'\); return; \}/);
+  assert.match(body('function shufflePlaylist()'), /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('tool', \{ id: 'plshuffle' \}\); return; \}/);
+  const rm = body('function removeItem(itemsIdx, clearLS)');
+  assert.ok(rm.indexOf("swChildIntent('remove'") < rm.indexOf('items.splice'), 'remove asks main before any splice');
+  const ro = body('function applyReorderResult(result)');
+  assert.ok(ro.indexOf("swChildIntent('reorder'") < ro.indexOf('items = result.items'), 'reorder asks main before any write');
+  // Folder rename, delete and open, plus per-slide duration and Ken Burns, go to main.
+  for (const op of ['renameFolder', 'toggleFolder', 'setDuration', 'setKenBurns', 'select']) {
+    assert.match(html, new RegExp("swChildIntent\\('" + op + "'"), op);
+  }
+  // Toolbar buttons are run by main, so pickers and prompts act on main's state.
+  const shell = body('function enterPlaylistWindowShell()') + html.slice(html.indexOf('function enterPlaylistWindowShell()'), html.indexOf('function initPlaylistWindowSync()'));
+  assert.match(shell, /SW_TOOL_IDS\.includes\(b\.id\)[\s\S]*stopImmediatePropagation\(\)[\s\S]*swChildIntent\('tool'/);
+  assert.match(shell, /swChild\.hello\(\)/);
+  // Keys in the second window become intents; stage keys never run there.
+  assert.match(html, /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildKey\(e\); return; \}/);
+  // Wiring: main answers hello/intent and re-docks on sw://closed; the window listens to snapshot/beat.
+  const init = html.slice(html.indexOf('function initPlaylistWindowSync()'), html.indexOf('/* ── Android TV SAF bridge'));
+  assert.match(init, /listen\(E\.snapshot/);
+  assert.match(init, /listen\(E\.beat/);
+  assert.match(init, /listen\(E\.hello, \(event\) => \{ if \(swHub\) swHub\.onHello/);
+  assert.match(init, /listen\(E\.intent, \(event\) => \{ if \(swHub\) swHub\.onIntent/);
+  assert.match(init, /listen\(E\.closed, \(\) => swOnChildClosed\(\)\)/);
+  // Black window: #media-dock sits inside #viewer, so the second window must not hide #viewer.
+  const hideList = html.slice(html.indexOf('body.ssp-playlist-window #dz,'), html.indexOf('display: none !important;', html.indexOf('body.ssp-playlist-window #dz,')));
+  assert.doesNotMatch(hideList, /#viewer/);
+  assert.match(html, /body\.ssp-playlist-window #viewer > :not\(#media-dock\) \{\n  display: none !important;/);
+  assert.doesNotMatch(shell, /viewer\.style\.display/);
+  assert.match(html, /<div id="viewer"[\s\S]*<div id="media-dock"/);
+  // Second-window chrome from the 0.2.0 design.
+  for (const id of ['swBar', 'swStatus', 'swDock', 'swReconnect', 'swBanner', 'swSkeleton']) assert.match(html, new RegExp('id="' + id + '"'), id);
+  assert.match(html, /Media Manager is back here\. Order and selection kept\./);
+  // Rust: destroy (no half-closed window to refocus) and tell main when the window is gone.
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  const close = lib.slice(lib.indexOf('fn close_playlist_window'), lib.indexOf('fn focus_playlist_window'));
+  assert.match(close, /w\.destroy\(\)/);
+  assert.doesNotMatch(close, /w\.close\(\)/);
+  assert.match(lib, /const SECOND_WINDOW_CLOSED_EVENT: &str = "sw:\/\/closed";/);
+  assert.match(lib, /window\.label\(\) == "playlist"[\s\S]{0,120}WindowEvent::Destroyed[\s\S]{0,200}emit_to\("main", SECOND_WINDOW_CLOSED_EVENT/);
 });
 
 test('emptying the playlist forgets the saved session so Continue is not offered', () => {
