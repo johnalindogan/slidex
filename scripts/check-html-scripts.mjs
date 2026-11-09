@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -7,13 +7,20 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const androidDir = join(root, 'android', 'app', 'src', 'main', 'assets');
 const androidHtml = join(androidDir, 'SlideShowPro.html');
+const fontsSrc = join(root, 'fonts');
 
 const core = join(root, 'slidex-core.js');
 mkdirSync(androidDir, { recursive: true });
 mkdirSync(join(root, 'ui'), { recursive: true });
+mkdirSync(join(root, 'ui', 'fonts'), { recursive: true });
+mkdirSync(join(androidDir, 'fonts'), { recursive: true });
 copyFileSync(join(root, 'SlideShowPro.html'), androidHtml);
 copyFileSync(core, join(root, 'ui', 'slidex-core.js'));
 copyFileSync(core, join(androidDir, 'slidex-core.js'));
+for (const name of readdirSync(fontsSrc)) {
+  copyFileSync(join(fontsSrc, name), join(root, 'ui', 'fonts', name));
+  copyFileSync(join(fontsSrc, name), join(androidDir, 'fonts', name));
+}
 
 const targets = [
   join(root, 'SlideShowPro.html'),

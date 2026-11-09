@@ -2360,3 +2360,31 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
 });
+
+test('bundled fonts are offline: no Google Fonts refs, woff2 + OFL.txt present', () => {
+  const root = new URL('./', import.meta.url);
+  const htmlPaths = [
+    new URL('./SlideShowPro.html', root),
+    new URL('./android/app/src/main/assets/SlideShowPro.html', root),
+  ];
+  for (const url of htmlPaths) {
+    const html = fs.readFileSync(url, 'utf8');
+    const label = url.pathname.split('/').slice(-3).join('/');
+    assert.doesNotMatch(html, /fonts\.googleapis/i, label);
+    assert.doesNotMatch(html, /fonts\.gstatic/i, label);
+    assert.match(html, /@font-face/, label);
+    assert.match(html, /fonts\/PlusJakartaSans\[wght\]\.woff2/, label);
+    assert.match(html, /fonts\/JetBrainsMono-Regular\.woff2/, label);
+    assert.match(html, /font-display:\s*swap/, label);
+  }
+  const fontDir = new URL('./fonts/', root);
+  for (const name of ['PlusJakartaSans[wght].woff2', 'JetBrainsMono-Regular.woff2', 'OFL.txt']) {
+    const path = new URL(name, fontDir);
+    assert.ok(fs.existsSync(path), name);
+    assert.ok(fs.statSync(path).size > 0, `${name} non-empty`);
+  }
+  const ofl = fs.readFileSync(new URL('OFL.txt', fontDir), 'utf8');
+  assert.match(ofl, /SIL OPEN FONT LICENSE/i);
+  assert.match(ofl, /Plus Jakarta Sans/i);
+  assert.match(ofl, /JetBrains Mono/i);
+});
