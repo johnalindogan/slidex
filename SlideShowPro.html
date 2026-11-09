@@ -86,7 +86,7 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 .zl{animation:zumo .6s cubic-bezier(0.16, 1, 0.3, 1) forwards;}
 
 .vb{position:absolute;top:12px;left:12px;background:rgba(0,0,0,.65);color:#fff;font-size:11px;padding:4px 10px;border-radius:5px;z-index:2;pointer-events:none;display:flex;align-items:center;gap:5px;font-family:var(--font-main);}
-#fnov{position:absolute;bottom:12px;right:12px;background:rgba(0,0,0,.55);color:rgba(255,255,255,.75);font-size:11px;padding:4px 10px;border-radius:4px;z-index:3;font-family:var(--font-main);pointer-events:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity .2s;}
+#fnov{position:absolute;bottom:12px;right:12px;background:rgba(0,0,0,.8);color:rgba(255,255,255,.75);font-size:11px;padding:4px 10px;border-radius:4px;z-index:3;font-family:var(--font-main);pointer-events:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity .2s;}
 #fnov.hidden{opacity:0;pointer-events:none;}
 
 /* Max Mode companion panel (same file cloned) */
@@ -595,7 +595,7 @@ body.ssp-playlist-window #dock-toggle-btn {
   border-bottom: 2px solid rgba(255, 255, 255, .6);
 }
 .pf-arr {
-  color: rgba(255, 255, 255, .45);
+  color: rgba(255, 255, 255, .6);
   font-size: 10px;
   transition: transform .15s;
   flex-shrink: 0;
@@ -750,7 +750,7 @@ body.ssp-playlist-window #dock-toggle-btn {
 #kedlist{flex:1;}
 .kerow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:.5px solid rgba(255,255,255,.06);}
 .kerow.conflict{background:rgba(180,40,40,.12);margin:0 -8px;padding-left:8px;padding-right:8px;border-radius:4px;}
-.kerow.modified .kelbl::after{content:' ·';color:rgba(255,255,255,.25);}
+.kerow.modified .kelbl::after{content:' ·';color:rgba(255,255,255,.6);}
 .kesec{font-size:10px;color:rgba(255,255,255,.6);text-transform:uppercase;letter-spacing:.08em;margin-top:14px;margin-bottom:4px;padding-top:8px;border-top:.5px solid rgba(255,255,255,.08);}
 .kesec:first-child{margin-top:0;padding-top:0;border-top:none;}
 .kednote{font-size:10px;color:rgba(255,255,255,.6);margin-top:14px;line-height:1.45;}
@@ -773,7 +773,7 @@ body.ssp-playlist-window #dock-toggle-btn {
 #showctrl.visible{display:block;}
 
 /* Watch mode badge */
-#watchbadge{display:none;position:fixed;top:12px;right:12px;background:rgba(0,0,0,.55);color:rgba(255,255,255,.6);font-size:10px;padding:3px 10px;border-radius:10px;z-index:4;font-family:system-ui,sans-serif;letter-spacing:.05em;}
+#watchbadge{display:none;position:fixed;top:12px;right:12px;background:rgba(0,0,0,.8);color:rgba(255,255,255,.6);font-size:10px;padding:3px 10px;border-radius:10px;z-index:4;font-family:system-ui,sans-serif;letter-spacing:.05em;}
 #loadstatus{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:40;background:rgba(20,20,20,.92);color:rgba(255,255,255,.9);font:12px/1.4 system-ui,sans-serif;padding:6px 12px;border-radius:999px;pointer-events:none;border:.5px solid rgba(255,255,255,.16);}
 #toast{position:fixed;bottom:32px;left:50%;transform:translateX(-50%);background:rgba(20,20,20,.97);border:.5px solid rgba(255,255,255,.18);color:rgba(255,255,255,.85);font-size:12px;font-family:system-ui,sans-serif;padding:10px 18px;border-radius:8px;z-index:600;pointer-events:none;opacity:0;transition:opacity .25s;max-width:80vw;text-align:center;line-height:1.5;}
 #toast.show{opacity:1;}

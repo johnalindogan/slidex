@@ -483,8 +483,8 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
 
 test('readable text in the main UI is at least 60% white and meets WCAG AA', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
-  /* Decoration only (P1-8 keeps 30% for these): glyph icons and separators, not text you read. */
-  const decor = new Set(['.pc', '.pf-arr', '.pldrag', '.kerow.modified .kelbl::after']);
+  /* Decoration only (P1-8 keeps 30% for these): glyph icons that carry no state. */
+  const decor = new Set(['.pc', '.pldrag']);
   const styles = [];
   html.replace(/<style[^>]*>([\s\S]*?)<\/style>/g, (m, body, at) => { styles.push([at, at + m.length]); return m; });
   const inStyle = i => styles.some(([a, b]) => i >= a && i < b);
@@ -511,6 +511,22 @@ test('readable text in the main UI is at least 60% white and meets WCAG AA', () 
   assert.ok(ratio(0.6, [26, 26, 26]) >= 4.5);
   assert.ok(ratio(0.6, [26, 34, 48]) >= 4.5);
   assert.ok(ratio(0.45, [26, 26, 26]) < 4.5, 'the old 45% text failed AA');
+  /* Meaningful glyphs (folder open arrow, modified-key marker) reach 3:1 as graphics, even on a hovered row. */
+  const rule = sel => { const i = html.indexOf(sel + '{') >= 0 ? html.indexOf(sel + '{') : html.indexOf(sel + ' {'); assert.ok(i >= 0, sel); return html.slice(i, html.indexOf('}', i)); };
+  const alpha = (sel, prop) => Number((rule(sel).match(new RegExp('(?<![-a-z])' + prop + ':\\s*rgba\\([^)]*,\\s*([0-9.]+)\\s*\\)')) || [])[1]);
+  for (const sel of ['.pf-arr', '.kerow.modified .kelbl::after']) {
+    const a = alpha(sel, 'color');
+    assert.ok(ratio(a, [26, 26, 26]) >= 3 && ratio(a, [44, 44, 44]) >= 3, sel + ' reaches 3:1');
+  }
+  /* Text overlays on the slide (#fnov file name, #watchbadge) stay readable over a pure white slide. */
+  for (const sel of ['#fnov', '#watchbadge']) {
+    const bgA = alpha(sel, 'background'), fgA = alpha(sel, 'color');
+    assert.ok(bgA >= 0.75, sel + ' backing is at least 75% black');
+    const backing = [255, 255, 255].map(v => v * (1 - bgA));
+    const r = ratio(fgA, backing);
+    assert.ok(r >= 4.5, sel + ' over #fff is ' + r.toFixed(2) + ':1');
+  }
+  assert.ok(ratio(0.75, [255 * 0.45, 255 * 0.45, 255 * 0.45]) < 4.5, 'the old .55 backing failed over white');
 });
 
 test('a saved duration off the list falls back to the closest choice', () => {
