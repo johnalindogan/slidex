@@ -1534,6 +1534,8 @@ let SSP_WINDOW_ROLE = (function () {
   return 'main';
 })();
 let SSP_IS_PLAYLIST_WINDOW = SSP_WINDOW_ROLE === 'playlist';
+/** True in the main window. Read live: the role can late-bind from the Tauri label. Only main writes saved state. */
+function sspIsMainWindow() { return !SSP_IS_PLAYLIST_WINDOW; }
 /** 0.2.0: Undock is back. The second window is a remote for the main window. */
 const SSP_UNDOCK_ENABLED = true;
 if (SSP_UNDOCK_ENABLED) document.body.classList.add('ssp-undock-enabled');
@@ -1569,7 +1571,7 @@ function refreshWindowRoleFromTauri() {
       : (WW.WebviewWindow && typeof WW.WebviewWindow.getCurrent === 'function'
         ? WW.WebviewWindow.getCurrent()
         : null));
-    if (cur && cur.label === 'playlist') {
+    if (cur && /^playlist(-\d+)?$/.test(cur.label || '')) {
       SSP_WINDOW_ROLE = 'playlist';
       SSP_IS_PLAYLIST_WINDOW = true;
       return true;
@@ -2732,6 +2734,8 @@ function loadItemLS(item) {
 }
 
 function saveItemLS(item) {
+  // Main owns the state: the second window never writes per-item edits to localStorage.
+  if (!sspIsMainWindow()) return;
   ensureItemId(item);
   try {
     localStorage.setItem(lsKey(item), JSON.stringify({
@@ -8480,6 +8484,8 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function el(id) { return document.getElementById(id); }
   function save() {
     if (!sspIsTauri()) return;
+    // Main owns the soundtrack. The pane is hidden in the second window by CSS; this makes it a rule.
+    if (!(typeof sspIsMainWindow === 'function' ? sspIsMainWindow() : isMain)) return;
     try { localStorage.setItem(LS_KEY, C.serializeAudioQueue(q)); } catch (_) {}
   }
   function toast(msg) { try { showToast(msg, 4000); } catch (_) {} }

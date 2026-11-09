@@ -2608,7 +2608,7 @@ test('in the page, the second window only sends intents and main owns every writ
   assert.match(close, /w\.destroy\(\)/);
   assert.doesNotMatch(close, /w\.close\(\)/);
   assert.match(lib, /const SECOND_WINDOW_CLOSED_EVENT: &str = "sw:\/\/closed";/);
-  assert.match(lib, /window\.label\(\) == "playlist"[\s\S]{0,120}WindowEvent::Destroyed[\s\S]{0,200}emit_to\("main", SECOND_WINDOW_CLOSED_EVENT/);
+  assert.match(lib, /is_second_window_label\(window\.label\(\)\)[\s\S]{0,120}WindowEvent::Destroyed[\s\S]{0,700}emit_to\("main", SECOND_WINDOW_CLOSED_EVENT/);
 });
 
 test('emptying the playlist forgets the saved session so Continue is not offered', () => {
@@ -2709,4 +2709,277 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
+
+// ---- 0.2.0 undock hardening (#55 follow-ups) ----
+
+function undockHtml() {
+  return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+}
+function sliceFrom(src, startMarker, endMarker) {
+  const start = src.indexOf(startMarker);
+  assert.ok(start !== -1, 'found ' + startMarker);
+  const end = src.indexOf(endMarker, start + startMarker.length);
+  assert.ok(end > start, 'found end ' + endMarker);
+  return src.slice(start, end);
+}
+
+test('saveItemLS never writes localStorage in the second window, including after the role late-binds', () => {
+  const html = undockHtml();
+  const isMainSrc = sliceFrom(html, 'function sspIsMainWindow()', '\n') + '\n';
+  const saveSrc = sliceFrom(html, 'function saveItemLS(item) {', '\nfunction applyImageUpdates');
+  assert.match(saveSrc, /^function saveItemLS\(item\) \{\n\s*\/\/[^\n]*\n\s*if \(!sspIsMainWindow\(\)\) return;/, 'the guard is the first statement');
+  const run = (isChild, flipToChild) => {
+    const writes = [];
+    const sb = {
+      SSP_IS_PLAYLIST_WINDOW: isChild,
+      ensureItemId: (it) => { it.id = it.id || 'id1'; },
+      lsKey: (it) => 'ssp_item_' + it.id,
+      localStorage: { setItem: (k, v) => writes.push(k), removeItem: () => {} },
+    };
+    vm.runInNewContext(isMainSrc + saveSrc, sb);
+    if (flipToChild) sb.SSP_IS_PLAYLIST_WINDOW = true;
+    vm.runInNewContext('saveItemLS({ id: "a", customDur: 6000 });', sb);
+    return writes;
+  };
+  assert.deepEqual(run(false, false), ['ssp_item_a'], 'main still saves');
+  assert.deepEqual(run(true, false), [], 'second window writes nothing');
+  assert.deepEqual(run(false, true), [], 'the guard reads the role live (refreshWindowRoleFromTauri can flip it)');
+});
+
+test('the soundtrack save() is guarded to the main window, not only hidden by CSS', () => {
+  const html = undockHtml();
+  const isMainSrc = sliceFrom(html, 'function sspIsMainWindow()', '\n') + '\n';
+  const block = html.slice(html.indexOf("var LS_KEY = 'sspSoundtrackV1';"));
+  const saveSrc = sliceFrom(block, '  function save() {', '\n  function toast(');
+  assert.match(saveSrc, /sspIsMainWindow\(\)/);
+  const run = (isChild) => {
+    const writes = [];
+    const sb = {
+      SSP_IS_PLAYLIST_WINDOW: isChild,
+      isMain: !isChild,
+      LS_KEY: 'sspSoundtrackV1',
+      q: { tracks: [] },
+      C: { serializeAudioQueue: () => '{}' },
+      sspIsTauri: () => true,
+      localStorage: { setItem: (k) => writes.push(k) },
+    };
+    vm.runInNewContext(isMainSrc + saveSrc + '\nsave();', sb);
+    return writes;
+  };
+  assert.deepEqual(run(false), ['sspSoundtrackV1']);
+  assert.deepEqual(run(true), [], 'the second window never writes the soundtrack');
+});
+
+test('a reopen after a slow destroy rebuilds the Media Manager instead of focusing the dying window', () => {
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  const sw = fs.readFileSync(new URL('./src-tauri/src/second_window.rs', import.meta.url), 'utf8');
+  assert.match(lib, /^mod second_window;$/m);
+  assert.match(lib, /\.manage\(SecondWindowState::default\(\)\)/);
+  // No command looks the window up by the fixed label any more: the slot decides.
+  assert.doesNotMatch(lib, /get_webview_window\("playlist"\)/);
+  const open = sliceFrom(lib, 'async fn open_playlist_window', 'fn close_playlist_window');
+  assert.match(open, /slot\.on_open\(/);
+  assert.match(open, /OpenAction::Build\(label\)[\s\S]*build_playlist_window\(&handle, &label\)/);
+  const close = sliceFrom(lib, 'fn close_playlist_window', 'fn focus_playlist_window');
+  assert.match(close, /slot\.on_close_requested\(\)[\s\S]*w\.destroy\(\)/, 'marked dying before destroy');
+  const focus = sliceFrom(lib, 'fn focus_playlist_window', '\n}\n');
+  assert.match(focus, /slot\.focus_target\(/);
+  assert.match(lib, /slot\.on_destroyed\(window\.label\(\)\)[\s\S]{0,300}if report/);
+  assert.match(sw, /fn destroy_slower_than_the_timeout_rebuilds_instead_of_focusing_the_dying_window/);
+  assert.doesNotMatch(sw, /^use tauri|tauri::/m, 'the slot stays pure so it can be tested without a Tauri build');
+  // New labels keep IPC access and the second-window role.
+  const caps = JSON.parse(fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8'));
+  assert.ok(caps.windows.includes('playlist') && caps.windows.includes('playlist-*'));
+  const html = undockHtml();
+  assert.match(html, /\/\^playlist\(-\\d\+\)\?\$\/\.test\(cur\.label/);
+  // Main still waits up to 2 s for sw://closed before it reopens.
+  assert.match(sliceFrom(html, 'async function undockPlaylistWindow', 'function swRedockMain'), /await swWaitChildClosed\(2000\)/);
+});
+
+test('second_window.rs unit tests pass (rustc --test; skipped when rustc is missing)', async (t) => {
+  const { spawnSync } = await import('node:child_process');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  if (spawnSync('rustc', ['--version']).status !== 0) { t.skip('rustc not installed'); return; }
+  const src = new URL('./src-tauri/src/second_window.rs', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+  const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sw-')), process.platform === 'win32' ? 'sw.exe' : 'sw');
+  const build = spawnSync('rustc', ['--edition', '2021', '--test', src, '-o', out], { encoding: 'utf8' });
+  assert.equal(build.status, 0, build.stderr);
+  const run = spawnSync(out, [], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.match(run.stdout, /test result: ok\. 6 passed; 0 failed/);
+});
+
+test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and bad payloads', () => {
+  const html = undockHtml();
+  const helpers = sliceFrom(html, 'function swMediaIds()', '\n\n/** Main: the state the second window renders. */');
+  const applySrc = sliceFrom(html, 'function swApplyIntent(intent) {', '\nfunction swEnsureHub()');
+  const core = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+  const normSrc = sliceFrom(core, 'function swNormalizeIntent(msg) {', '\n  /*');
+  const opsIn = (src) => new Set([...src.matchAll(/case '([A-Za-z]+)':/g)].map(m => m[1]));
+  const allowed = opsIn(normSrc);
+  assert.deepEqual([...opsIn(applySrc)].sort(), [...allowed].sort(), 'main handles exactly the allowed ops');
+
+  function makeMain(over = {}) {
+    const calls = [];
+    const spy = (name) => (...a) => { calls.push([name, ...a]); };
+    const buttons = {
+      plshuffle: { hidden: false, disabled: false, click: () => calls.push(['click', 'plshuffle']) },
+      plsave: { hidden: true, disabled: false, click: () => calls.push(['click', 'plsave']) },
+    };
+    const sb = {
+      SlideXCore: C,
+      items: [
+        { id: 'a', type: 'image', name: 'a.jpg' },
+        { id: 'b', type: 'image', name: 'b.jpg' },
+        { id: 'f', type: 'folder', name: 'Trip', open: true },
+        { id: 'v', type: 'video', name: 'v.mp4' },
+        { id: 'c', type: 'image', name: 'c.jpg' },
+      ],
+      selectedItems: new Set([1]),
+      lastClickedMI: 1,
+      cur: 1,
+      g: (id) => buttons[id] || null,
+      goTo: spy('goTo'),
+      togglePlay: spy('togglePlay'),
+      updSelBadge: spy('updSelBadge'),
+      renderPlaylist: spy('renderPlaylist'),
+      buildPlRows: spy('buildPlRows'),
+      playlistChromeOpen: () => false,
+      autoSave: spy('autoSave'),
+      schedAutoSave: spy('schedAutoSave'),
+      saveItemLS: (it) => calls.push(['saveItemLS', it.id]),
+      applyKBNow: spy('applyKBNow'),
+      dockPlaylistWindow: spy('dockPlaylistWindow'),
+      removeItem: (idx) => { calls.push(['removeItem', sb.items[idx].id]); sb.items.splice(idx, 1); },
+      applyReorderResult: (r) => { calls.push(['applyReorderResult']); sb.items = r.items; },
+      getMediaItems: () => sb.items.filter(it => it.type !== 'folder'),
+      ...over,
+    };
+    vm.runInNewContext(helpers + '\n' + applySrc, sb);
+    const sent = [];
+    const hub = C.createSwHub({ send: (ev, p) => sent.push(ev), snapshot: () => ({ n: sb.items.length }), apply: (i) => sb.swApplyIntent(i) });
+    hub.open();
+    return { sb, calls, hub, sent };
+  }
+  const ids = (sb) => Array.from(sb.items, it => it.id);
+  const named = (calls, name) => calls.filter(c => c[0] === name).map(c => c.slice(1));
+
+  // [label, message, expected { ok, reason }, check(state)]
+  const rows = [
+    ['goTo', { op: 'goTo', id: 'c' }, true, ({ sb, calls }) => {
+      assert.deepEqual(named(calls, 'goTo'), [[3, 'user']]);
+      assert.equal(sb.selectedItems.size, 1, 'selection kept without clearSelection');
+    }],
+    ['goTo clearSelection', { op: 'goTo', id: 'b', clearSelection: true }, true, ({ sb, calls }) => {
+      assert.equal(sb.selectedItems.size, 0);
+      assert.equal(sb.lastClickedMI, 1);
+      assert.deepEqual(named(calls, 'goTo'), [[1, 'user']]);
+    }],
+    ['goTo folder id', { op: 'goTo', id: 'f' }, 'refused', ({ calls }) => assert.equal(named(calls, 'goTo').length, 0)],
+    ['goTo unknown id', { op: 'goTo', id: 'zz' }, 'refused'],
+    ['goTo numeric id', { op: 'goTo', id: 3 }, 'invalid'],
+    ['select', { op: 'select', ids: ['a', 'c'], lastId: 'c' }, true, ({ sb }) => {
+      assert.deepEqual([...sb.selectedItems].sort(), [0, 3]);
+      assert.equal(sb.lastClickedMI, 3);
+    }],
+    ['select none', { op: 'select', ids: [], lastId: null }, true, ({ sb }) => {
+      assert.equal(sb.selectedItems.size, 0);
+      assert.equal(sb.lastClickedMI, -1);
+    }],
+    ['select ids not a list', { op: 'select', ids: 'a' }, 'invalid'],
+    ['select bad lastId', { op: 'select', ids: ['a'], lastId: 7 }, 'invalid'],
+    ['step +1', { op: 'step', dir: 1 }, true, ({ calls }) => assert.deepEqual(named(calls, 'goTo'), [[2, 'user']])],
+    ['step -1', { op: 'step', dir: -1 }, true, ({ calls }) => assert.deepEqual(named(calls, 'goTo'), [[0, 'user']])],
+    ['step 5', { op: 'step', dir: 5 }, 'invalid'],
+    ['step "1"', { op: 'step', dir: '1' }, 'invalid'],
+    ['togglePlay', { op: 'togglePlay' }, true, ({ calls }) => assert.equal(named(calls, 'togglePlay').length, 1)],
+    ['reorder', { op: 'reorder', order: ['c', 'f', 'v', 'b', 'a'] }, true, ({ sb }) => {
+      assert.deepEqual(ids(sb), ['c', 'f', 'v', 'b', 'a']);
+      assert.deepEqual([...sb.selectedItems], [2], 'selection follows the item (b)');
+    }],
+    ['reorder partial', { op: 'reorder', order: ['a', 'b'] }, 'refused', ({ sb }) => assert.deepEqual(ids(sb), ['a', 'b', 'f', 'v', 'c'])],
+    ['reorder duplicates', { op: 'reorder', order: ['a', 'a', 'f', 'v', 'c'] }, 'invalid'],
+    ['reorder not a list', { op: 'reorder', order: 'abc' }, 'invalid'],
+    ['remove', { op: 'remove', ids: ['b', 'f'] }, true, ({ sb, calls }) => {
+      assert.deepEqual(ids(sb), ['a', 'v', 'c']);
+      assert.deepEqual(named(calls, 'removeItem'), [['b']], 'folders are spliced, media go through removeItem');
+      assert.equal(named(calls, 'autoSave').length, 1);
+    }],
+    ['remove unknown', { op: 'remove', ids: ['zz'] }, 'refused', ({ sb }) => assert.equal(sb.items.length, 5)],
+    ['remove not a list', { op: 'remove', ids: 'b' }, 'invalid'],
+    ['toggleFolder', { op: 'toggleFolder', id: 'f' }, true, ({ sb }) => assert.equal(sb.items[2].open, false)],
+    ['toggleFolder on an image', { op: 'toggleFolder', id: 'a' }, 'refused'],
+    ['renameFolder', { op: 'renameFolder', id: 'f', name: '  Beach  ' }, true, ({ sb }) => assert.equal(sb.items[2].name, 'Beach')],
+    ['renameFolder on an image', { op: 'renameFolder', id: 'a', name: 'x' }, 'refused', ({ sb }) => assert.equal(sb.items[0].name, 'a.jpg')],
+    ['renameFolder blank', { op: 'renameFolder', id: 'f', name: '   ' }, 'invalid'],
+    ['renameFolder too long', { op: 'renameFolder', id: 'f', name: 'x'.repeat(201) }, 'invalid'],
+    ['setDuration', { op: 'setDuration', id: 'a', ms: 6000 }, true, ({ sb, calls }) => {
+      assert.equal(sb.items[0].customDur, 6000);
+      assert.deepEqual(named(calls, 'saveItemLS'), [['a']]);
+    }],
+    ['setDuration on a video', { op: 'setDuration', id: 'v', ms: 6000 }, 'refused', ({ calls }) => assert.equal(named(calls, 'saveItemLS').length, 0)],
+    ['setDuration odd ms', { op: 'setDuration', id: 'a', ms: 1234 }, 'invalid'],
+    ['setKenBurns on current', { op: 'setKenBurns', id: 'b', preset: 3 }, true, ({ sb, calls }) => {
+      assert.equal(sb.items[1].kbPreset, 3);
+      assert.equal(named(calls, 'applyKBNow').length, 1, 'current slide updates now');
+    }],
+    ['setKenBurns auto', { op: 'setKenBurns', id: 'a', preset: 'auto' }, true, ({ sb, calls }) => {
+      assert.equal(sb.items[0].kbPreset, undefined);
+      assert.equal(named(calls, 'applyKBNow').length, 0, 'not the current slide');
+    }],
+    ['setKenBurns on a folder', { op: 'setKenBurns', id: 'f', preset: 2 }, 'refused'],
+    ['setKenBurns 64', { op: 'setKenBurns', id: 'a', preset: 64 }, 'invalid'],
+    ['setKenBurns 1.5', { op: 'setKenBurns', id: 'a', preset: 1.5 }, 'invalid'],
+    ['tool', { op: 'tool', id: 'plshuffle' }, true, ({ calls }) => assert.deepEqual(named(calls, 'click'), [['plshuffle']])],
+    ['tool hidden', { op: 'tool', id: 'plsave' }, 'refused', ({ calls }) => assert.equal(named(calls, 'click').length, 0)],
+    ['tool missing button', { op: 'tool', id: 'pllocate' }, 'refused'],
+    ['tool not allowed', { op: 'tool', id: 'bdel' }, 'invalid'],
+    ['dock', { op: 'dock' }, true, ({ calls }) => assert.equal(named(calls, 'dockPlaylistWindow').length, 1)],
+    // Unknown ops and non-intents never reach swApplyIntent.
+    ['unknown op eval', { op: 'eval', code: 'x' }, 'invalid'],
+    ['unknown op setItems', { op: 'setItems', items: [] }, 'invalid'],
+    ['unknown op __proto__', { op: '__proto__' }, 'invalid'],
+    ['unknown op constructor', { op: 'constructor' }, 'invalid'],
+    ['no op', {}, 'invalid'],
+    ['op not a string', { op: 1 }, 'invalid'],
+  ];
+  const covered = new Set();
+  for (const [label, msg, expect, check] of rows) {
+    const m = makeMain();
+    const applied = [];
+    const realApply = m.sb.swApplyIntent;
+    m.sb.swApplyIntent = (i) => { applied.push(i.op); return realApply(i); };
+    const res = m.hub.onIntent({ ...msg, origin: 'playlist' });
+    if (expect === true) {
+      assert.equal(res.ok, true, label);
+      covered.add(msg.op);
+    } else {
+      assert.equal(res.ok, false, label);
+      assert.equal(res.reason, expect, label);
+    }
+    if (expect === 'invalid') assert.deepEqual(applied, [], label + ': main state is never touched');
+    assert.ok(m.sent.length >= 1, label + ': main answers with a snapshot');
+    if (check) check(m);
+  }
+  assert.deepEqual([...covered].sort(), [...allowed].sort(), 'every allowed op has a passing row');
+
+  // Empty playlist: step and togglePlay are refused.
+  for (const op of [{ op: 'step', dir: 1 }, { op: 'togglePlay' }]) {
+    const m = makeMain({ items: [] });
+    assert.deepEqual({ ...m.hub.onIntent({ ...op, origin: 'playlist' }) }, { ok: false, reason: 'refused', op: op.op });
+    assert.equal(m.calls.length, 0);
+  }
+  // Non-objects and wrong origin.
+  const m = makeMain();
+  for (const bad of [null, undefined, 'goTo', 42, []]) assert.equal(m.hub.onIntent(bad).ok, false);
+  assert.equal(m.hub.onIntent({ op: 'dock' }).reason, 'origin');
+  assert.equal(m.hub.onIntent({ op: 'dock', origin: 'main' }).reason, 'origin');
+  assert.equal(m.calls.length, 0);
+  // Called directly, swApplyIntent still refuses an op it does not know.
+  assert.equal(m.sb.swApplyIntent({ op: 'eval' }), false);
+  // A throwing handler is reported as refused, not a crash.
+  const t = makeMain({ goTo: () => { throw new Error('boom'); } });
+  assert.equal(t.hub.onIntent({ op: 'goTo', id: 'a', origin: 'playlist' }).reason, 'refused');
 });

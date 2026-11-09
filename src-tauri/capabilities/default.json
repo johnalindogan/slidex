@@ -4,7 +4,8 @@
   "description": "Default capabilities for SlideShowPro desktop wrapper",
   "windows": [
     "main",
-    "playlist"
+    "playlist",
+    "playlist-*"
   ],
   "permissions": [
     "core:default",
