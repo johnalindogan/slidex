@@ -648,6 +648,8 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   const sandbox = {
     console,
     SlideXCore: C,
+    SSP_IS_PLAYLIST_WINDOW: false,
+    sspIsMainWindow() { return !sandbox.SSP_IS_PLAYLIST_WINDOW; },
     cur: 0,
     playing: true,
     tmr: null,
@@ -2508,6 +2510,7 @@ test('page code in the second window asks main instead of writing items, selecti
   const startItems = [{ id: 'a', type: 'image' }, { id: 'b', type: 'image' }, { id: 'c', type: 'image' }];
   const sandbox = {
     SSP_IS_PLAYLIST_WINDOW: true,
+    sspIsMainWindow() { return !sandbox.SSP_IS_PLAYLIST_WINDOW; },
     items: startItems.slice(),
     cur: 1,
     playing: true,
@@ -2567,8 +2570,8 @@ test('in the page, the second window only sends intents and main owns every writ
   assert.doesNotMatch(html, /ssp-pl-sync|ssp-pl-dock|ssp-pl-ack|ssp-playlist-sync|applyLiveSync/);
   assert.match(body('function notifyPlaylistSync()'), /if \(SSP_IS_PLAYLIST_WINDOW\) return;/);
   const save = html.slice(html.indexOf('function saveSessionBeforeExit(ack)'), html.indexOf('function autoSave()'));
-  assert.ok(save.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') !== -1);
-  assert.ok(save.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < save.indexOf('getPlaylistSnapshot()'), 'returns before reading or writing the session');
+  assert.ok(save.indexOf('if (!sspIsMainWindow()) return;') !== -1);
+  assert.ok(save.indexOf('if (!sspIsMainWindow()) return;') < save.indexOf('getPlaylistSnapshot()'), 'returns before reading or writing the session');
   assert.match(body('function goTo(i, source)'), /^function goTo\(i, source\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildGoToIndex\(i\); return; \}/);
   assert.match(body('function togglePlay()'), /^function togglePlay\(\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('togglePlay'\); return; \}/);
   assert.match(body('function shufflePlaylist()'), /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('tool', \{ id: 'plshuffle' \}\); return; \}/);
@@ -2709,4 +2712,273 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
+
+
+// ---- 0.2.0: second window never writes saved settings ----
+
+function swNoWriteHtml() {
+  return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+}
+function swSlice(src, startMarker, endMarker) {
+  const start = src.indexOf(startMarker);
+  assert.ok(start !== -1, 'found ' + startMarker);
+  const end = endMarker == null ? src.length : src.indexOf(endMarker, start + startMarker.length);
+  assert.ok(end > start, 'found end ' + endMarker);
+  return src.slice(start, end);
+}
+
+/** Enclosing function / arrow / method body that contains offset, walking braces. */
+function swEnclosingFn(src, offset) {
+  let start = -1;
+  const re = /\bfunction\s+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{|\bfunction\s*\([^)]*\)\s*\{|[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*=>\s*\{|[A-Za-z_$][\w$]*\s*=\s*function\s*\([^)]*\)\s*\{|\.\w+\s*=\s*function\s*\([^)]*\)\s*\{/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    if (m.index > offset) break;
+    start = m.index;
+  }
+  assert.ok(start !== -1, 'enclosing function before offset ' + offset);
+  const braceAt = src.indexOf('{', start);
+  let depth = 0;
+  for (let i = braceAt; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  return src.slice(start);
+}
+
+function swWriteIsGuarded(fnBody) {
+  // Call-time sspIsMainWindow() near the write, or a main-only early return at the top.
+  if (/sspIsMainWindow\s*\(/.test(fnBody)) return true;
+  if (/if\s*\(\s*!sspIsMainWindow\s*\(\s*\)\s*\)\s*return/.test(fnBody)) return true;
+  if (/if\s*\(\s*SSP_IS_PLAYLIST_WINDOW\s*\)\s*return/.test(fnBody)) return true;
+  if (/if\s*\(\s*SSP_IS_PLAYLIST_WINDOW\s*\)\s*\{[^}]*return/.test(fnBody)) return true;
+  return false;
+}
+
+test('every localStorage setItem/removeItem in the page is guarded for the second window (source scan)', () => {
+  const html = swNoWriteHtml();
+  assert.match(html, /function sspIsMainWindow\(\) \{\s*return !SSP_IS_PLAYLIST_WINDOW;\s*\}/);
+
+  // Sites that may write without a page-level sspIsMainWindow call, with an explicit reason.
+  // Empty by default: every write must be guarded. Add an entry only when truly needed.
+  const allowlist = [
+    // none — saveItemLS, soundtrack, session, keymap, defaults, transition, video-skip,
+    // image-updates, autosave clear, and item-key removals all use sspIsMainWindow().
+  ];
+
+  const hits = [];
+  const re = /localStorage\.(setItem|removeItem)\s*\(/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const line = html.slice(0, m.index).split('\n').length;
+    const fnBody = swEnclosingFn(html, m.index);
+    const snippet = html.slice(Math.max(0, m.index - 80), Math.min(html.length, m.index + 60)).replace(/\s+/g, ' ');
+    const allowed = allowlist.find(a => a.test(fnBody) || a.test(snippet));
+    if (allowed) {
+      hits.push({ line, method: m[1], ok: true, reason: allowed.reason });
+      continue;
+    }
+    const ok = swWriteIsGuarded(fnBody);
+    hits.push({ line, method: m[1], ok, snippet });
+  }
+  assert.ok(hits.length >= 10, 'expected to find the known write sites, got ' + hits.length);
+  const bad = hits.filter(h => !h.ok);
+  assert.equal(
+    bad.length,
+    0,
+    'unguarded localStorage writes reachable without sspIsMainWindow:\n' +
+      bad.map(h => `  L${h.line} ${h.method}: ${h.snippet}`).join('\n')
+  );
+});
+
+test('main writes saved settings; the second window does not (KEYMAP, default dur, transition, video skip, image updates, autosave, item keys)', () => {
+  const html = swNoWriteHtml();
+  const isMainSrc = swSlice(html, 'function sspIsMainWindow()', '\n') + '\n';
+
+  const run = (isChild, src, invoke) => {
+    const writes = [];
+    const sb = {
+      SSP_IS_PLAYLIST_WINDOW: isChild,
+      sspIsMainWindow() { return !sb.SSP_IS_PLAYLIST_WINDOW; },
+      videoSkipSec: 5,
+      clampVideoSkipSec: (s) => Number(s) || 5,
+      VIDEO_SKIP_LS: 'ssp_video_skip_sec',
+      sharedImageUpdates: null,
+      normalizeImageUpdatesSource: (d) => d,
+      keyMap: { next: 'ArrowRight' },
+      KEYMAP_LS: 'ssp_keymap',
+      refreshMoreToolsTooltip() {},
+      sessionLoaded: true,
+      sessionDirty: true,
+      autoSaveTimer: null,
+      ensureItemId: (it) => { it.id = it.id || 'id1'; },
+      lsKey: (it) => 'ssp|' + (typeof it === 'string' ? it : it.id),
+      g: (id) => {
+        if (id === 'dsel') return { value: '8000' };
+        if (id === 'vskip') return { value: '5' };
+        return null;
+      },
+      transitionType: 'fade',
+      tmr: null,
+      ptmr: null,
+      cur: 0,
+      playing: false,
+      isV: () => false,
+      startKB() {},
+      startProg() {},
+      schedNext() {},
+      clearInterval() {},
+      localStorage: {
+        setItem: (k, v) => writes.push(['set', k]),
+        removeItem: (k) => writes.push(['rm', k]),
+        getItem: () => null,
+      },
+      clearTimeout() {},
+      getPlaylistSnapshot: () => ({ items: [{ id: 'a' }], cur: 0 }),
+      notifyPlaylistSync() {},
+      getMediaItems: () => [],
+      window: { __sspCastActive: false },
+      SlideXCore: null,
+    };
+    // Bind window for forgetEmptiedSession
+    sb.window = sb;
+    vm.runInNewContext(isMainSrc + src + '\n' + invoke, sb);
+    return writes;
+  };
+
+  // saveKeyMap / KEYMAP_LS
+  {
+    const src = swSlice(html, 'function saveKeyMap() {', '\nloadKeyMap();');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'saveKeyMap();'), [['set', 'ssp_keymap']]);
+    assert.deepEqual(run(true, src, 'saveKeyMap();'), []);
+  }
+
+  // persistVideoSkipSec / VIDEO_SKIP_LS
+  {
+    const src = swSlice(html, 'function persistVideoSkipSec(sec) {', '\nlet videoNavLast');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'persistVideoSkipSec(7);').filter(w => w[0] === 'set'), [['set', 'ssp_video_skip_sec']]);
+    assert.deepEqual(run(true, src, 'persistVideoSkipSec(7);').filter(w => w[0] === 'set'), []);
+  }
+
+  // persistImageUpdatesSource / ssp_image_updates
+  {
+    const src = swSlice(html, 'function persistImageUpdatesSource(data) {', '\nfunction applySharedImageUpdates');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'persistImageUpdatesSource({v:1});'), [['set', 'ssp_image_updates']]);
+    assert.deepEqual(run(true, src, 'persistImageUpdatesSource({v:1});'), []);
+  }
+
+  // forgetEmptiedSession / ssp_autosave remove
+  {
+    const src = swSlice(html, 'function forgetEmptiedSession() {', '\nfunction removeItem');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'forgetEmptiedSession();'), [['rm', 'ssp_autosave']]);
+    assert.deepEqual(run(true, src, 'forgetEmptiedSession();'), []);
+  }
+
+  // saveSessionBeforeExit / ssp_default_dur + ssp_autosave set
+  {
+    const src = swSlice(html, 'function saveSessionBeforeExit(ack) {', '\nfunction autoSave()');
+    assert.match(src, /if \(!sspIsMainWindow\(\)\) return;/);
+    const main = run(false, src, 'saveSessionBeforeExit(null);');
+    assert.ok(main.some(w => w[0] === 'set' && w[1] === 'ssp_default_dur'), 'main sets default dur');
+    assert.ok(main.some(w => w[0] === 'set' && w[1] === 'ssp_autosave'), 'main sets autosave');
+    assert.deepEqual(run(true, src, 'saveSessionBeforeExit(null);'), []);
+  }
+
+  // dsel.onchange / ssp_default_dur (second place)
+  {
+    const src = swSlice(html, "g('dsel').onchange = () => {", '\n(function initDefaultImageDuration');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    // Extract only the assignment body as a callable
+    const body = src.replace(/^g\('dsel'\)\.onchange = /, 'const __dsel = ').replace(/;\s*$/, '');
+    assert.deepEqual(
+      run(false, body + '\n', '__dsel();').filter(w => w[1] === 'ssp_default_dur'),
+      [['set', 'ssp_default_dur']]
+    );
+    assert.deepEqual(
+      run(true, body + '\n', '__dsel();').filter(w => w[1] === 'ssp_default_dur'),
+      []
+    );
+  }
+
+  // tsel.onchange / ssp_transition
+  {
+    const src = swSlice(html, "g('tsel').onchange = function() {", '\n(function initVideoSkipControl');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    const body = src.replace(/^g\('tsel'\)\.onchange = /, 'const __tsel = ').replace(/;\s*$/, '');
+    assert.deepEqual(
+      run(false, body + '\n', '__tsel.call({ value: "cut" });').filter(w => w[1] === 'ssp_transition'),
+      [['set', 'ssp_transition']]
+    );
+    assert.deepEqual(
+      run(true, body + '\n', '__tsel.call({ value: "cut" });').filter(w => w[1] === 'ssp_transition'),
+      []
+    );
+  }
+
+  // removePlaylistFiles item-key removals
+  {
+    const src = swSlice(html, 'function removePlaylistFiles(files, clearLS, byPath) {', '\nasync function otherPlaylistNames');
+    assert.match(src, /clearLS && sspIsMainWindow\(\)/);
+    const harness = `
+      ${src}
+      window.SlideXCore = {
+        removePlaylistMatches: () => ({
+          removed: true,
+          matched: [{ id: 'a', name: 'a.jpg' }],
+          items: [],
+          cur: 0
+        })
+      };
+      items = [{ id: 'a', name: 'a.jpg', type: 'image' }];
+      cur = 0;
+      selectedItems = { clear() {} };
+      getMediaItems = () => [];
+      forgetEmptiedSession = () => {};
+      rebuildSlides = () => {};
+      autoSave = () => {};
+      g = () => ({ click() {} });
+    `;
+    const main = run(false, harness, 'removePlaylistFiles(["a.jpg"], true, false);');
+    assert.ok(main.some(w => w[0] === 'rm' && w[1] === 'ssp|a'), 'main removes item key by id');
+    assert.ok(main.some(w => w[0] === 'rm' && w[1] === 'ssp|a.jpg'), 'main removes item key by name');
+    assert.deepEqual(run(true, harness, 'removePlaylistFiles(["a.jpg"], true, false);'), []);
+  }
+
+  // saveItemLS (same call-time guard idea as #57)
+  {
+    const src = swSlice(html, 'function saveItemLS(item) {', '\nfunction applyImageUpdates');
+    assert.match(src, /^function saveItemLS\(item\) \{\n\s*\/\/[^\n]*\n\s*if \(!sspIsMainWindow\(\)\) return;/);
+    assert.deepEqual(run(false, src, 'saveItemLS({ id: "x", customDur: 1 });'), [['set', 'ssp|x']]);
+    assert.deepEqual(run(true, src, 'saveItemLS({ id: "x", customDur: 1 });'), []);
+  }
+});
+
+test('removing the sspIsMainWindow guard from a saved-settings write makes the behaviour test fail', () => {
+  // Mutation check: strip the guard from saveKeyMap and confirm the child would write.
+  const html = swNoWriteHtml();
+  const isMainSrc = swSlice(html, 'function sspIsMainWindow()', '\n') + '\n';
+  let src = swSlice(html, 'function saveKeyMap() {', '\nloadKeyMap();');
+  src = src.replace(/\n\s*\/\/[^\n]*\n\s*if \(sspIsMainWindow\(\)\) \{\n\s*try \{ localStorage\.setItem\(KEYMAP_LS, JSON\.stringify\(keyMap\)\); \} catch \(_\) \{\}\n\s*\}/,
+    '\n  try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}');
+  assert.doesNotMatch(src, /sspIsMainWindow/);
+  const writes = [];
+  const sb = {
+    SSP_IS_PLAYLIST_WINDOW: true,
+    sspIsMainWindow() { return !sb.SSP_IS_PLAYLIST_WINDOW; },
+    keyMap: { next: 'ArrowRight' },
+    KEYMAP_LS: 'ssp_keymap',
+    refreshMoreToolsTooltip() {},
+    localStorage: { setItem: (k) => writes.push(k) },
+  };
+  vm.runInNewContext(isMainSrc + src + '\nsaveKeyMap();', sb);
+  assert.deepEqual(writes, ['ssp_keymap'], 'without the guard the second window would write');
 });
