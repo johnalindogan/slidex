@@ -2339,12 +2339,12 @@ test('main applies an intent on its own state and then broadcasts a new snapshot
       return false;
     }
   });
-  assert.equal(hub.onIntent({ op: 'goTo', id: 'b', origin: 'playlist' }).reason, 'closed', 'nothing before open');
+  assert.equal(hub.onIntent({ op: 'goTo', id: 'b', origin: 'playlist', from: 'playlist' }).reason, 'closed', 'nothing before open');
   assert.equal(sent.length, 0);
-  const first = hub.open();
+  const first = hub.open('playlist');
   assert.equal(first.v, 1);
   assert.equal(sent[0][0], C.SW_EVENTS.snapshot);
-  const r = hub.onIntent({ op: 'reorder', order: ['c', 'a', 'b'], origin: 'playlist' });
+  const r = hub.onIntent({ op: 'reorder', order: ['c', 'a', 'b'], origin: 'playlist', from: 'playlist' });
   assert.equal(r.ok, true);
   assert.deepEqual(swIds(model.items), ['c', 'a', 'b']);
   const snap = sent[sent.length - 1];
@@ -2353,18 +2353,18 @@ test('main applies an intent on its own state and then broadcasts a new snapshot
   assert.deepEqual(swIds(snap[1].state.items), ['c', 'a', 'b']);
   // A stale order (an item main no longer has) is refused, and main resends its truth.
   const before = sent.length;
-  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'x'], origin: 'playlist' }).ok, false);
+  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'x'], origin: 'playlist', from: 'playlist' }).ok, false);
   assert.deepEqual(swIds(model.items), ['c', 'a', 'b']);
   assert.equal(sent.length, before + 1);
   assert.equal(sent[sent.length - 1][1].v, 3);
   // Invalid ops never reach apply; intents from main itself are ignored.
   const nApplied = applied.length;
-  assert.equal(hub.onIntent({ op: 'setItems', items: [], origin: 'playlist' }).reason, 'invalid');
+  assert.equal(hub.onIntent({ op: 'setItems', items: [], origin: 'playlist', from: 'playlist' }).reason, 'invalid');
   assert.equal(hub.onIntent({ op: 'goTo', id: 'a', origin: 'main' }).reason, 'origin');
   assert.equal(applied.length, nApplied);
   // An apply that throws changes nothing and still answers with a snapshot.
   const n2 = sent.length;
-  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist' }).ok, false);
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, false);
   assert.equal(sent.length, n2 + 1);
   assert.equal(hub.beat().v, hub.version);
 });
@@ -2451,9 +2451,9 @@ test('closing and reopening the second window is safe and never loses main\'s or
     }
   };
   // Open: main's first snapshot is lost because the window is not listening yet.
-  hub.open();
+  hub.open('playlist');
   toChild.length = 0;
-  const child1 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]) });
+  const child1 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]), from: 'playlist' });
   child1.hello(); pump(); deliver(child1);
   assert.deepEqual(swIds(child1.state.items), ['a', 'b', 'c'], 'hello fixes the create race');
   child1.intent('reorder', { order: ['c', 'b', 'a'] }); pump(); deliver(child1);
@@ -2466,19 +2466,19 @@ test('closing and reopening the second window is safe and never loses main\'s or
   const vAtClose = hub.version;
   // Late messages from the closed window change nothing and get no answer.
   toChild.length = 0;
-  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'c'], origin: 'playlist' }).reason, 'closed');
-  assert.equal(hub.onHello({ origin: 'playlist', v: 0 }), null);
+  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'c'], origin: 'playlist', from: 'playlist' }).reason, 'closed');
+  assert.equal(hub.onHello({ origin: 'playlist', from: 'playlist', v: 0 }), null);
   assert.equal(hub.beat(), null);
   assert.equal(toChild.length, 0);
   assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
   // Reopen: a fresh window gets main's current order, with a higher version.
-  const again = hub.open();
+  const again = hub.open('playlist');
   assert.ok(again.v > vAtClose);
-  const child2 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]) });
+  const child2 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]), from: 'playlist' });
   deliver(child2);
   assert.deepEqual(swIds(child2.state.items), ['c', 'b', 'a']);
   // Opening twice in a row only re-sends the snapshot.
-  hub.open(); deliver(child2);
+  hub.open('playlist'); deliver(child2);
   assert.deepEqual(swIds(child2.state.items), ['c', 'b', 'a']);
 });
 
@@ -2604,9 +2604,11 @@ test('in the page, the second window only sends intents and main owns every writ
   assert.match(html, /Media Manager is back here\. Order and selection kept\./);
   // Rust: destroy (no half-closed window to refocus) and tell main when the window is gone.
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  const close = lib.slice(lib.indexOf('fn close_playlist_window'), lib.indexOf('fn focus_playlist_window'));
-  assert.match(close, /w\.destroy\(\)/);
-  assert.doesNotMatch(close, /w\.close\(\)/);
+  const host = lib.slice(lib.indexOf('impl second_window::WindowHost for TauriWindowHost'), lib.indexOf('fn build_playlist_window'));
+  assert.match(host, /w\.destroy\(\)/);
+  assert.doesNotMatch(host, /w\.close\(\)/);
+  // The adapter's emit_closed is the one line Rust tests cannot reach.
+  assert.match(host, /fn emit_closed\(&self\) \{\s*let _ = self\.0\.emit_to\(MAIN_WINDOW_LABEL, SECOND_WINDOW_CLOSED_EVENT, \(\)\);\s*\}/);
   assert.match(lib, /const SECOND_WINDOW_CLOSED_EVENT: &str = "sw:\/\/closed";/);
   assert.match(lib, /is_second_window_label\(window\.label\(\)\)[\s\S]{0,120}WindowEvent::Destroyed[\s\S]{0,1200}emit_to\("main", SECOND_WINDOW_CLOSED_EVENT/);
 });
@@ -2791,17 +2793,23 @@ test('a reopen after a slow destroy rebuilds the Media Manager instead of focusi
   assert.match(open, /slot\.on_open\(/);
   assert.match(open, /OpenAction::Build\(label\)[\s\S]*build_playlist_window\(&handle, &built\)/);
   assert.match(open, /async fn open_playlist_window\(app: AppHandle, window: tauri::WebviewWindow\) -> Result<String, String>/);
-  assert.match(open, /require_main_caller\(&window, "open"\)\?/, 'main only');
+  assert.match(open, /second_window::require_main\(window\.label\(\), "open"\)\?/, 'main only (logic unit-tested in second_window.rs)');
   assert.match(open, /Ok\(label\)[\s\S]*Ok\(label\)/, 'returns the label it focused or built');
   const close = sliceFrom(lib, 'fn close_playlist_window', 'fn focus_playlist_window');
+  // The close flow (caller check, emit, destroy) is second_window::handle_close, tested in Rust with a fake host.
   assert.match(close, /window: tauri::WebviewWindow/);
-  assert.match(close, /slot\.on_close_requested_by\(caller\.as_deref\(\), second_window_exists\(&app\)\)[\s\S]*w\.destroy\(\)/, 'marked closing before destroy');
-  assert.match(close, /outcome\.report_closed[\s\S]{0,200}emit_to\(MAIN_WINDOW_LABEL, SECOND_WINDOW_CLOSED_EVENT/);
+  assert.match(close, /second_window::handle_close\(&state, window\.label\(\), &TauriWindowHost\(&app\)\)/);
+  assert.match(sw, /fn close_flow_emits_and_destroys_from_the_right_callers/);
   const focus = sliceFrom(lib, 'fn focus_playlist_window', '\n}\n');
-  assert.match(focus, /require_main_caller\(&window, "focus"\)\?/, 'main only');
+  assert.match(focus, /second_window::require_main\(window\.label\(\), "focus"\)\?/, 'main only');
   assert.match(focus, /slot\.focus_target\(/);
+  assert.match(focus, /FocusTarget::Pending => Ok\(\(\)\)/, 'a pending build is open: main does not re-dock');
+  assert.match(sw, /fn a_pending_build_counts_as_open_for_focus_and_reopen/);
+  assert.match(sw, /fn callers_are_main_a_media_manager_label_or_refused/);
+  assert.doesNotMatch(lib, /fn require_main_caller/, 'one caller check, in the pure module');
   const build = sliceFrom(lib, 'fn build_playlist_window', '\n}\n');
-  assert.match(build, /slot\.keep_built\(label\)[\s\S]{0,200}if !keep \{\s*let _ = w\.destroy\(\);/, 'a stray window from a dock race is destroyed');
+  assert.match(build, /slot\.on_built\(label, true\)[\s\S]{0,200}if !keep \{\s*let _ = w\.destroy\(\);/, 'a stray window from a dock race is destroyed');
+  assert.match(build, /Err\(e\) => \{[\s\S]{0,200}slot\.on_built\(label, false\)/, 'a failed build is no longer pending');
   assert.match(lib, /slot\.on_destroyed\(window\.label\(\)\)[\s\S]{0,300}if report/);
   assert.match(lib, /poisoned lock[\s\S]{0,700}\.map\(\|mut slot\| slot\.on_destroyed\(window\.label\(\)\)\)\s*\.unwrap_or\(true\)/, 'the poisoned-lock fallback is explained');
   assert.match(sw, /fn a_late_close_from_the_closing_window_leaves_playlist_2_open/);
@@ -2814,6 +2822,14 @@ test('a reopen after a slow destroy rebuilds the Media Manager instead of focusi
   assert.deepEqual(labels, ['playlist', ...[2, 3, 4, 5, 6, 7, 8, 9].map(n => 'playlist-' + n)]);
   assert.deepEqual(caps.windows, ['main', ...labels]);
   assert.ok(!caps.windows.some(w => w.includes('*')), 'no wildcard window rule');
+  // The Media Manager windows cannot create windows outside the Rust bookkeeping.
+  assert.ok(!caps.permissions.includes('core:webview:allow-create-webview-window'));
+  assert.ok(!caps.permissions.some(p => typeof p === 'string' && /create-webview/.test(p)));
+  // ...and no page code needs it: nothing constructs a WebviewWindow or calls a create command.
+  for (const f of ['./SlideShowPro.html', './slidex-core.js', './index.html']) {
+    const src = fs.readFileSync(new URL(f, import.meta.url), 'utf8');
+    assert.doesNotMatch(src, /new\s+(WW\.)?WebviewWindow\b|plugin:webview\|create|create_webview/, f);
+  }
   const html = undockHtml();
   assert.match(html, /\/\^playlist\(-\[2-9\]\)\?\$\/\.test\(cur\.label/);
   // Main keeps the label Rust returned and gives it to the hub; the child sends its own.
@@ -2841,7 +2857,7 @@ test('second_window.rs unit tests pass (rustc --test; fails in CI, skips locally
   assert.equal(build.status, 0, build.stderr);
   const run = spawnSync(out, [], { encoding: 'utf8' });
   assert.equal(run.status, 0, run.stdout + run.stderr);
-  assert.match(run.stdout, /test result: ok\. 9 passed; 0 failed/);
+  assert.match(run.stdout, /test result: ok\. 12 passed; 0 failed/);
 });
 
 test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and bad payloads', () => {
@@ -3051,4 +3067,23 @@ test('the hub only listens to the window Rust built: other labels are refused as
   assert.equal(child.intent('dock', { from: 'playlist-2' }), true);
   assert.equal(out.at(-1).from, 'playlist-3', 'args cannot override the label');
   assert.equal(hub.onIntent(out.at(-1)).ok, true, 'round trip through the hub');
+});
+
+test('the hub fails closed: opened without a label it accepts no window', () => {
+  let applied = 0;
+  const sent = [];
+  const hub = C.createSwHub({ send: (ev, p) => sent.push(ev), snapshot: () => ({}), apply: () => { applied += 1; return true; } });
+  for (const label of [undefined, null, '', 42]) {
+    hub.open(label);
+    assert.equal(hub.label, null);
+    const before = sent.length;
+    for (const from of [undefined, null, '', 'playlist', 'playlist-2']) {
+      assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from }).reason, 'stale', String(label) + '/' + String(from));
+      assert.equal(hub.onHello({ origin: 'playlist', v: 0, from }), null);
+    }
+    assert.equal(sent.length, before, 'no reply');
+  }
+  assert.equal(applied, 0);
+  hub.open('playlist');
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, true);
 });
