@@ -3397,6 +3397,27 @@ test('source scan fails on each no-write injection fixture (14 prior + 2 after s
 // runtime recording Proxy is the backstop.
 
 const SW_RUNTIME_HANDLER_FLOOR = 25; // sensible floor; reported in the test
+const SW_RUNTIME_FLUSH_CAP = 1000;
+const SW_RUNTIME_INTERVAL_FIRES = 3;
+
+/** Optional allow-list: empty when stubs are honest. Each entry needs a reason. */
+const SW_RUNTIME_ALLOW_HANDLER_FAIL = [];
+const SW_RUNTIME_ALLOW_LOAD_THROW = [];
+
+function swFakeFileList(files) {
+  const arr = Array.from(files);
+  const fl = {
+    length: arr.length,
+    item(i) { return arr[i] ?? null; },
+    [Symbol.iterator]: function* () { yield* arr; },
+  };
+  for (let i = 0; i < arr.length; i++) fl[i] = arr[i];
+  return fl;
+}
+
+function swDefaultFiles() {
+  return swFakeFileList([new File(['{}'], 'x.json', { type: 'application/json' })]);
+}
 
 function swExtractInlineScripts(html) {
   const out = [];
@@ -3461,7 +3482,6 @@ function swRecordingStorage() {
     },
   });
   return { proxy, writes, data, tagStorage(name) {
-    // Return a parallel sessionStorage that shares the writes log with a tag.
     const sdata = new Map();
     const sapi = {
       getItem(k) { const key = String(k); return sdata.has(key) ? sdata.get(key) : null; },
@@ -3490,8 +3510,42 @@ function swRecordingStorage() {
   } };
 }
 
-function swStubElement(id, bag) {
+function swMakeFileHandle(store, name) {
+  return {
+    kind: 'file',
+    name: name || 'file',
+    async createWritable() {
+      store.writes.push({ op: 'createWritable', key: String(name || 'createWritable'), storage: 'fs' });
+      return {
+        write: async () => {},
+        close: async () => {},
+        abort: async () => {},
+      };
+    },
+    async getFile() { return new File(['x'], name || 'file'); },
+  };
+}
+
+function swMakeDirHandle(store, name) {
+  return {
+    kind: 'directory',
+    name: name || 'dir',
+    async queryPermission() { return 'granted'; },
+    async requestPermission() { return 'granted'; },
+    async getDirectoryHandle(child, _opts) {
+      store.writes.push({ op: 'getDirectoryHandle', key: String(child), storage: 'fs' });
+      return swMakeDirHandle(store, child);
+    },
+    async getFileHandle(child, _opts) {
+      store.writes.push({ op: 'getFileHandle', key: String(child), storage: 'fs' });
+      return swMakeFileHandle(store, child);
+    },
+  };
+}
+
+function swStubElement(id, bag, elFactory) {
   const listeners = [];
+  const makeChild = () => elFactory('qs-' + id + '-' + (listeners.length));
   const base = {
     id,
     nodeType: 1,
@@ -3524,7 +3578,7 @@ function swStubElement(id, bag) {
     checked: false,
     selectedIndex: 0,
     options: [],
-    files: null,
+    files: swDefaultFiles(),
     href: '',
     src: '',
     currentTime: 0,
@@ -3569,8 +3623,8 @@ function swStubElement(id, bag) {
     play() { return Promise.resolve(); },
     pause() {},
     load() {},
-    querySelector() { return null; },
-    querySelectorAll() { return []; },
+    querySelector(_sel) { return makeChild(); },
+    querySelectorAll(_sel) { return [makeChild()]; },
     getElementsByTagName() { return []; },
     getElementsByClassName() { return []; },
     closest() { return null; },
@@ -3593,6 +3647,15 @@ function swStubElement(id, bag) {
     toDataURL() { return 'data:image/png;base64,xx'; },
     toBlob(cb) { if (typeof cb === 'function') cb(new Blob(['x'])); },
   };
+  // Seed a span under bmusic so soundtrack render's querySelector('span') is stable even if
+  // a caller inspects children; querySelector itself always returns a stub.
+  if (id === 'bmusic') {
+    const span = elFactory('bmusic-span');
+    span.tagName = 'SPAN';
+    span.nodeName = 'SPAN';
+    span.textContent = 'Music';
+    base.children.push(span);
+  }
   return new Proxy(base, {
     set(t, prop, value) {
       if (typeof prop === 'string' && prop.startsWith('on') && typeof value === 'function') {
@@ -3609,47 +3672,58 @@ function swStubElement(id, bag) {
   });
 }
 
-function swFakeEvent(target) {
+function swFakeEvent(target, overrides = {}) {
   return {
     target,
     currentTarget: target,
-    type: 'change',
-    key: '',
-    code: '',
-    ctrlKey: false,
-    metaKey: false,
-    altKey: false,
-    shiftKey: false,
+    type: overrides.type || 'change',
+    key: overrides.key || '',
+    code: overrides.code || '',
+    ctrlKey: !!overrides.ctrlKey,
+    metaKey: !!overrides.metaKey,
+    altKey: !!overrides.altKey,
+    shiftKey: !!overrides.shiftKey,
     button: 0,
     preventDefault() {},
     stopPropagation() {},
     stopImmediatePropagation() {},
+    ...overrides,
   };
+}
+
+function swKeymapKeysFromHtml(html) {
+  const keys = new Set();
+  const re = /def:\s*'((?:\\'|[^'])*)'/g;
+  let m;
+  const fns = html.indexOf('const FNS = [');
+  const fnsEnd = html.indexOf('];', fns);
+  const slice = fns !== -1 && fnsEnd !== -1 ? html.slice(fns, fnsEnd) : html;
+  while ((m = re.exec(slice)) !== null) keys.add(m[1].replace(/\\'/g, "'"));
+  for (const k of ['Delete', 'Backspace', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) keys.add(k);
+  return [...keys];
 }
 
 /**
  * Run the real page scripts as role 'main' | 'playlist'.
- * Returns { writes, handlersRun, handlersFailed, handlerTotal, keys, sandbox }.
+ * Returns { writes, handlersRun, handlersFailed, handlerTotal, keys, loadThrow, ... }.
  */
 function swRuntimeRun(html, role, opts = {}) {
   const coreSrc = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
   let scripts = swExtractInlineScripts(html);
   assert.ok(scripts.length >= 2, 'expected main + soundtrack inline scripts');
-  // Expose soundtrack save() for the direct-call phase.
   scripts = scripts.map(s => s.includes('initSoundtrack')
     ? s.replace('window.sspSoundtrackSync = sync;',
       'window.sspSoundtrackSync = sync; window.__sspTestSoundtrackSave = save;')
     : s);
 
   const store = swRecordingStorage();
-  const bag = { onHandlers: [], domListeners: [], idb: [], fsWrites: [] };
+  const bag = { onHandlers: [], domListeners: [], idb: [], fsWrites: [], loadThrow: [], handlerErrors: [] };
   const elements = new Map();
   const el = (id) => {
-    if (!elements.has(id)) elements.set(id, swStubElement(id, bag));
+    if (!elements.has(id)) elements.set(id, swStubElement(id, bag, el));
     return elements.get(id);
   };
 
-  const timers = [];
   let timerSeq = 1;
   const pendingTimers = new Map();
 
@@ -3662,12 +3736,12 @@ function swRuntimeRun(html, role, opts = {}) {
     title: '',
     hidden: false,
     getElementById: (id) => el(String(id)),
-    querySelector: () => null,
-    querySelectorAll: () => [],
+    querySelector: (_sel) => el('document-qs'),
+    querySelectorAll: (_sel) => [el('document-qsa')],
     getElementsByTagName: () => [],
     getElementsByClassName: () => [],
     createElement: (tag) => {
-      const e = swStubElement('created-' + tag, bag);
+      const e = swStubElement('created-' + tag, bag, el);
       e.tagName = String(tag).toUpperCase();
       e.nodeName = e.tagName;
       return e;
@@ -3710,12 +3784,16 @@ function swRuntimeRun(html, role, opts = {}) {
       constructor() { this.onload = null; this.onerror = null; this.result = null; this.readyState = 0; }
       readAsDataURL() { this.readyState = 2; this.result = 'data:application/octet-stream;base64,eA=='; if (typeof this.onload === 'function') this.onload({ target: this }); }
       readAsArrayBuffer() { this.readyState = 2; this.result = new ArrayBuffer(1); if (typeof this.onload === 'function') this.onload({ target: this }); }
-      readAsText() { this.readyState = 2; this.result = ''; if (typeof this.onload === 'function') this.onload({ target: this }); }
+      readAsText(file) {
+        this.readyState = 2;
+        // Prefer real text when the stub File carries '{}'.
+        this.result = (file && typeof file === 'object' && file.name === 'x.json') ? '{}' : '{}';
+        if (typeof this.onload === 'function') this.onload({ target: this });
+      }
     },
     setTimeout(fn, ms) {
       const id = timerSeq++;
-      pendingTimers.set(id, { fn, ms: ms || 0 });
-      timers.push(id);
+      pendingTimers.set(id, { fn, ms: ms || 0, interval: false });
       return id;
     },
     clearTimeout(id) { pendingTimers.delete(id); },
@@ -3753,19 +3831,37 @@ function swRuntimeRun(html, role, opts = {}) {
           onerror: null,
           onupgradeneeded: null,
         };
-        // Don't auto-succeed: callers that write should hit recording via open itself.
-        sandbox.setTimeout(() => {
+        // Microtasks (not setTimeout) so awaited saveMetaIDB/saveScreenshotFile can settle
+        // without depending on flushAsync to pump the timer queue.
+        const finishOpen = () => {
           req.result = {
+            name: String(name),
             objectStoreNames: { contains: () => true },
             createObjectStore: () => ({ createIndex() {} }),
-            transaction: () => ({
-              objectStore: () => ({
-                put: (v) => { store.writes.push({ op: 'idb-put', key: 'put', storage: 'idb' }); return {}; },
-                get: () => ({ onsuccess: null, onerror: null, result: null }),
-              }),
-              oncomplete: null,
-              onerror: null,
-            }),
+            transaction: () => {
+              const tx = { oncomplete: null, onerror: null };
+              const storeApi = {
+                put: (v) => {
+                  store.writes.push({ op: 'idb-put', key: String(name), storage: 'idb' });
+                  const r = { onsuccess: null, onerror: null, result: v };
+                  Promise.resolve().then(() => {
+                    if (typeof r.onsuccess === 'function') r.onsuccess({ target: r });
+                    if (typeof tx.oncomplete === 'function') tx.oncomplete({ target: tx });
+                  });
+                  return r;
+                },
+                get: () => {
+                  const r = { onsuccess: null, onerror: null, result: null };
+                  Promise.resolve().then(() => {
+                    if (typeof r.onsuccess === 'function') r.onsuccess({ target: r });
+                    if (typeof tx.oncomplete === 'function') tx.oncomplete({ target: tx });
+                  });
+                  return r;
+                },
+              };
+              tx.objectStore = () => storeApi;
+              return tx;
+            },
           };
           if (typeof req.onupgradeneeded === 'function') {
             try { req.onupgradeneeded({ target: req }); } catch (_) {}
@@ -3773,7 +3869,8 @@ function swRuntimeRun(html, role, opts = {}) {
           if (typeof req.onsuccess === 'function') {
             try { req.onsuccess({ target: req }); } catch (_) {}
           }
-        }, 0);
+        };
+        Promise.resolve().then(finishOpen);
         return req;
       },
     },
@@ -3822,9 +3919,10 @@ function swRuntimeRun(html, role, opts = {}) {
     HTMLElement: class {},
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init && init.detail; } },
     Event: class { constructor(type) { this.type = type; } },
-    showOpenFilePicker: undefined,
-    showSaveFilePicker: undefined,
-    showDirectoryPicker: undefined,
+    // Wired FS access pickers: getDirectoryHandle / getFileHandle / createWritable all record.
+    showOpenFilePicker: async () => [swMakeFileHandle(store, 'picked.bin')],
+    showSaveFilePicker: async () => swMakeFileHandle(store, 'export.bin'),
+    showDirectoryPicker: async () => swMakeDirHandle(store, 'Screenshots'),
   };
   sandbox.window = sandbox;
   sandbox.globalThis = sandbox;
@@ -3833,21 +3931,7 @@ function swRuntimeRun(html, role, opts = {}) {
   sandbox.removeEventListener = () => {};
   sandbox.dispatchEvent = () => true;
   sandbox.attachEvent = undefined;
-
-  // createWritable recording on any element/file handle used later
   sandbox.__swBag = bag;
-  sandbox.__swRecordCreateWritable = () => {
-    store.writes.push({ op: 'createWritable', key: 'createWritable', storage: 'fs' });
-    return {
-      write: async () => {},
-      close: async () => {},
-      abort: async () => {},
-    };
-  };
-
-  // Patch FileSystemFileHandle-like createWritable via a global used if code paths reach it.
-  // saveExportBlob / saveScreenshotFile call handle.createWritable — stub handles when show* is missing.
-  // They early-return for playlist via sspIsMainWindow.
 
   let loadError = null;
   try {
@@ -3861,14 +3945,10 @@ function swRuntimeRun(html, role, opts = {}) {
     try {
       vm.runInNewContext(scripts[i], sandbox, { filename: 'inline-' + (i + 1) + '.js' });
     } catch (e) {
-      // Classic scripts hoist function decls onto the sandbox; a late throw is OK
-      // as long as the save* APIs we need exist. Record and continue.
-      bag.loadThrow = bag.loadThrow || [];
       bag.loadThrow.push({ script: i + 1, message: e && e.message });
     }
   }
 
-  // Ensure role stuck as playlist through the real path.
   if (role === 'playlist') {
     try {
       sandbox.__SSP_WINDOW_ROLE = 'playlist';
@@ -3879,7 +3959,6 @@ function swRuntimeRun(html, role, opts = {}) {
     assert.equal(sandbox.sspIsMainWindow(), true, 'main role must make sspIsMainWindow true');
   }
 
-  // Init playlist window path.
   try {
     if (typeof sandbox.initPlaylistWindowSync === 'function') sandbox.initPlaylistWindowSync();
   } catch (_) {}
@@ -3890,38 +3969,84 @@ function swRuntimeRun(html, role, opts = {}) {
   } catch (_) {}
 
   async function flushAsync() {
-    // Flush microtasks and pending timers a few rounds (not intervals forever).
-    for (let round = 0; round < 8; round++) {
+    // Drain one-shot timeouts + microtasks. Fire each interval callback a few times.
+    // Cap total steps so runaway timer chains cannot hang the suite.
+    const intervalFires = new Map();
+    for (let step = 0; step < SW_RUNTIME_FLUSH_CAP; step++) {
       await Promise.resolve();
       await Promise.resolve();
-      const due = [...pendingTimers.entries()].filter(([, t]) => !t.interval);
-      for (const [id, t] of due) {
+
+      let progressed = false;
+      for (const [id, t] of [...pendingTimers.entries()]) {
+        if (t.interval) continue;
         pendingTimers.delete(id);
+        progressed = true;
         try { t.fn(); } catch (_) {}
       }
+      for (const [id, t] of [...pendingTimers.entries()]) {
+        if (!t.interval) continue;
+        const n = intervalFires.get(id) || 0;
+        if (n >= SW_RUNTIME_INTERVAL_FIRES) continue;
+        intervalFires.set(id, n + 1);
+        progressed = true;
+        try { t.fn(); } catch (_) {}
+      }
+
       await Promise.resolve();
+      await Promise.resolve();
+
+      const hasTimeouts = [...pendingTimers.values()].some(tm => !tm.interval);
+      if (!hasTimeouts && !progressed) break;
     }
   }
 
-  // Direct save* calls (Pia's list).
   const directCalls = [];
-  function callDirect(name, fn) {
+  async function callDirect(name, fn) {
     directCalls.push(name);
-    try { return fn(); } catch (e) { bag.directErrors = bag.directErrors || []; bag.directErrors.push({ name, message: e && e.message }); }
+    try {
+      const ret = fn();
+      if (ret && typeof ret.then === 'function') {
+        // Pump microtasks + one-shot timers until the promise settles or the cap hits.
+        let settled = false;
+        let outcome;
+        let error;
+        ret.then(v => { settled = true; outcome = v; }, e => { settled = true; error = e; });
+        for (let i = 0; i < SW_RUNTIME_FLUSH_CAP && !settled; i++) {
+          // Only drain one-shot timers + microtasks here (intervals handled in flushAsync).
+          await Promise.resolve();
+          for (const [id, tm] of [...pendingTimers.entries()]) {
+            if (tm.interval) continue;
+            pendingTimers.delete(id);
+            try { tm.fn(); } catch (_) {}
+          }
+          await Promise.resolve();
+        }
+        if (!settled) {
+          bag.directErrors = bag.directErrors || [];
+          bag.directErrors.push({ name, message: 'timed out waiting for async save*' });
+          return;
+        }
+        if (error) throw error;
+        return outcome;
+      }
+      return ret;
+    } catch (e) {
+      bag.directErrors = bag.directErrors || [];
+      bag.directErrors.push({ name, message: e && e.message });
+    }
   }
 
   return (async () => {
     await flushAsync();
 
-    callDirect('saveKeyMap', () => sandbox.saveKeyMap && sandbox.saveKeyMap());
-    callDirect('persistVideoSkipSec', () => sandbox.persistVideoSkipSec && sandbox.persistVideoSkipSec(7));
-    callDirect('persistImageUpdatesSource', () => sandbox.persistImageUpdatesSource && sandbox.persistImageUpdatesSource({ v: 1 }));
-    callDirect('saveItemLS', () => sandbox.saveItemLS && sandbox.saveItemLS({ id: 't1', name: 't1.jpg', type: 'image', customDur: 5000 }));
-    callDirect('saveSessionBeforeExit', () => sandbox.saveSessionBeforeExit && sandbox.saveSessionBeforeExit(null));
-    callDirect('forgetEmptiedSession', () => sandbox.forgetEmptiedSession && sandbox.forgetEmptiedSession());
-    callDirect('removePlaylistFiles', () => {
+    await callDirect('saveKeyMap', () => sandbox.saveKeyMap && sandbox.saveKeyMap());
+    await callDirect('persistVideoSkipSec', () => sandbox.persistVideoSkipSec && sandbox.persistVideoSkipSec(7));
+    await callDirect('persistImageUpdatesSource', () => sandbox.persistImageUpdatesSource && sandbox.persistImageUpdatesSource({ v: 1 }));
+    await callDirect('saveItemLS', () => sandbox.saveItemLS && sandbox.saveItemLS({ id: 't1', name: 't1.jpg', type: 'image', customDur: 5000 }));
+    await callDirect('saveSessionBeforeExit', () => sandbox.saveSessionBeforeExit && sandbox.saveSessionBeforeExit(null));
+    await callDirect('forgetEmptiedSession', () => sandbox.forgetEmptiedSession && sandbox.forgetEmptiedSession());
+    await callDirect('removePlaylistFiles', () => {
       if (!sandbox.removePlaylistFiles) return;
-      // Seed a tiny playlist so the helper has something to match.
       try {
         sandbox.items = [{ id: 't1', name: 't1.jpg', type: 'image', path: '/t/t1.jpg' }];
         sandbox.cur = 0;
@@ -3929,49 +4054,85 @@ function swRuntimeRun(html, role, opts = {}) {
       } catch (_) {}
       return sandbox.removePlaylistFiles(['t1.jpg'], true, false);
     });
-    callDirect('soundtrack save', () => sandbox.__sspTestSoundtrackSave && sandbox.__sspTestSoundtrackSave());
-    callDirect('saveMetaIDB', () => sandbox.saveMetaIDB && sandbox.saveMetaIDB('k', 1));
-    callDirect('saveHandleIDB', () => sandbox.saveHandleIDB && sandbox.saveHandleIDB('h', {}));
-    callDirect('saveScreenshotFile', () => sandbox.saveScreenshotFile && sandbox.saveScreenshotFile('x.png', new Blob(['x'])));
-    callDirect('saveExportBlob', () => sandbox.saveExportBlob && sandbox.saveExportBlob('x.jpg', new Blob(['x'])));
+    await callDirect('soundtrack save', () => sandbox.__sspTestSoundtrackSave && sandbox.__sspTestSoundtrackSave());
+    await callDirect('saveMetaIDB', () => sandbox.saveMetaIDB && sandbox.saveMetaIDB('k', 1));
+    await callDirect('saveHandleIDB', () => sandbox.saveHandleIDB && sandbox.saveHandleIDB('h', {}));
+    await callDirect('saveScreenshotFile', () => sandbox.saveScreenshotFile && sandbox.saveScreenshotFile('x.png', new Blob(['x'])));
+    await callDirect('saveExportBlob', () => sandbox.saveExportBlob && sandbox.saveExportBlob('x.jpg', new Blob(['x'])));
 
     await flushAsync();
 
-    // Fire every recorded on* and addEventListener handler.
     let handlersRun = 0;
     let handlersFailed = 0;
     const allHandlers = [];
     for (const h of bag.onHandlers) allHandlers.push({ kind: 'on', ...h, run: h.fn });
-    for (const h of bag.domListeners) allHandlers.push({ kind: 'addEventListener', id: h.id, prop: 'on' + h.type, run: h.fn });
-    // Also fire common element onchange/onclick if set but somehow missed
+    for (const h of bag.domListeners) allHandlers.push({ kind: 'addEventListener', id: h.id, type: h.type, prop: 'on' + h.type, run: h.fn });
     for (const [id, node] of elements) {
-      for (const prop of ['onclick', 'onchange', 'oninput', 'onkeydown', 'onkeyup']) {
+      for (const prop of ['onclick', 'onchange', 'oninput', 'onkeydown', 'onkeyup', 'onplaying', 'onpause']) {
         if (typeof node[prop] === 'function' && !allHandlers.some(h => h.id === id && h.prop === prop)) {
           allHandlers.push({ kind: 'on-direct', id, prop, run: node[prop] });
         }
       }
     }
 
-    for (const h of allHandlers) {
+    const keyHandlers = allHandlers.filter(h =>
+      (h.type === 'keydown' || h.type === 'keyup' || h.prop === 'onkeydown' || h.prop === 'onkeyup')
+    );
+    const nonKeyHandlers = allHandlers.filter(h => !keyHandlers.includes(h));
+
+    async function fireOne(h, ev) {
       try {
         const target = elements.get(h.id) || el(h.id || 'unknown');
-        const ret = h.run.call(target, swFakeEvent(target));
+        const ret = h.run.call(target, ev || swFakeEvent(target));
         if (ret && typeof ret.then === 'function') {
-          try { await ret; } catch (_) { handlersFailed++; }
+          try { await ret; } catch (err) {
+            handlersFailed++;
+            bag.handlerErrors.push({ id: h.id, prop: h.prop, message: err && err.message });
+          }
         }
         handlersRun++;
-      } catch (_) {
+      } catch (err) {
         handlersFailed++;
-        handlersRun++; // attempted
+        handlersRun++;
+        bag.handlerErrors.push({ id: h.id, prop: h.prop, message: err && err.message });
+      }
+    }
+
+    for (const h of nonKeyHandlers) {
+      await fireOne(h, swFakeEvent(elements.get(h.id) || el(h.id || 'unknown')));
+    }
+
+    // Nit: fire key listeners with each keymap key + Delete/Backspace/Escape/arrows,
+    // with and without Shift/Ctrl.
+    const keyList = swKeymapKeysFromHtml(html);
+    const modCombos = [
+      { shiftKey: false, ctrlKey: false },
+      { shiftKey: true, ctrlKey: false },
+      { shiftKey: false, ctrlKey: true },
+      { shiftKey: true, ctrlKey: true },
+    ];
+    for (const h of keyHandlers) {
+      for (const key of keyList) {
+        for (const mod of modCombos) {
+          await fireOne(h, swFakeEvent(elements.get(h.id) || el(h.id || 'unknown'), {
+            type: (h.type || (h.prop || '').replace(/^on/, '') || 'keydown'),
+            key,
+            code: key.length === 1 ? 'Key' + key.toUpperCase() : key,
+            ...mod,
+          }));
+        }
       }
     }
 
     await flushAsync();
 
-    // Cancel leftover intervals so the process can exit cleanly.
     for (const [id] of pendingTimers) pendingTimers.delete(id);
 
-    const keys = store.writes.filter(w => w.op === 'setItem' || w.op === 'removeItem' || w.op === 'prop-set' || w.op === 'clear' || w.op === 'idb-open' || w.op === 'idb-put' || w.op === 'createWritable' || w.op === 'fs').map(w => w.key);
+    const keys = store.writes.filter(w =>
+      w.op === 'setItem' || w.op === 'removeItem' || w.op === 'prop-set' || w.op === 'clear'
+      || w.op === 'idb-open' || w.op === 'idb-put' || w.op === 'createWritable'
+      || w.op === 'getDirectoryHandle' || w.op === 'getFileHandle' || w.op === 'fs'
+    ).map(w => w.key);
 
     return {
       writes: store.writes.slice(),
@@ -3979,8 +4140,10 @@ function swRuntimeRun(html, role, opts = {}) {
       handlersRun,
       handlersFailed,
       handlerTotal: allHandlers.length,
+      handlerErrors: bag.handlerErrors.slice(),
       directCalls,
-      loadThrow: bag.loadThrow || [],
+      loadThrow: bag.loadThrow.slice(),
+      directErrors: bag.directErrors || [],
       sspIsMain: typeof sandbox.sspIsMainWindow === 'function' ? sandbox.sspIsMainWindow() : null,
       hasSaveKeyMap: typeof sandbox.saveKeyMap === 'function',
       hasSaveItemLS: typeof sandbox.saveItemLS === 'function',
@@ -3988,9 +4151,29 @@ function swRuntimeRun(html, role, opts = {}) {
   })();
 }
 
+function swAssertCleanHandlers(label, result) {
+  const failAllow = new Set(SW_RUNTIME_ALLOW_HANDLER_FAIL.map(x => x.id + '|' + x.prop));
+  const unexpectedFails = (result.handlerErrors || []).filter(e => !failAllow.has(e.id + '|' + e.prop));
+  const loadAllow = new Set(SW_RUNTIME_ALLOW_LOAD_THROW.map(x => x.script + '|' + x.message));
+  const unexpectedLoad = (result.loadThrow || []).filter(t => !loadAllow.has(t.script + '|' + t.message));
+
+  if (SW_RUNTIME_ALLOW_HANDLER_FAIL.length === 0) {
+    assert.equal(result.handlersFailed, 0,
+      label + ' handlersFailed must be 0; errors=' + JSON.stringify(result.handlerErrors));
+  } else {
+    assert.equal(unexpectedFails.length, 0,
+      label + ' unexpected handler failures: ' + JSON.stringify(unexpectedFails));
+  }
+  if (SW_RUNTIME_ALLOW_LOAD_THROW.length === 0) {
+    assert.deepEqual(result.loadThrow, [],
+      label + ' loadThrow must be empty; got ' + JSON.stringify(result.loadThrow));
+  } else {
+    assert.equal(unexpectedLoad.length, 0,
+      label + ' unexpected loadThrow: ' + JSON.stringify(unexpectedLoad));
+  }
+}
+
 function swInjectRuntimeFixture(html, code) {
-  // Append a trailing classic script so the fixture runs even if an earlier statement
-  // in the main inline script throws on a stub gap.
   const tag = '<script>\n' + code + '\n</script>';
   const body = html.lastIndexOf('</body>');
   if (body !== -1) return html.slice(0, body) + tag + html.slice(body);
@@ -3998,12 +4181,41 @@ function swInjectRuntimeFixture(html, code) {
 }
 
 function swInjectAfterSaveMetaIDB(html, code) {
-
   const start = html.indexOf('async function saveMetaIDB');
   assert.ok(start !== -1);
   const enc = swEnclosingFn(html, start + 10);
   assert.ok(enc);
   return html.slice(0, enc.end) + code + html.slice(enc.end);
+}
+
+function swUnguardScreenshotFns(html0) {
+  let html = html0;
+  html = html.replace(
+    /async function getScreenshotDirHandle\(\) \{\s*if \(!sspIsMainWindow\(\)\) return null;/,
+    'async function getScreenshotDirHandle() {'
+  );
+  html = html.replace(
+    /async function saveScreenshotFile\(name, blob\) \{\s*if \(!sspIsMainWindow\(\)\) return false;/,
+    'async function saveScreenshotFile(name, blob) {'
+  );
+  assert.doesNotMatch(
+    html.slice(html.indexOf('async function getScreenshotDirHandle'), html.indexOf('async function getScreenshotDirHandle') + 120),
+    /sspIsMainWindow/
+  );
+  assert.doesNotMatch(
+    html.slice(html.indexOf('async function saveScreenshotFile'), html.indexOf('async function saveScreenshotFile') + 120),
+    /sspIsMainWindow/
+  );
+  return html;
+}
+
+function swInjectFiupdLateWrite(html0) {
+  const needle = "g('fiupd').onchange = function() {\n  if (!this.files[0]) return;\n";
+  assert.ok(html0.includes(needle), 'fiupd onchange shape not found');
+  return html0.replace(
+    needle,
+    needle + "  localStorage.setItem('fixture_fiupd_late', 'v');\n"
+  );
 }
 
 test('runtime: second window records no persisted writes; main records expected keys', async () => {
@@ -4012,11 +4224,14 @@ test('runtime: second window records no persisted writes; main records expected 
   swBlankCacheByStr.clear();
 
   const child = await swRuntimeRun(html, 'playlist');
+  console.log('SW_RUNTIME playlist handlersRun=%d handlersFailed=%d loadThrow=%s',
+    child.handlersRun, child.handlersFailed, JSON.stringify(child.loadThrow));
   assert.ok(child.hasSaveKeyMap, 'saveKeyMap must exist after script load');
   assert.ok(child.hasSaveItemLS, 'saveItemLS must exist after script load');
   assert.equal(child.sspIsMain, false);
   assert.ok(child.handlersRun >= SW_RUNTIME_HANDLER_FLOOR,
     `too few handlers ran as playlist (${child.handlersRun} < ${SW_RUNTIME_HANDLER_FLOOR}); stub gaps may be hiding writes`);
+  swAssertCleanHandlers('playlist', child);
   assert.deepEqual(
     child.writes,
     [],
@@ -4024,38 +4239,52 @@ test('runtime: second window records no persisted writes; main records expected 
   );
 
   const main = await swRuntimeRun(html, 'main');
+  console.log('SW_RUNTIME main handlersRun=%d handlersFailed=%d loadThrow=%s',
+    main.handlersRun, main.handlersFailed, JSON.stringify(main.loadThrow));
   assert.equal(main.sspIsMain, true);
   assert.ok(main.handlersRun >= SW_RUNTIME_HANDLER_FLOOR,
     `too few handlers ran as main (${main.handlersRun} < ${SW_RUNTIME_HANDLER_FLOOR})`);
+  swAssertCleanHandlers('main', main);
   const mainKeys = [...new Set(main.writes.filter(w => w.op === 'setItem' || w.op === 'removeItem').map(w => w.key))].sort();
-  // Expected keys from the direct save* calls (and any init that legitimately saves on main).
   for (const key of ['ssp_keymap', 'ssp_video_skip_sec', 'ssp_image_updates', 'sspSoundtrackV1']) {
     assert.ok(mainKeys.includes(key) || main.writes.some(w => w.key === key), 'main should record ' + key + '; got ' + mainKeys.join(','));
   }
-  // At least one of session / item / default-dur writes
   assert.ok(
     main.writes.some(w => w.key === 'ssp_autosave' || w.key === 'ssp_default_dur' || String(w.key).startsWith('ssp|')),
     'main should record session/default-dur/item keys'
   );
+  assert.ok(
+    main.writes.some(w => w.op === 'idb-open' && w.key === 'SSP_v1'),
+    'main control must record IDB SSP_v1 open; writes=' + JSON.stringify(main.writes.filter(w => String(w.op).startsWith('idb')).slice(0, 10))
+  );
+  assert.ok(
+    main.writes.some(w => w.op === 'idb-put' && w.key === 'SSP_v1'),
+    'main control must record IDB SSP_v1 put; writes=' + JSON.stringify(main.writes.filter(w => String(w.op).startsWith('idb')).slice(0, 10))
+  );
+  // createWritable path exercised on main via saveScreenshotFile + wired pickers
+  assert.ok(
+    main.writes.some(w => w.op === 'createWritable'),
+    'main should record createWritable via saveScreenshotFile; ops=' + main.writes.map(w => w.op).filter((v, i, a) => a.indexOf(v) === i).join(',')
+  );
 
-  // Expose counts for the report via assert messages / stored on globalThis for the agent.
   globalThis.__swRuntimeReport = {
     childHandlersRun: child.handlersRun,
+    childHandlersFailed: child.handlersFailed,
+    childLoadThrow: child.loadThrow,
     mainHandlersRun: main.handlersRun,
-    childHandlerTotal: child.handlerTotal,
-    mainHandlerTotal: main.handlerTotal,
+    mainHandlersFailed: main.handlersFailed,
+    mainLoadThrow: main.loadThrow,
     mainKeys,
-    mainWriteOps: main.writes.map(w => w.op + ':' + w.key).slice(0, 40),
     childWrites: child.writes.length,
     handlerFloor: SW_RUNTIME_HANDLER_FLOOR,
+    allowHandlerFail: SW_RUNTIME_ALLOW_HANDLER_FAIL,
+    allowLoadThrow: SW_RUNTIME_ALLOW_LOAD_THROW,
   };
 });
 
-test('runtime fixtures: hoisted helper and i++ / 2 shapes write as second window', async () => {
+test('runtime fixtures: hoisted helper, i++ / 2, fiupd late-write, key write, unguarded screenshot', async () => {
   const html0 = swNoWriteHtml();
 
-  // 1. Honest shape: hoisted helper registered before the guard / declared after it.
-  // Lexical scan can miss this; runtime must catch the write when the listener fires.
   const hoistedSafe = swInjectRuntimeFixture(html0, `
 document.addEventListener('change', onSkip);
 if (!sspIsMainWindow()) { /* register already happened */ }
@@ -4067,7 +4296,6 @@ function onSkip(){ localStorage.setItem('fixture_hoisted', 'v'); }
     'hoisted helper fixture must be caught at runtime; writes=' + JSON.stringify(r1.writes)
   );
 
-  // 2. Honest shape: i++ / 2 on the same line as a write (old blanker treated / as regex).
   const divslash = swInjectRuntimeFixture(html0, `
 document.addEventListener('change', () => { let i = 0; i++ / 2; localStorage.setItem('fixture_divslash', 'v'); });
 `);
@@ -4075,6 +4303,34 @@ document.addEventListener('change', () => { let i = 0; i++ / 2; localStorage.set
   assert.ok(
     r2.writes.some(w => w.key === 'fixture_divslash'),
     'i++ / 2 fixture must be caught at runtime; writes=' + JSON.stringify(r2.writes)
+  );
+
+  // fiupd late-write: a write after this.files[0] must be seen when onchange fires.
+  const fiupdHtml = swInjectFiupdLateWrite(html0);
+  const r3 = await swRuntimeRun(fiupdHtml, 'playlist');
+  assert.ok(
+    r3.writes.some(w => w.key === 'fixture_fiupd_late'),
+    'fiupd late-write fixture must be caught; writes=' + JSON.stringify(r3.writes.slice(0, 20))
+  );
+
+  // Key-specific write: keydown listener must fire for keymap keys.
+  const keyHtml = swInjectRuntimeFixture(html0, `
+document.addEventListener('keydown', function onFixtureKey(e) {
+  if (e.key === 'ArrowRight') localStorage.setItem('fixture_key_arrowright', 'v');
+});
+`);
+  const r4 = await swRuntimeRun(keyHtml, 'playlist');
+  assert.ok(
+    r4.writes.some(w => w.key === 'fixture_key_arrowright'),
+    'key-specific fixture must be caught; writes=' + JSON.stringify(r4.writes.slice(0, 20))
+  );
+
+  // Unguarded saveScreenshotFile + getScreenshotDirHandle must record FS writes as playlist.
+  const shotHtml = swUnguardScreenshotFns(html0);
+  const r5 = await swRuntimeRun(shotHtml, 'playlist');
+  assert.ok(
+    r5.writes.some(w => w.op === 'createWritable' || w.op === 'getFileHandle' || w.op === 'getDirectoryHandle'),
+    'unguarded screenshot fixture must record FS writes; writes=' + JSON.stringify(r5.writes.slice(0, 20))
   );
 });
 
@@ -4103,7 +4359,9 @@ test('runtime mutation: removing a guard makes the second window record a write;
   const main = await swRuntimeRun(html0, 'main');
   assert.ok(main.writes.some(w => w.key === 'ssp_keymap'), 'main control must still record ssp_keymap');
   assert.ok(main.handlersRun >= SW_RUNTIME_HANDLER_FLOOR, 'main control handler floor');
+  swAssertCleanHandlers('main-mutation-control', main);
 });
+
 
 
 test('main writes saved settings; the second window does not (KEYMAP, default dur, transition, video skip, image updates, autosave, item keys)', () => {
