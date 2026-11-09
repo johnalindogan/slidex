@@ -1,3 +1,4 @@
+mod audio_stat;
 mod cast;
 mod media_trash;
 
@@ -306,6 +307,13 @@ fn media_file_size(path: String, allowed: State<'_, AllowedMedia>) -> Result<u64
     }
     let meta = std::fs::metadata(&canonical).map_err(|e| e.to_string())?;
     Ok(meta.len())
+}
+
+/// Size and mtime of a song the app plays, for the beat cache. Never reads the file.
+#[tauri::command]
+fn audio_file_stat(path: String, allowed: State<'_, AllowedMedia>) -> Result<audio_stat::AudioStat, String> {
+    // Fixed error strings only: nothing from the input path or the OS reaches the page.
+    audio_stat::stat_audio_path(Path::new(&path), |p| is_path_allowed(p, &allowed))
 }
 
 #[tauri::command]
@@ -1350,6 +1358,7 @@ pub fn run() {
             get_launch_paths,
             read_media_file,
             media_file_size,
+            audio_file_stat,
             register_allowed_paths,
             list_folder_media,
             read_text_file,
