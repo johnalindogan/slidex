@@ -3933,7 +3933,7 @@ function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
   if (!item) return;
   if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
-  // Redundant sspIsMainWindow: kept for the source-scan.
+  // The sspIsMainWindow() guard is redundant on purpose (playlist early-return already covers it); the source-scan requires a call-time guard on this write.
   if (clearLS && sspIsMainWindow()) [item.id, item.name].filter(Boolean).forEach(key => localStorage.removeItem(lsKey(key)));
   items.splice(itemsIdx, 1);
   selectedItems.clear();
@@ -6310,7 +6310,8 @@ async function blobToBase64(blob) {
 }
 /** Save blob via Tauri dialog+write_export_file, showSaveFilePicker, or <a download>. */
 async function saveExportBlob(defaultName, blob, filters, extra) {
-  if (!sspIsMainWindow()) return { ok: false, reason: 'child' };
+  // Second window never exports (stage tools run in main). Quiet cancel so callers don't toast.
+  if (!sspIsMainWindow()) return { ok: false, reason: 'cancel' };
   if (!blob) return { ok: false, reason: 'empty' };
   if (sspIsTauri()) {
     try {
@@ -8510,7 +8511,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function save() {
     if (!sspIsTauri()) return;
     // Main owns the soundtrack. The pane is hidden in the second window by CSS; this makes it a rule.
-    if (!(typeof sspIsMainWindow === 'function' ? sspIsMainWindow() : isMain)) return;
+    if (!sspIsMainWindow()) return;
     try { localStorage.setItem(LS_KEY, C.serializeAudioQueue(q)); } catch (_) {}
   }
   function toast(msg) { try { showToast(msg, 4000); } catch (_) {} }
