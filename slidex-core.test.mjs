@@ -1811,6 +1811,71 @@ test('clicking a strip thumbnail jumps to that slide', () => {
   assert.equal(C.pointerPassedReorderThreshold(4, 0), true);
 });
 
+test('playlist undo: Remove, Shuffle and Reorder undo and redo in order, capped at 100', () => {
+  const a = { id: 'a' }, b = { id: 'b' }, c = { id: 'c' };
+  let h = C.undoHistory();
+  let list = [a, b, c];
+  h = C.undoCommit(h, 'Remove', { items: list.slice(), cur: 1 });
+  list = [a, c];
+  h = C.undoCommit(h, 'Shuffle', { items: list.slice(), cur: 0 });
+  list = [c, a];
+  let step = C.undoStep(h, { items: list.slice(), cur: 0 });
+  assert.equal(step.label, 'Shuffle');
+  assert.deepEqual(step.snap.items.map(x => x.id), ['a', 'c']);
+  h = step.history; list = step.snap.items;
+  step = C.undoStep(h, { items: list.slice(), cur: 0 });
+  assert.equal(step.label, 'Remove');
+  assert.deepEqual(step.snap.items.map(x => x.id), ['a', 'b', 'c']);
+  assert.equal(step.snap.cur, 1);
+  assert.strictEqual(step.snap.items[1], b, 'the removed item object comes back, edits and all');
+  h = step.history; list = step.snap.items;
+  assert.equal(C.undoStep(h, { items: list, cur: 1 }), null, 'nothing left to undo');
+  step = C.redoStep(h, { items: list.slice(), cur: 1 });
+  assert.equal(step.label, 'Remove');
+  assert.deepEqual(step.snap.items.map(x => x.id), ['a', 'c']);
+  h = step.history;
+  /* A new edit clears redo. */
+  h = C.undoCommit(h, 'Reorder', { items: [a, c], cur: 0 });
+  assert.equal(h.future.length, 0);
+  assert.equal(C.redoStep(h, { items: [c, a], cur: 0 }), null);
+  /* Cap. */
+  let big = C.undoHistory();
+  for (let i = 0; i < 130; i++) big = C.undoCommit(big, 'Reorder ' + i, { items: [], cur: i });
+  assert.equal(big.past.length, C.PLAYLIST_UNDO_CAP);
+  assert.equal(C.PLAYLIST_UNDO_CAP, 100);
+  assert.equal(big.past[0].snap.cur, 30, 'the oldest steps drop off first');
+});
+
+test('playlist undo keys are Ctrl+Z, Ctrl+Y and Ctrl+Shift+Z, and every playlist edit records a step', () => {
+  const k = (key, mods = {}) => C.undoKeyAction({ key, ctrlKey: true, ...mods });
+  assert.equal(k('z'), 'undo');
+  assert.equal(k('Z', { shiftKey: true }), 'redo');
+  assert.equal(k('y'), 'redo');
+  assert.equal(C.undoKeyAction({ key: 'z', metaKey: true }), 'undo');
+  assert.equal(C.undoKeyAction({ key: 'z' }), null, 'plain z stays free');
+  assert.equal(C.undoKeyAction({ key: 'y' }), null, 'plain y stays Lowlights −');
+  assert.equal(k('z', { altKey: true }), null);
+  assert.equal(k('x'), null);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const body = name => {
+    const i = html.indexOf('function ' + name + '(');
+    assert.ok(i >= 0, name);
+    return html.slice(i, html.indexOf('\n}\n', i));
+  };
+  assert.match(body('removeItem'), /recordPlaylistEdit\('Remove'\)/);
+  assert.match(body('shufflePlaylist'), /recordPlaylistEdit\('Shuffle'\)[\s\S]*toastPlaylistEdit\('Shuffle'\)/);
+  assert.match(body('applyReorderResult'), /recordPlaylistEdit\('Reorder'\)/);
+  assert.match(html, /recordPlaylistEdit\('Duplicate'\);\n  const dup = /);
+  /* Recycle Bin moves restart history; remove-only is a step. */
+  assert.match(body('removePlaylistFiles'), /if \(clearLS\) clearPlaylistUndo\(\); else recordPlaylistEdit\('Remove'\);/);
+  /* New session, a loaded playlist, and a restored list start with empty history. */
+  assert.match(body('build'), /clearPlaylistUndo\(\)/);
+  /* The key check sits after the text-field guard, so fields keep their own Ctrl+Z. */
+  const guard = html.indexOf('  if (editing) return;\n\n  /* Ctrl+Z');
+  assert.ok(guard > 0, 'undo keys run after the text-editing guard');
+  assert.match(html, /data-pl-undo/);
+});
+
 test('new order holds after Next/Prev and after save and reopen', () => {
   const shots = whatsappShots(8);
   const rows = C.stackMediaRows(shots.length);
