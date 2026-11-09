@@ -2007,6 +2007,9 @@
       seen[key] = true;
       var t = { path: String(path), name: trackDisplayName(name) };
       if (e && typeof e === 'object' && e.url) t.url = e.url;
+      // Browser File picks carry File.size / File.lastModified: the beat cache keys on them.
+      if (e && typeof e === 'object' && Number(e.size) > 0) t.size = Math.round(Number(e.size));
+      if (e && typeof e === 'object' && Number(e.mtimeMs) > 0) t.mtimeMs = Math.round(Number(e.mtimeMs));
       tracks.push(t);
       added++;
     });
@@ -2304,14 +2307,45 @@
     return Math.min(SYNC_OFFSET_MAX_MS, Math.max(SYNC_OFFSET_MIN_MS, n)) || 0;
   }
 
-  /* Per-file beat cache (localStorage), so a song isn't decoded and analysed on every play or
-     every launch. Key = file path (case-folded like the queue) + file size + analyzer version;
-     a changed file or a new analyzer misses the cache. Stores the grid or the unclear reason. */
+  /* Per-file beat cache (localStorage), so a song isn't read, decoded or analysed on every play
+     or every launch. Key (v2) = file path (case-folded like the queue) + size + mtime + analyzer
+     version, from a stat (Tauri) or File metadata (browser), so a hit reads no file bytes.
+     Only when neither is available does the key use a fingerprint of the first and last 64 KB.
+     A changed file or a new analyzer misses the cache. Stores the grid or the unclear reason. */
   var BEAT_CACHE_MAX = 200;
-  function beatCacheKey(path, size, version) {
-    var n = Number(size);
-    if (!path || !(n > 0)) return null;
-    return audioPathKey(path) + '|' + Math.round(n) + '|v' + (version == null ? BEAT_ANALYZER_VERSION : version);
+  var BEAT_CACHE_KEY_VERSION = 2;
+  var BEAT_FINGERPRINT_BYTES = 64 * 1024;
+  /** stat: { size, mtimeMs } or { size, fingerprint }. null when there is nothing to key on. */
+  function beatCacheKey(path, stat, version) {
+    var size = Number(stat && stat.size), mtime = Number(stat && stat.mtimeMs);
+    var fp = stat && typeof stat.fingerprint === 'string' && /^[0-9a-f]{8,}$/.test(stat.fingerprint) ? stat.fingerprint : '';
+    if (!path || !(size > 0)) return null;
+    var id = mtime > 0 ? 'm' + Math.round(mtime) : (fp ? 'f' + fp : '');
+    if (!id) return null;
+    return 'k' + BEAT_CACHE_KEY_VERSION + '|' + audioPathKey(path) + '|' + Math.round(size) + '|' + id +
+      '|a' + (version == null ? BEAT_ANALYZER_VERSION : version);
+  }
+  /** Stat from track metadata (browser File) or the Tauri audio_file_stat reply; null if neither. */
+  function trackStatFrom(track, reply) {
+    if (track && Number(track.size) > 0 && Number(track.mtimeMs) > 0) {
+      return { size: Number(track.size), mtimeMs: Number(track.mtimeMs) };
+    }
+    if (reply && Number(reply.size) > 0 && Number(reply.mtime_ms) > 0) {
+      return { size: Number(reply.size), mtimeMs: Number(reply.mtime_ms) };
+    }
+    return null;
+  }
+  /** FNV-1a 32-bit over head bytes, tail bytes and the size (fallback key only). */
+  function beatFingerprint(head, tail, size) {
+    var h = 0x811c9dc5;
+    function eat(b) { h ^= b; h = Math.imul(h, 0x01000193) >>> 0; }
+    [head, tail].forEach(function (u8, part) {
+      eat(part);
+      var a = u8 || [];
+      for (var i = 0; i < a.length; i++) eat(a[i] & 255);
+    });
+    String(Math.round(Number(size) || 0)).split('').forEach(function (ch) { eat(ch.charCodeAt(0)); });
+    return ('0000000' + h.toString(16)).slice(-8);
   }
   /** Cache entry from an analyzeBeats result. */
   function beatCacheEntry(res) {
@@ -2429,7 +2463,11 @@
     SYNC_OFFSET_MAX_MS: SYNC_OFFSET_MAX_MS,
     clampSyncOffsetMs: clampSyncOffsetMs,
     BEAT_CACHE_MAX: BEAT_CACHE_MAX,
+    BEAT_CACHE_KEY_VERSION: BEAT_CACHE_KEY_VERSION,
+    BEAT_FINGERPRINT_BYTES: BEAT_FINGERPRINT_BYTES,
     beatCacheKey: beatCacheKey,
+    trackStatFrom: trackStatFrom,
+    beatFingerprint: beatFingerprint,
     beatCacheEntry: beatCacheEntry,
     beatCacheRead: beatCacheRead,
     beatCacheWrite: beatCacheWrite,

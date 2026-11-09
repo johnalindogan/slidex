@@ -8294,10 +8294,18 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   var beatMode = 'off';
   try { var bm = localStorage.getItem(BEAT_KEY); if (C.BEAT_SYNC_MODES.indexOf(bm) >= 0) beatMode = bm; } catch (_) {}
   var beats = Object.create(null); // track path -> { state: 'analyzing'|'ok'|'unclear'|'failed', grid }
-  var BEAT_CACHE_KEY = 'sspBeatCacheV1';
+  var BEAT_CACHE_KEY = 'sspBeatCacheV2';
+  try { localStorage.removeItem('sspBeatCacheV1'); } catch (_) {} // v1 keys had no mtime
   var OFFSET_KEY = 'sspBeatOffsetV1';
-  var syncOffsetMs = 0;
-  try { syncOffsetMs = C.clampSyncOffsetMs(localStorage.getItem(OFFSET_KEY)); } catch (_) {}
+  var syncOffsetMs = 0, savedOffsetMs = null;
+  try {
+    var so = localStorage.getItem(OFFSET_KEY);
+    syncOffsetMs = C.clampSyncOffsetMs(so);
+    if (so != null) savedOffsetMs = syncOffsetMs;
+  } catch (_) {}
+  function offsetLabel() {
+    return 'Sync offset \u00b7 ' + syncOffsetMs + ' ms' + (savedOffsetMs === syncOffsetMs ? ' \u00b7 Saved' : '');
+  }
   function readBeatCache() { try { return C.parseBeatCache(localStorage.getItem(BEAT_CACHE_KEY)); } catch (_) { return {}; } }
   function writeBeatCache(key, res) {
     if (!key) return;
@@ -8378,12 +8386,46 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (analysisWindow(workMs)) { fn(); return; }
     setTimeout(function () { whenSafe(workMs, fn); }, 150);
   }
-  function fetchTrack(t) {
+  /* Songs the app plays are registered with Rust, so audio_file_stat (size + mtime, no read)
+     answers for them and refuses anything else. Restored songs register at startup. */
+  var songsRegistered = Promise.resolve();
+  function registerSongs(paths) {
+    var list = (paths || []).filter(function (p) { return typeof p === 'string' && p && p.indexOf('file:') !== 0; });
+    if (!sspIsTauri() || !list.length) return songsRegistered;
+    songsRegistered = songsRegistered.then(function () {
+      return tauriInvoke('register_allowed_paths', { paths: list });
+    }).catch(function (e) { console.warn('[music] register failed', e); });
+    return songsRegistered;
+  }
+  registerSongs(q.tracks.map(function (t) { return t.path; }));
+  /** { size, mtimeMs } without reading the file: File metadata first, then the Rust stat. */
+  function statTrack(t) {
+    var known = C.trackStatFrom(t, null);
+    if (known) return Promise.resolve(known);
+    if (!sspIsTauri() || t.url) return Promise.resolve(null);
+    return songsRegistered.then(function () {
+      return tauriInvoke('audio_file_stat', { path: t.path });
+    }).then(function (reply) { return C.trackStatFrom(null, reply); }, function (e) {
+      console.warn('[music] stat failed', e);
+      return null;
+    });
+  }
+  function fetchTrackBlob(t) {
     var src = srcFor(t);
     if (!src || typeof fetch !== 'function') return Promise.reject(new Error('no source'));
     return fetch(src).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.arrayBuffer();
+      return r.blob();
+    });
+  }
+  /** Last-resort key when there is no stat: first and last 64 KB of the blob, plus its size. */
+  function fingerprintBlob(blob) {
+    var n = C.BEAT_FINGERPRINT_BYTES, size = blob.size;
+    return Promise.all([
+      blob.slice(0, Math.min(n, size)).arrayBuffer(),
+      blob.slice(Math.max(0, size - n), size).arrayBuffer()
+    ]).then(function (parts) {
+      return { size: size, fingerprint: C.beatFingerprint(new Uint8Array(parts[0]), new Uint8Array(parts[1]), size) };
     });
   }
   function decodeTrack(buf) {
@@ -8412,12 +8454,8 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
       pumpAnalysis();
     }
     var cacheKey = null;
-    fetchTrack(t).then(function (buf) {
-      // Same file (path + size) and same analyzer as before: reuse the result, no decode.
-      cacheKey = C.beatCacheKey(t.path, buf.byteLength);
-      var hit = C.beatCacheRead(readBeatCache(), cacheKey);
-      if (hit) { finish(hit); return; }
-      return decodeTrack(buf).then(function (ab) {
+    function analyseBlob(blob) {
+      return blob.arrayBuffer().then(decodeTrack).then(function (ab) {
         if (ab.duration > C.BEAT_MAX_SECONDS) {
           writeBeatCache(cacheKey, { ok: false, reason: 'too-long' });
           finish({ state: 'unclear', reason: 'too-long' });
@@ -8429,6 +8467,22 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
           var res = C.analyzeBeats(C.mixToMono(chans), ab.sampleRate);
           writeBeatCache(cacheKey, res);
           finish(res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason });
+        });
+      });
+    }
+    // The cache is checked before any fetch: a hit on path + size + mtime reads no file bytes.
+    statTrack(t).then(function (stat) {
+      cacheKey = C.beatCacheKey(t.path, stat);
+      var hit = cacheKey && C.beatCacheRead(readBeatCache(), cacheKey);
+      if (hit) { finish(hit); return; }
+      return fetchTrackBlob(t).then(function (blob) {
+        if (cacheKey) return analyseBlob(blob);
+        // No stat at all: key on a head + tail fingerprint, then look again before decoding.
+        return fingerprintBlob(blob).then(function (fp) {
+          cacheKey = C.beatCacheKey(t.path, fp);
+          var fpHit = cacheKey && C.beatCacheRead(readBeatCache(), cacheKey);
+          if (fpHit) { finish(fpHit); return; }
+          return analyseBlob(blob);
         });
       });
     }).catch(function (e) {
@@ -8504,7 +8558,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     el('musicBeat').classList.toggle('on', beatMode !== 'off');
     el('musicOffsetRow').hidden = beatMode === 'off';
     el('musicOffset').value = String(syncOffsetMs);
-    el('musicOffsetLbl').textContent = 'Sync offset \u00b7 ' + syncOffsetMs + ' ms';
+    el('musicOffsetLbl').textContent = offsetLabel();
     var chip = el('musicBpm'), bt = t && beats[t.path];
     chip.hidden = beatMode === 'off' || !bt;
     chip.className = '';
@@ -8557,6 +8611,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   }
   function addEntries(entries) {
     var r = C.queueAddTracks(q, entries);
+    registerSongs(r.queue.tracks.slice(q.tracks.length).map(function (t) { return t.path; }));
     if (r.skipped.length) toast(r.skipped.length + ' file(s) can\u2019t be used: ' + r.skipped.slice(0, 3).join(', '));
     setQueue(r.queue);
     pumpAnalysis();
@@ -8582,7 +8637,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     var files = Array.prototype.slice.call(this.files || []);
     this.value = '';
     addEntries(files.map(function (f) {
-      return { path: 'file:' + f.name + ':' + f.size, name: f.name, url: URL.createObjectURL(f) };
+      return { path: 'file:' + f.name + ':' + f.size, name: f.name, url: URL.createObjectURL(f), size: f.size, mtimeMs: f.lastModified };
     }));
   };
 
@@ -8614,12 +8669,12 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   });
   el('musicOffset').oninput = function () {
     syncOffsetMs = C.clampSyncOffsetMs(this.value);
-    el('musicOffsetLbl').textContent = 'Sync offset \u00b7 ' + syncOffsetMs + ' ms';
+    el('musicOffsetLbl').textContent = offsetLabel();
   };
   el('musicOffset').onchange = function () {
     syncOffsetMs = C.clampSyncOffsetMs(this.value);
-    try { localStorage.setItem(OFFSET_KEY, String(syncOffsetMs)); } catch (_) {}
-    el('musicOffsetLbl').textContent = 'Sync offset \u00b7 ' + syncOffsetMs + ' ms \u00b7 Saved';
+    try { localStorage.setItem(OFFSET_KEY, String(syncOffsetMs)); savedOffsetMs = syncOffsetMs; } catch (_) {}
+    el('musicOffsetLbl').textContent = offsetLabel();
   };
   el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });
   el('musicVol').oninput = function () {

@@ -29,6 +29,11 @@ description = "Allow probing allowlisted media file sizes for blob vs convertFil
 commands.allow = ["media_file_size"]
 
 [[permission]]
+identifier = "allow-audio-file-stat"
+description = "Allow reading the size and modified time of a registered music file, without reading it"
+commands.allow = ["audio_file_stat"]
+
+[[permission]]
 identifier = "allow-open-playlist-window"
 description = "Allow opening the undocked Media Manager playlist window"
 commands.allow = ["open_playlist_window"]

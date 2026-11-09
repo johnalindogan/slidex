@@ -2637,14 +2637,65 @@ test('below the 2.2 confidence bar slides keep the unsynced time', () => {
   assert.match(html, /b\.state === 'ok' && C\.beatGridUsable\(b\.grid\) \? b\.grid : null/);
 });
 
-test('beat results are cached per file: path + size + analyzer version', () => {
-  const k = C.beatCacheKey('C:/Music/Song.mp3', 4096);
-  assert.equal(k, 'c:\\music\\song.mp3|4096|v' + C.BEAT_ANALYZER_VERSION);
-  assert.equal(C.beatCacheKey('c:\\music\\SONG.mp3', 4096), k, 'same file, same key');
-  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', 4097), k, 'changed file misses');
-  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', 4096, C.BEAT_ANALYZER_VERSION + 1), k, 'new analyzer misses');
-  assert.equal(C.beatCacheKey('', 10), null);
-  assert.equal(C.beatCacheKey('a.mp3', 0), null);
+test('beat cache key v2: path + size + mtime + analyzer version', () => {
+  const st = { size: 4096, mtimeMs: 1762700000123 };
+  const k = C.beatCacheKey('C:/Music/Song.mp3', st);
+  assert.equal(C.BEAT_CACHE_KEY_VERSION, 2);
+  assert.equal(k, 'k2|c:\\music\\song.mp3|4096|m1762700000123|a' + C.BEAT_ANALYZER_VERSION);
+  assert.equal(C.beatCacheKey('c:\\music\\SONG.mp3', st), k, 'same file, same key');
+  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', { ...st, size: 4097 }), k, 'size change misses');
+  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', { ...st, mtimeMs: st.mtimeMs + 1 }), k, 'same-size edit (new mtime) misses');
+  assert.notEqual(C.beatCacheKey('C:/Music/Song.mp3', st, C.BEAT_ANALYZER_VERSION + 1), k, 'new analyzer misses');
+  // mtime wins over a fingerprint; the fingerprint is only the no-stat fallback.
+  assert.equal(C.beatCacheKey('C:/Music/Song.mp3', { ...st, fingerprint: 'deadbeef' }), k);
+  assert.equal(C.beatCacheKey('a.mp3', { size: 10, fingerprint: 'deadbeef' }), 'k2|a.mp3|10|fdeadbeef|a' + C.BEAT_ANALYZER_VERSION);
+  // Nothing to key on: no cache (never a size-only key).
+  assert.equal(C.beatCacheKey('a.mp3', { size: 10 }), null);
+  assert.equal(C.beatCacheKey('a.mp3', { size: 10, fingerprint: 'nothex!' }), null);
+  assert.equal(C.beatCacheKey('a.mp3', 4096), null);
+  assert.equal(C.beatCacheKey('a.mp3', null), null);
+  assert.equal(C.beatCacheKey('', st), null);
+  assert.equal(C.beatCacheKey('a.mp3', { size: 0, mtimeMs: 5 }), null);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  assert.match(html, /var BEAT_CACHE_KEY = 'sspBeatCacheV2';/);
+});
+
+test('track stat: File metadata first, then the Rust audio_file_stat reply', () => {
+  assert.deepEqual({ ...C.trackStatFrom({ size: 10, mtimeMs: 20 }, { size: 1, mtime_ms: 2 }) }, { size: 10, mtimeMs: 20 });
+  assert.deepEqual({ ...C.trackStatFrom({ path: 'C:/a.mp3' }, { size: 1234, mtime_ms: 1762700000000 }) }, { size: 1234, mtimeMs: 1762700000000 });
+  assert.equal(C.trackStatFrom({ path: 'C:/a.mp3' }, null), null);
+  assert.equal(C.trackStatFrom({ path: 'C:/a.mp3' }, { size: 1234, mtime_ms: 0 }), null);
+  // Browser picks carry File.size / lastModified through the queue.
+  const q = C.queueAddTracks(C.createAudioQueue(), [{ path: 'file:a.mp3:9', name: 'a.mp3', url: 'blob:x', size: 9, mtimeMs: 77 }]).queue;
+  assert.equal(q.tracks[0].size, 9);
+  assert.equal(q.tracks[0].mtimeMs, 77);
+  // Fallback fingerprint: stable, and changes with head, tail or size.
+  const head = new Uint8Array([1, 2, 3]), tail = new Uint8Array([9, 8]);
+  const fp = C.beatFingerprint(head, tail, 100);
+  assert.match(fp, /^[0-9a-f]{8}$/);
+  assert.equal(C.beatFingerprint(new Uint8Array([1, 2, 3]), new Uint8Array([9, 8]), 100), fp);
+  assert.notEqual(C.beatFingerprint(new Uint8Array([1, 2, 4]), tail, 100), fp);
+  assert.notEqual(C.beatFingerprint(head, new Uint8Array([9, 7]), 100), fp);
+  assert.notEqual(C.beatFingerprint(head, tail, 101), fp);
+  assert.notEqual(C.beatFingerprint(tail, head, 100), C.beatFingerprint(head, tail, 100));
+  assert.equal(C.BEAT_FINGERPRINT_BYTES, 65536);
+  // Rust side: the command exists, is limited to registered audio files, and is permitted.
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  assert.match(lib, /fn audio_file_stat\(path: String, allowed: State<'_, AllowedMedia>\)/);
+  assert.match(lib, /audio_stat::stat_audio\(&canonical, \|p\| is_path_allowed\(p, &allowed\)\)/);
+  assert.match(lib, /generate_handler!\[[\s\S]*audio_file_stat,/);
+  const rs = fs.readFileSync(new URL('./src-tauri/src/audio_stat.rs', import.meta.url), 'utf8');
+  assert.match(rs, /pub mtime_ms: u64/);
+  assert.match(rs, /if !allowed\(canonical\) \{\s*return Err/);
+  assert.doesNotMatch(rs, /fs::read\(|File::open\(canonical/);
+  const cap = JSON.parse(fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8'));
+  assert.ok(cap.permissions.includes('allow-audio-file-stat'));
+  const perm = fs.readFileSync(new URL('./src-tauri/permissions/launch.toml', import.meta.url), 'utf8');
+  assert.match(perm, /identifier = "allow-audio-file-stat"[\s\S]*?commands\.allow = \["audio_file_stat"\]/);
+});
+
+test('beat results round-trip through the cache', () => {
+  const k = C.beatCacheKey('C:/Music/Song.mp3', { size: 4096, mtimeMs: 1 });
   const r = C.analyzeBeats(clickTrack(120, 0.25, 40), 22050);
   assert.equal(r.ok, true);
   let store = C.beatCacheWrite({}, k, C.beatCacheEntry(r));
@@ -2657,7 +2708,7 @@ test('beat results are cached per file: path + size + analyzer version', () => {
   const s = { mode: 'beat', audioPaused: false, casting: false, now: 12.3, targetMs: 4000 };
   assert.equal(C.beatSnapDelay({ ...s, grid: hit.grid }), C.beatSnapDelay({ ...s, grid: r.grid }));
   // Unclear songs are cached too, so they aren't re-analysed either.
-  const k2 = C.beatCacheKey('b.mp3', 99);
+  const k2 = C.beatCacheKey('b.mp3', { size: 99, mtimeMs: 5 });
   store = C.beatCacheWrite(store, k2, C.beatCacheEntry({ ok: false, reason: 'tempo-unclear' }));
   assert.deepEqual({ ...C.beatCacheRead(store, k2) }, { state: 'unclear', reason: 'tempo-unclear' });
   // A stored grid under the bar reads back as unclear.
@@ -2675,17 +2726,93 @@ test('beat results are cached per file: path + size + analyzer version', () => {
   assert.deepEqual(Object.keys(big), ['k3', 'k4', 'k2']);
 });
 
-test('the player checks the beat cache before decoding and saves every result', () => {
+function loadAnalysisPump({ tauri, stat, cache = {}, statFails = false, fetchBytes = 300000 }) {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const src = html.slice(html.indexOf('  var analysisBusy = false;'), html.indexOf('  function currentGrid() {'));
+  const log = [];
+  const store = { ...cache };
+  const bytes = new Uint8Array(fetchBytes).map((_, i) => i & 255);
+  const sandbox = {
+    C, console: { warn() {} }, Promise, setTimeout, log, store,
+    q: C.queueAddTracks(C.createAudioQueue(), [tauri ? 'C:/Music/Song.mp3' : { path: 'file:s.mp3:1', name: 's.mp3', url: 'blob:s', ...(stat || {}) }]).queue,
+    beats: Object.create(null), beatMode: 'beat',
+    render() {},
+    readBeatCache() { return { ...store }; },
+    writeBeatCache(key, res) { log.push('write:' + key); store[key] = C.beatCacheEntry(res); },
+    sspIsTauri() { return tauri; },
+    tauriInvoke(cmd, args) {
+      log.push('invoke:' + cmd);
+      if (cmd === 'audio_file_stat') return statFails ? Promise.reject(new Error('path not in allowed set')) : Promise.resolve({ size: 4096, mtime_ms: 1762700000123 });
+      return Promise.resolve([]);
+    },
+    srcFor(t) { return t.url || 'asset://' + t.path; },
+    fetch(url) {
+      log.push('fetch:' + url);
+      return Promise.resolve({
+        ok: true,
+        blob() {
+          return Promise.resolve({
+            size: bytes.length,
+            slice(a, b) { log.push('slice:' + a + '-' + b); return { arrayBuffer: () => Promise.resolve(bytes.slice(a, b).buffer) }; },
+            arrayBuffer() { log.push('read-body'); return Promise.resolve(bytes.buffer); },
+          });
+        },
+        arrayBuffer() { log.push('read-body'); return Promise.resolve(bytes.buffer); },
+      });
+    },
+    window: { OfflineAudioContext: function () { this.decodeAudioData = () => { log.push('decode'); return Promise.reject(new Error('stub')); }; } },
+  };
+  vm.runInNewContext(src + '\nthis.pumpAnalysis = pumpAnalysis;', sandbox);
+  return sandbox;
+}
+const settle = () => new Promise((r) => setTimeout(r, 20));
+const okEntry = (r) => C.beatCacheEntry(r);
+
+test('a cache hit reads no file bytes: the cache is checked before the fetch', async () => {
+  const r = C.analyzeBeats(clickTrack(120, 0.25, 40), 22050);
+  // Tauri: stat via audio_file_stat (size + mtime), hit → no fetch, no read, no decode.
+  const key = C.beatCacheKey('C:/Music/Song.mp3', { size: 4096, mtimeMs: 1762700000123 });
+  let sb = loadAnalysisPump({ tauri: true, cache: { [key]: okEntry(r) } });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, ['invoke:register_allowed_paths', 'invoke:audio_file_stat']);
+  assert.equal(sb.beats['C:/Music/Song.mp3'].state, 'ok');
+  // Browser: File.size + lastModified on the track, hit → nothing at all.
+  const bkey = C.beatCacheKey('file:s.mp3:1', { size: 5000, mtimeMs: 42 });
+  sb = loadAnalysisPump({ tauri: false, stat: { size: 5000, mtimeMs: 42 }, cache: { [bkey]: okEntry(r) } });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, []);
+  assert.equal(sb.beats['file:s.mp3:1'].state, 'ok');
+  // Miss with a stat: fetch, read, decode (stub fails) — one fetch, no fingerprint slices.
+  sb = loadAnalysisPump({ tauri: true });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, ['invoke:register_allowed_paths', 'invoke:audio_file_stat', 'fetch:asset://C:/Music/Song.mp3', 'read-body', 'decode']);
+  // No stat (refused): last-resort head + tail fingerprint; a hit then skips the body read.
+  const fp = C.beatFingerprint(new Uint8Array(65536).map((_, i) => i & 255),
+    new Uint8Array(300000).map((_, i) => i & 255).slice(300000 - 65536), 300000);
+  const fkey = C.beatCacheKey('C:/Music/Song.mp3', { size: 300000, fingerprint: fp });
+  sb = loadAnalysisPump({ tauri: true, statFails: true, cache: { [fkey]: okEntry(r) } });
+  sb.pumpAnalysis();
+  await settle();
+  assert.deepEqual(sb.log, ['invoke:register_allowed_paths', 'invoke:audio_file_stat', 'fetch:asset://C:/Music/Song.mp3', 'slice:0-65536', 'slice:234464-300000']);
+  assert.equal(sb.beats['C:/Music/Song.mp3'].state, 'ok');
+  // Source order: stat and cache lookup come before the fetch.
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   const pump = html.slice(html.indexOf('function pumpAnalysis()'), html.indexOf('function currentGrid()'));
+  const statAt = pump.indexOf('statTrack(t).then');
   const hitAt = pump.indexOf('C.beatCacheRead(readBeatCache(), cacheKey)');
-  const decodeAt = pump.indexOf('decodeTrack(buf)');
-  assert.ok(hitAt > 0 && decodeAt > hitAt, 'cache lookup comes before decode');
-  assert.match(pump, /cacheKey = C\.beatCacheKey\(t\.path, buf\.byteLength\);/);
+  const fetchAt = pump.indexOf('return fetchTrackBlob(t)');
+  assert.ok(statAt > 0 && hitAt > statAt && fetchAt > hitAt, 'stat → cache lookup → fetch');
   assert.match(pump, /if \(hit\) \{ finish\(hit\); return; \}/);
   assert.match(pump, /writeBeatCache\(cacheKey, res\);/);
   assert.match(pump, /writeBeatCache\(cacheKey, \{ ok: false, reason: 'too-long' \}\);/);
-  assert.match(html, /var BEAT_CACHE_KEY = 'sspBeatCacheV1';/);
+  assert.doesNotMatch(html, /buf\.byteLength/);
+  // Songs are registered with Rust when added and when restored, so the stat can answer.
+  assert.match(html, /registerSongs\(q\.tracks\.map\(function \(t\) \{ return t\.path; \}\)\);/);
+  assert.match(html, /registerSongs\(r\.queue\.tracks\.slice\(q\.tracks\.length\)/);
+  assert.match(html, /size: f\.size, mtimeMs: f\.lastModified/);
 });
 
 test('sync offset shifts slide changes later by the speaker lag, clamped and saved', () => {
@@ -2718,4 +2845,7 @@ test('sync offset shifts slide changes later by the speaker lag, clamped and sav
   assert.match(html, /var OFFSET_KEY = 'sspBeatOffsetV1';/);
   assert.match(html, /localStorage\.setItem\(OFFSET_KEY, String\(syncOffsetMs\)\)/);
   assert.match(html, /el\('musicOffsetRow'\)\.hidden = beatMode === 'off';/);
+  // "Saved" stays on the label across re-renders while the value matches what was stored.
+  assert.match(html, /\(savedOffsetMs === syncOffsetMs \? ' \\u00b7 Saved' : ''\)/);
+  assert.equal((html.match(/el\('musicOffsetLbl'\)\.textContent = offsetLabel\(\);/g) || []).length, 3);
 });
