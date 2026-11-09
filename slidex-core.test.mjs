@@ -2024,6 +2024,7 @@ test('removing the last item can be undone: the toast shows Undo and Ctrl+Z brin
   const view = { dz: 'none', viewer: 'flex' };
   const sb = {
     SlideXCore: C, console, Math,
+    SSP_IS_PLAYLIST_WINDOW: false,
     items: [], cur: 0, sessionLoaded: true, lastClickedMI: -1, selectedItems: new Set(),
     plUndo: { past: [], future: [] },
     localStorage: { removeItem() {} }, lsKey: k => k,
@@ -2047,7 +2048,7 @@ test('removing the last item can be undone: the toast shows Undo and Ctrl+Z brin
   assert.match(toasts.at(-1), /Remove done\. <button[^>]*data-pl-undo[^>]*>Undo<\/button>/, 'the Undo toast appears');
   assert.equal(sb.plUndo.past.length, 1, 'history survives the landing reset');
   /* Ctrl+Z on the empty list is allowed while history is pending. */
-  assert.match(html, /if \(undoAct && \(getMediaItems\(\)\.length \|\| playlistUndoPending\(\)\)\)/);
+  assert.match(html, /if \(undoAct && (!SSP_IS_PLAYLIST_WINDOW && )?\(getMediaItems\(\)\.length \|\| playlistUndoPending\(\)\)\)/);
   assert.equal(vm.runInContext('undoPlaylistEdit(false)', sb), true);
   assert.equal(sb.getMediaItems().length, 1);
   assert.strictEqual(sb.items[0], only, 'the same item comes back, edits and all');

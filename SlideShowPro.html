@@ -7007,12 +7007,12 @@ document.addEventListener('keydown', e => {
     || (e.target && (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA'));
   if (editing) return;
 
-  /* Second window: keys become intents for main; stage keys do nothing here. */
-  if (SSP_IS_PLAYLIST_WINDOW) { swChildKey(e); return; }
-
   /* Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) undo and redo playlist edits. Text fields keep their own undo. */
   const undoAct = window.SlideXCore && SlideXCore.undoKeyAction ? SlideXCore.undoKeyAction(e) : null;
-  if (undoAct && (getMediaItems().length || playlistUndoPending())) { e.preventDefault(); undoPlaylistEdit(undoAct === 'redo'); return; }
+  if (undoAct && !SSP_IS_PLAYLIST_WINDOW && (getMediaItems().length || playlistUndoPending())) { e.preventDefault(); undoPlaylistEdit(undoAct === 'redo'); return; }
+
+  /* Second window: keys become intents for main; stage keys do nothing here. */
+  if (SSP_IS_PLAYLIST_WINDOW) { swChildKey(e); return; }
 
   if (!getMediaItems().length) {
     if (keysEqual(keyMap.watch, e.key)) return;
