@@ -1930,7 +1930,172 @@
     return { media: media, skipped: skipped, append: !!(viewerOpen && itemCount > 0) };
   }
 
+  /* ── 0.2.0 soundtrack: a generic audio queue (local files only, no streaming).
+     The main window owns this state; the 0.3.0 karaoke queue can reuse it. ── */
+  var AUDIO_MIME = {
+    mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', wav: 'audio/wav',
+    flac: 'audio/flac', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg'
+  };
+  var AUDIO_EXTS = Object.keys(AUDIO_MIME);
+  var AUDIO_QUEUE_VERSION = 1;
+  var AUDIO_REPEAT_MODES = ['all', 'one', 'off'];
+  var AUDIO_DEFAULT_VOLUME = 0.8;
+
+  function audioExt(path) {
+    var s = String(path || '');
+    var base = s.split(/[\\/]/).pop() || '';
+    var dot = base.lastIndexOf('.');
+    return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
+  }
+
+  function audioMimeForPath(path) {
+    var ext = audioExt(path);
+    return Object.prototype.hasOwnProperty.call(AUDIO_MIME, ext) ? AUDIO_MIME[ext] : null;
+  }
+
+  function isAudioPath(path) { return audioMimeForPath(path) !== null; }
+
+  function trackDisplayName(path) {
+    var base = String(path || '').split(/[\\/]/).pop() || '';
+    var dot = base.lastIndexOf('.');
+    return dot > 0 ? base.slice(0, dot) : base;
+  }
+
+  function audioPathKey(path) {
+    // Windows paths are case-insensitive; one key per file stops duplicates.
+    return String(path || '').replace(/\//g, '\\').toLowerCase();
+  }
+
+  function clampVolume(v) {
+    var n = Number(v);
+    if (!Number.isFinite(n)) return AUDIO_DEFAULT_VOLUME;
+    return Math.max(0, Math.min(1, n));
+  }
+
+  function createAudioQueue(opts) {
+    var o = opts || {};
+    return {
+      tracks: [],
+      index: -1,
+      repeat: AUDIO_REPEAT_MODES.indexOf(o.repeat) >= 0 ? o.repeat : 'all',
+      volume: o.volume === undefined ? AUDIO_DEFAULT_VOLUME : clampVolume(o.volume),
+      on: o.on !== false
+    };
+  }
+
+  function copyQueue(q, patch) {
+    var out = {
+      tracks: q.tracks.slice(), index: q.index, repeat: q.repeat, volume: q.volume, on: q.on
+    };
+    for (var k in patch) if (Object.prototype.hasOwnProperty.call(patch, k)) out[k] = patch[k];
+    return out;
+  }
+
+  /** entries: paths (strings) or { path, name, url } (browser File picks carry a blob url). */
+  function queueAddTracks(q, entries) {
+    var seen = Object.create(null);
+    q.tracks.forEach(function (t) { seen[audioPathKey(t.path)] = true; });
+    var tracks = q.tracks.slice();
+    var added = 0, skipped = [];
+    (entries || []).forEach(function (e) {
+      var path = typeof e === 'string' ? e : (e && e.path);
+      var name = (e && typeof e === 'object' && e.name) || path;
+      if (!path) return;
+      if (!isAudioPath(name) && !isAudioPath(path)) { skipped.push(trackDisplayName(name) || String(path)); return; }
+      var key = audioPathKey(path);
+      if (seen[key]) return;
+      seen[key] = true;
+      var t = { path: String(path), name: trackDisplayName(name) };
+      if (e && typeof e === 'object' && e.url) t.url = e.url;
+      tracks.push(t);
+      added++;
+    });
+    var index = q.index;
+    if (index < 0 && tracks.length) index = 0;
+    return { queue: copyQueue(q, { tracks: tracks, index: index }), added: added, skipped: skipped };
+  }
+
+  function queueRemoveAt(q, i) {
+    if (i < 0 || i >= q.tracks.length) return q;
+    var tracks = q.tracks.slice();
+    tracks.splice(i, 1);
+    var index = q.index;
+    if (!tracks.length) index = -1;
+    else if (i < index) index -= 1;
+    else if (i === index) index = Math.min(index, tracks.length - 1);
+    return copyQueue(q, { tracks: tracks, index: index });
+  }
+
+  /** dir +1/-1. auto=true is "the track ended"; manual skips always wrap.
+      Returns { index, stop }: stop=true means the queue ran out (repeat off). */
+  function queueStep(q, dir, auto) {
+    var n = q.tracks.length;
+    if (!n) return { index: -1, stop: true };
+    var i = q.index < 0 ? 0 : q.index;
+    if (auto && q.repeat === 'one') return { index: i, stop: false };
+    var next = i + (dir < 0 ? -1 : 1);
+    if (next >= n || next < 0) {
+      if (auto && q.repeat === 'off') return { index: 0, stop: true };
+      next = (next + n) % n;
+    }
+    return { index: next, stop: false };
+  }
+
+  function nextRepeatMode(mode) {
+    var i = AUDIO_REPEAT_MODES.indexOf(mode);
+    return AUDIO_REPEAT_MODES[(i + 1) % AUDIO_REPEAT_MODES.length];
+  }
+
+  /** Music follows the slideshow: it plays only while slides play, in the main window. */
+  function soundtrackShouldPlay(s) {
+    return !!(s && s.slideshowPlaying && s.on && s.hasTrack && s.mainWindow && s.sessionLoaded);
+  }
+
+  /** Only real paths persist; browser blob picks die with the page. */
+  function serializeAudioQueue(q) {
+    var tracks = q.tracks.filter(function (t) { return !t.url; });
+    var idx = q.index >= 0 && q.tracks[q.index] && !q.tracks[q.index].url
+      ? tracks.indexOf(q.tracks[q.index]) : (tracks.length ? 0 : -1);
+    return JSON.stringify({
+      v: AUDIO_QUEUE_VERSION,
+      tracks: tracks.map(function (t) { return t.path; }),
+      index: idx, repeat: q.repeat, volume: q.volume, on: q.on
+    });
+  }
+
+  function parseAudioQueue(text) {
+    var data;
+    try { data = JSON.parse(text); } catch (_) { return createAudioQueue(); }
+    if (!data || data.v !== AUDIO_QUEUE_VERSION || !Array.isArray(data.tracks)) return createAudioQueue();
+    var q = queueAddTracks(createAudioQueue({ repeat: data.repeat, volume: data.volume, on: data.on }),
+      data.tracks.filter(function (p) { return typeof p === 'string'; })).queue;
+    var idx = Number(data.index);
+    if (Number.isInteger(idx) && idx >= 0 && idx < q.tracks.length) q.index = idx;
+    return q;
+  }
+
+  function formatTrackTime(sec) {
+    var s = Number(sec);
+    if (!Number.isFinite(s) || s < 0) return '—';
+    s = Math.floor(s);
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
   root.SlideXCore = {
+    AUDIO_EXTS: AUDIO_EXTS,
+    audioMimeForPath: audioMimeForPath,
+    isAudioPath: isAudioPath,
+    trackDisplayName: trackDisplayName,
+    clampVolume: clampVolume,
+    createAudioQueue: createAudioQueue,
+    queueAddTracks: queueAddTracks,
+    queueRemoveAt: queueRemoveAt,
+    queueStep: queueStep,
+    nextRepeatMode: nextRepeatMode,
+    soundtrackShouldPlay: soundtrackShouldPlay,
+    serializeAudioQueue: serializeAudioQueue,
+    parseAudioQueue: parseAudioQueue,
+    formatTrackTime: formatTrackTime,
     CROP_VERSION: CROP_VERSION,
     PLAYLIST_SSP_VERSION: PLAYLIST_SSP_VERSION,
     ASPECTS: ASPECTS,

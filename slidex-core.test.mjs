@@ -2279,3 +2279,84 @@ test('emptying the playlist forgets the saved session so Continue is not offered
   const broken = { removeItem: () => { throw new Error('denied'); } };
   assert.equal(C.forgetEmptiedSession(broken, 0), false);
 });
+
+test('soundtrack queue takes local audio files once and skips other files', () => {
+  assert.equal(C.audioMimeForPath('C:\\Music\\Song.MP3'), 'audio/mpeg');
+  assert.equal(C.audioMimeForPath('D:/a/b.flac'), 'audio/flac');
+  assert.equal(C.audioMimeForPath('x.m4a'), 'audio/mp4');
+  assert.equal(C.audioMimeForPath('x.wav'), 'audio/wav');
+  assert.equal(C.isAudioPath('photo.jpg'), false);
+  const r = C.queueAddTracks(C.createAudioQueue(), [
+    'C:\\Music\\Golden Hour.mp3', 'c:/music/golden hour.MP3', 'C:\\Music\\cover.jpg', 'D:\\Low Tide.flac'
+  ]);
+  assert.equal(r.added, 2);
+  assert.deepEqual([...r.skipped], ['cover']);
+  assert.deepEqual([...r.queue.tracks.map(t => t.name)], ['Golden Hour', 'Low Tide']);
+  assert.equal(r.queue.index, 0);
+  assert.equal(r.queue.volume, 0.8);
+  assert.equal(r.queue.repeat, 'all');
+});
+
+test('soundtrack advances, loops and stops by repeat mode', () => {
+  let q = C.queueAddTracks(C.createAudioQueue(), ['a.mp3', 'b.mp3', 'c.mp3']).queue;
+  q.index = 2;
+  assert.deepEqual({ ...C.queueStep(q, 1, true) }, { index: 0, stop: false });
+  assert.deepEqual({ ...C.queueStep({ ...q, repeat: 'one' }, 1, true) }, { index: 2, stop: false });
+  assert.deepEqual({ ...C.queueStep({ ...q, repeat: 'off' }, 1, true) }, { index: 0, stop: true });
+  assert.deepEqual({ ...C.queueStep({ ...q, repeat: 'off' }, 1, false) }, { index: 0, stop: false });
+  assert.deepEqual({ ...C.queueStep({ ...q, index: 0 }, -1, false) }, { index: 2, stop: false });
+  assert.equal(C.nextRepeatMode('all'), 'one');
+  assert.equal(C.nextRepeatMode('one'), 'off');
+  assert.equal(C.nextRepeatMode('off'), 'all');
+  assert.equal(C.queueStep(C.createAudioQueue(), 1, true).stop, true);
+});
+
+test('removing a song keeps the current song selected', () => {
+  const q = { ...C.queueAddTracks(C.createAudioQueue(), ['a.mp3', 'b.mp3', 'c.mp3']).queue, index: 1 };
+  assert.equal(C.queueRemoveAt(q, 0).index, 0);
+  assert.equal(C.queueRemoveAt(q, 0).tracks[0].name, 'b');
+  assert.equal(C.queueRemoveAt(q, 2).index, 1);
+  assert.equal(C.queueRemoveAt({ ...q, index: 2 }, 2).index, 1);
+  assert.equal(C.queueRemoveAt(C.queueRemoveAt(C.queueRemoveAt(q, 0), 0), 0).index, -1);
+});
+
+test('music plays only while the slideshow plays in the main window', () => {
+  const on = { slideshowPlaying: true, on: true, hasTrack: true, mainWindow: true, sessionLoaded: true };
+  assert.equal(C.soundtrackShouldPlay(on), true);
+  for (const k of Object.keys(on)) assert.equal(C.soundtrackShouldPlay({ ...on, [k]: false }), false, k);
+  assert.equal(C.clampVolume(3), 1);
+  assert.equal(C.clampVolume(-1), 0);
+  assert.equal(C.clampVolume('x'), 0.8);
+  assert.equal(C.formatTrackTime(192.7), '3:12');
+  assert.equal(C.formatTrackTime(NaN), '—');
+});
+
+test('the soundtrack saves file paths only, not browser picks', () => {
+  let q = C.queueAddTracks(C.createAudioQueue({ repeat: 'off', volume: 0.5 }), [
+    'C:\\Music\\a.mp3', { path: 'file:b.mp3:10', name: 'b.mp3', url: 'blob:x' }
+  ]).queue;
+  const back = C.parseAudioQueue(C.serializeAudioQueue(q));
+  assert.deepEqual([...back.tracks.map(t => t.path)], ['C:\\Music\\a.mp3']);
+  assert.equal(back.repeat, 'off');
+  assert.equal(back.volume, 0.5);
+  assert.equal(back.index, 0);
+  assert.equal(C.parseAudioQueue('not json').tracks.length, 0);
+  assert.equal(C.parseAudioQueue('{"v":99,"tracks":["a.mp3"]}').tracks.length, 0);
+});
+
+test('the soundtrack follows slideshow play and pause, local files only', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const upd = html.slice(html.indexOf('function updPlayBtn()'), html.indexOf('function togglePlay()'));
+  assert.match(upd, /window\.sspSoundtrackSync\(\)/);
+  const home = html.slice(html.indexOf("g('bru').onclick"), html.indexOf("g('bru').onclick") + 200);
+  assert.match(home, /sessionLoaded = false;\s*\n\s*if \(typeof window\.sspSoundtrackSync/);
+  for (const id of ['bmusic', 'musicTab', 'musicPane', 'musicList', 'musicNow', 'musicAudio', 'musicVol']) {
+    assert.match(html, new RegExp(`id="${id}"`), id);
+  }
+  assert.equal((html.match(/<audio\b/g) || []).length, 1);
+  assert.match(html, /convertFileSrc\(t\.path\)/);
+  assert.doesNotMatch(html, /spotify/i);
+  const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  assert.equal(conf.app.security.assetProtocol.enable, true);
+  assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
