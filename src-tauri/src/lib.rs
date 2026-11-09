@@ -1053,15 +1053,19 @@ fn read_text_file(path: String, allowed: State<'_, AllowedMedia>) -> Result<Stri
 }
 
 
-/// 0.1.19 keeps the second window off. The JS flag hides the button; this
-/// command is the gate that nothing else can skip.
-const UNDOCK_MAIN_WINDOW: bool = false;
+/// 0.2.0 turns the second window back on. The main window owns the state and
+/// the second window only sends intents. This flag stays as the one gate.
+const UNDOCK_MAIN_WINDOW: bool = true;
+
+/// Event sent to the main window once the playlist window is destroyed, however
+/// it went (Dock back, the native close button, or a crash). Main re-docks on it.
+const SECOND_WINDOW_CLOSED_EVENT: &str = "sw://closed";
 
 pub fn undock_blocked_reason() -> Option<&'static str> {
     if UNDOCK_MAIN_WINDOW {
         None
     } else {
-        Some("Undock is off in 0.1.19")
+        Some("Undock is off")
     }
 }
 
@@ -1110,10 +1114,13 @@ async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Destroy (not close) the playlist window. The window holds no state, so there
+/// is nothing to save first, and destroy does not leave a half-closed window
+/// that a quick reopen would focus instead of rebuilding.
 #[tauri::command]
 fn close_playlist_window(app: AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("playlist") {
-        w.close().map_err(|e| e.to_string())?;
+        w.destroy().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1414,6 +1421,14 @@ pub fn run() {
             inject_launch_paths_to_webview(webview.app_handle());
         })
         .on_window_event(|window, event| {
+            if window.label() == "playlist" {
+                if let tauri::WindowEvent::Destroyed = event {
+                    let _ = window
+                        .app_handle()
+                        .emit_to("main", SECOND_WINDOW_CLOSED_EVENT, ());
+                }
+                return;
+            }
             if window.label() != "main" {
                 return;
             }
