@@ -26,6 +26,11 @@
   --border-glass: rgba(255, 255, 255, 0.08);
   --bg-hover: rgba(255, 255, 255, 0.08);
 }
+/* Keyboard focus ring (P1-9): 2px white on any control reached by keyboard. !important beats the
+   outline:none on search and rename fields so they show it too. Mouse clicks on buttons stay ring-free.
+   The 6px black halo sits under the outline, so the ring reads as black-white-black: visible on a white
+   slide (black halo) and on the black UI (white ring). */
+:focus-visible{outline:2px solid #fff!important;outline-offset:2px;box-shadow:0 0 0 6px #000!important;}
 *{box-sizing:border-box;margin:0;padding:0;}
 html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-main);}
 #app{display:flex;flex-direction:column;width:100vw;height:100vh;background:#000;}
