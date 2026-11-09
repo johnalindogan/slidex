@@ -1535,7 +1535,10 @@ let SSP_WINDOW_ROLE = (function () {
 })();
 let SSP_IS_PLAYLIST_WINDOW = SSP_WINDOW_ROLE === 'playlist';
 /** True in the main window. Read live: the role can late-bind from the Tauri label. Only main writes saved state. */
-function sspIsMainWindow() { return !SSP_IS_PLAYLIST_WINDOW; }
+function sspIsMainWindow() {
+  try { refreshWindowRoleFromTauri(); } catch (_) {}
+  return !SSP_IS_PLAYLIST_WINDOW;
+}
 /** 0.2.0: Undock is back. The second window is a remote for the main window. */
 const SSP_UNDOCK_ENABLED = true;
 if (SSP_UNDOCK_ENABLED) document.body.classList.add('ssp-undock-enabled');
@@ -3930,6 +3933,7 @@ function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
   if (!item) return;
   if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
+  // Redundant sspIsMainWindow: kept for the source-scan.
   if (clearLS && sspIsMainWindow()) [item.id, item.name].filter(Boolean).forEach(key => localStorage.removeItem(lsKey(key)));
   items.splice(itemsIdx, 1);
   selectedItems.clear();
@@ -4003,6 +4007,7 @@ function openHandleDB() {
   });
 }
 async function saveMetaIDB(key, value) {
+  if (!sspIsMainWindow()) return;
   const db = await openHandleDB();
   return new Promise((res, rej) => {
     const tx = db.transaction('meta', 'readwrite');
@@ -4021,6 +4026,7 @@ async function getMetaIDB(key) {
 }
 
 async function getScreenshotDirHandle() {
+  if (!sspIsMainWindow()) return null;
   if (!window.showDirectoryPicker) return null;
   if (screenshotDirHandle) return screenshotDirHandle;
   try {
@@ -4049,6 +4055,7 @@ async function getScreenshotDirHandle() {
 }
 
 async function saveScreenshotFile(name, blob) {
+  if (!sspIsMainWindow()) return false;
   const dir = await getScreenshotDirHandle();
   if (!dir) return false;
   try {
@@ -4065,6 +4072,7 @@ async function saveScreenshotFile(name, blob) {
 }
 
 async function saveHandleIDB(name, handle) {
+  if (!sspIsMainWindow()) return;
   const db = await openHandleDB();
   return new Promise((res, rej) => {
     const tx = db.transaction('handles', 'readwrite');
@@ -6302,6 +6310,7 @@ async function blobToBase64(blob) {
 }
 /** Save blob via Tauri dialog+write_export_file, showSaveFilePicker, or <a download>. */
 async function saveExportBlob(defaultName, blob, filters, extra) {
+  if (!sspIsMainWindow()) return { ok: false, reason: 'child' };
   if (!blob) return { ok: false, reason: 'empty' };
   if (sspIsTauri()) {
     try {

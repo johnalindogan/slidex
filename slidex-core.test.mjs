@@ -2575,7 +2575,8 @@ test('in the page, the second window only sends intents and main owns every writ
   assert.match(body('function goTo(i, source)'), /^function goTo\(i, source\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildGoToIndex\(i\); return; \}/);
   assert.match(body('function togglePlay()'), /^function togglePlay\(\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('togglePlay'\); return; \}/);
   assert.match(body('function shufflePlaylist()'), /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('tool', \{ id: 'plshuffle' \}\); return; \}/);
-  const rm = body('function removeItem(itemsIdx, clearLS)');
+  const rmAt = html.indexOf('function removeItem(itemsIdx, clearLS)');
+  const rm = html.slice(rmAt, rmAt + 700);
   assert.ok(rm.indexOf("swChildIntent('remove'") < rm.indexOf('items.splice'), 'remove asks main before any splice');
   const ro = body('function applyReorderResult(result)');
   assert.ok(ro.indexOf("swChildIntent('reorder'") < ro.indexOf('items = result.items'), 'reorder asks main before any write');
@@ -2720,6 +2721,9 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
 function swNoWriteHtml() {
   return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
 }
+function swNoWriteCore() {
+  return fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+}
 function swSlice(src, startMarker, endMarker) {
   const start = src.indexOf(startMarker);
   assert.ok(start !== -1, 'found ' + startMarker);
@@ -2727,11 +2731,15 @@ function swSlice(src, startMarker, endMarker) {
   assert.ok(end > start, 'found end ' + endMarker);
   return src.slice(start, end);
 }
+function swIsMainSrc(html) {
+  // Full multi-line sspIsMainWindow (calls refreshWindowRoleFromTauri first, like #57).
+  return swSlice(html, 'function sspIsMainWindow()', '\n/** 0.2.0: Undock') + '\n';
+}
 
 /** Enclosing function / arrow / method body that contains offset, walking braces. */
 function swEnclosingFn(src, offset) {
   let start = -1;
-  const re = /\bfunction\s+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{|\bfunction\s*\([^)]*\)\s*\{|[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*=>\s*\{|[A-Za-z_$][\w$]*\s*=\s*function\s*\([^)]*\)\s*\{|\.\w+\s*=\s*function\s*\([^)]*\)\s*\{/g;
+  const re = /\b(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{|\b(?:async\s+)?function\s*\([^)]*\)\s*\{|[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*=>\s*\{|[A-Za-z_$][\w$]*\s*=\s*(?:async\s+)?function\s*\([^)]*\)\s*\{|\.\w+\s*=\s*(?:async\s+)?function\s*\([^)]*\)\s*\{/g;
   let m;
   while ((m = re.exec(src)) !== null) {
     if (m.index > offset) break;
@@ -2745,66 +2753,240 @@ function swEnclosingFn(src, offset) {
     if (ch === '{') depth++;
     else if (ch === '}') {
       depth--;
-      if (depth === 0) return src.slice(start, i + 1);
+      if (depth === 0) return { start, end: i + 1, text: src.slice(start, i + 1) };
     }
   }
-  return src.slice(start);
+  return { start, end: src.length, text: src.slice(start) };
 }
 
-function swWriteIsGuarded(fnBody) {
-  // Call-time sspIsMainWindow() near the write, or a main-only early return at the top.
-  if (/sspIsMainWindow\s*\(/.test(fnBody)) return true;
-  if (/if\s*\(\s*!sspIsMainWindow\s*\(\s*\)\s*\)\s*return/.test(fnBody)) return true;
-  if (/if\s*\(\s*SSP_IS_PLAYLIST_WINDOW\s*\)\s*return/.test(fnBody)) return true;
-  if (/if\s*\(\s*SSP_IS_PLAYLIST_WINDOW\s*\)\s*\{[^}]*return/.test(fnBody)) return true;
+function swBraceDepth(src, from, to) {
+  let depth = 0;
+  for (let i = from; i < to; i++) {
+    const ch = src[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') depth--;
+  }
+  return depth;
+}
+
+/** Matching `}` for a `{` at openIdx. */
+function swMatchBrace(src, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * True when the write at writeRel (offset inside fnText) is covered by a real
+ * sspIsMainWindow guard that comes before it: an early
+ * `if (!sspIsMainWindow()) return …;` at function-body depth, or the write
+ * lying inside an `if (sspIsMainWindow()) { … }` / `if (… && sspIsMainWindow())`
+ * block that actually spans the write (an empty `if (sspIsMainWindow()) {}`
+ * does not count).
+ */
+function swGuardCoversWrite(fnText, writeRel) {
+  const bodyOpen = fnText.indexOf('{');
+  if (bodyOpen < 0) return false;
+  const before = fnText.slice(0, writeRel);
+
+  // Early return at function-body depth (depth === 1 relative to function start).
+  const earlyRe = /if\s*\(\s*!\s*sspIsMainWindow\s*\(\s*\)\s*\)\s*return\b[^;]*;|if\s*\(\s*!\s*\(\s*typeof\s+sspIsMainWindow\s*===\s*['"]function['"]\s*\?\s*sspIsMainWindow\s*\(\s*\)\s*:\s*[A-Za-z_$][\w$]*\s*\)\s*\)\s*return\b[^;]*;/g;
+  let m;
+  while ((m = earlyRe.exec(before)) !== null) {
+    if (swBraceDepth(fnText, bodyOpen, m.index) === 1) return true;
+  }
+
+  // if (sspIsMainWindow()) { …write… }  or  if (clearLS && sspIsMainWindow()) { … }
+  const ifBlockRe = /if\s*\(\s*(?:[^)]*&&\s*)?sspIsMainWindow\s*\(\s*\)\s*(?:&&\s*[^)]*)?\)\s*\{/g;
+  while ((m = ifBlockRe.exec(fnText)) !== null) {
+    const open = fnText.indexOf('{', m.index);
+    const close = swMatchBrace(fnText, open);
+    if (close < 0) continue;
+    if (writeRel > open && writeRel < close) return true;
+  }
+
+  // Single-statement form: if (sspIsMainWindow()) <stmt>;  / if (clearLS && sspIsMainWindow()) <stmt>;
+  // (?!\s*\{) so `if (sspIsMainWindow()) {}` is not treated as a one-liner (\\s* backtracking would otherwise pass).
+  const ifStmtRe = /if\s*\(\s*(?:[^)]*&&\s*)?sspIsMainWindow\s*\(\s*\)\s*(?:&&\s*[^)]*)?\)(?!\s*\{)/g;
+  while ((m = ifStmtRe.exec(fnText)) !== null) {
+    const stmtStart = m.index + m[0].length;
+    // Statement ends at the next semicolon at the same brace depth as stmtStart.
+    const baseDepth = swBraceDepth(fnText, bodyOpen, stmtStart);
+    let i = stmtStart;
+    while (i < fnText.length) {
+      if (fnText[i] === '{') {
+        const end = swMatchBrace(fnText, i);
+        if (end < 0) break;
+        i = end + 1;
+        continue;
+      }
+      if (fnText[i] === ';' && swBraceDepth(fnText, bodyOpen, i) === baseDepth) {
+        if (writeRel >= stmtStart && writeRel <= i) return true;
+        break;
+      }
+      i++;
+    }
+  }
   return false;
 }
 
-test('every localStorage setItem/removeItem in the page is guarded for the second window (source scan)', () => {
-  const html = swNoWriteHtml();
-  assert.match(html, /function sspIsMainWindow\(\) \{\s*return !SSP_IS_PLAYLIST_WINDOW;\s*\}/);
+/** Broad persisted-write finder (Pia's shapes). */
+const SW_WRITE_RE = new RegExp(
+  String.raw`\b(?:local|session)Storage\s*(?:\.\s*(?:setItem|removeItem|clear)\s*\(|\[[^\]]+\]\s*=|\.\w+\s*=)` +
+  String.raw`|indexedDB\s*\.\s*open\s*\(` +
+  String.raw`|\bsaveMetaIDB\s*\(` +
+  String.raw`|\.put\s*\(` +
+  String.raw`|(?:getFileHandle|getDirectoryHandle)\s*\([^;]{0,120}?create\s*:\s*true` +
+  String.raw`|\bcreateWritable\s*\(` +
+  String.raw`|navigator\s*\.\s*storage\s*\.\s*getDirectory\s*\(`,
+  'g'
+);
 
-  // Sites that may write without a page-level sspIsMainWindow call, with an explicit reason.
-  // Empty by default: every write must be guarded. Add an entry only when truly needed.
-  const allowlist = [
-    // none — saveItemLS, soundtrack, session, keymap, defaults, transition, video-skip,
-    // image-updates, autosave clear, and item-key removals all use sspIsMainWindow().
-  ];
-
-  const hits = [];
-  const re = /localStorage\.(setItem|removeItem)\s*\(/g;
+/** localStorage aliases (const ls = localStorage) used later as ls.setItem / ls['k']= / … */
+function swFindAliasWrites(src, fileLabel) {
+  const bad = [];
+  const aliasRe = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*localStorage\b/g;
   let m;
-  while ((m = re.exec(html)) !== null) {
-    const line = html.slice(0, m.index).split('\n').length;
-    const fnBody = swEnclosingFn(html, m.index);
-    const snippet = html.slice(Math.max(0, m.index - 80), Math.min(html.length, m.index + 60)).replace(/\s+/g, ' ');
-    const allowed = allowlist.find(a => a.test(fnBody) || a.test(snippet));
+  while ((m = aliasRe.exec(src)) !== null) {
+    const name = m[1];
+    const after = src.slice(m.index + m[0].length);
+    const useRe = new RegExp(
+      String.raw`\b` + name + String.raw`\s*(?:\.\s*(?:setItem|removeItem|clear)\s*\(|\[[^\]]+\]\s*=|\.\w+\s*=)`
+    );
+    if (useRe.test(after)) {
+      const line = src.slice(0, m.index).split('\n').length;
+      bad.push({
+        file: fileLabel,
+        line,
+        kind: 'alias:' + name,
+        ok: false,
+        snippet: (m[0] + ' … ' + (after.match(useRe) || [''])[0]).replace(/\s+/g, ' ').slice(0, 120),
+      });
+    }
+  }
+  return bad;
+}
+
+/**
+ * Scan one source for unguarded persisted writes.
+ * allowlist: [{ re, reason }] — skip a hit when re matches the enclosing fn or snippet.
+ */
+function swScanSource(src, fileLabel, allowlist) {
+  const hits = [];
+  let m;
+  SW_WRITE_RE.lastIndex = 0;
+  while ((m = SW_WRITE_RE.exec(src)) !== null) {
+    // `async function saveMetaIDB(` is a declaration, not a write call.
+    if (/^saveMetaIDB\s*\(/.test(m[0])) {
+      const pre = src.slice(Math.max(0, m.index - 24), m.index);
+      if (/(?:async\s+)?function\s*$/.test(pre)) continue;
+    }
+    const line = src.slice(0, m.index).split('\n').length;
+    const enc = swEnclosingFn(src, m.index);
+    const writeRel = m.index - enc.start;
+    const snippet = src.slice(Math.max(0, m.index - 60), Math.min(src.length, m.index + 80)).replace(/\s+/g, ' ');
+    const allowed = (allowlist || []).find(a => a.re.test(enc.text) || a.re.test(snippet));
     if (allowed) {
-      hits.push({ line, method: m[1], ok: true, reason: allowed.reason });
+      hits.push({ file: fileLabel, line, kind: m[0].slice(0, 40), ok: true, reason: allowed.reason });
       continue;
     }
-    const ok = swWriteIsGuarded(fnBody);
-    hits.push({ line, method: m[1], ok, snippet });
+    const ok = swGuardCoversWrite(enc.text, writeRel);
+    hits.push({ file: fileLabel, line, kind: m[0].slice(0, 40), ok, snippet });
   }
-  assert.ok(hits.length >= 10, 'expected to find the known write sites, got ' + hits.length);
+  for (const a of swFindAliasWrites(src, fileLabel)) hits.push(a);
+  return hits;
+}
+
+function swScanAll(html, core) {
+  // openHandleDB's indexedDB.open is shared read/write plumbing; write paths are
+  // saveMetaIDB / saveHandleIDB, which carry their own sspIsMainWindow guards.
+  const htmlAllow = [
+    {
+      re: /function openHandleDB\s*\(/,
+      reason: 'indexedDB.open shared plumbing; writes go through guarded saveMetaIDB/saveHandleIDB',
+    },
+  ];
+  // Core helpers take a storage arg; only allow SlideXCore.*(localStorage…) call sites,
+  // and those callers are scanned in the HTML (forgetEmptiedSession / saveSessionBeforeExit).
+  const coreAllow = [
+    {
+      re: /function forgetEmptiedSession\s*\(\s*storage/,
+      reason: 'storage arg; HTML caller forgetEmptiedSession() is sspIsMainWindow-guarded',
+    },
+    {
+      re: /function saveBeforeExitThenAck\s*\(\s*storage/,
+      reason: 'storage arg; HTML caller saveSessionBeforeExit() is sspIsMainWindow-guarded',
+    },
+  ];
+  // Confirm the allow-listed core helpers are only reached via guarded HTML callers.
+  assert.match(html, /if\s*\(\s*!sspIsMainWindow\s*\(\s*\)\s*\)\s*return;[\s\S]{0,400}SlideXCore\.forgetEmptiedSession\(\s*localStorage/);
+  assert.match(html, /if\s*\(\s*!sspIsMainWindow\s*\(\s*\)\s*\)\s*return;[\s\S]{0,800}SlideXCore\.saveBeforeExitThenAck\(\s*localStorage/);
+
+  return swScanSource(html, 'SlideShowPro.html', htmlAllow)
+    .concat(swScanSource(core, 'slidex-core.js', coreAllow));
+}
+
+test('source scan: every persisted write in the page and core is covered by sspIsMainWindow before the write', () => {
+  const html = swNoWriteHtml();
+  const core = swNoWriteCore();
+  assert.match(
+    html,
+    /function sspIsMainWindow\(\) \{\s*try \{ refreshWindowRoleFromTauri\(\); \} catch \(_\) \{\}\s*return !SSP_IS_PLAYLIST_WINDOW;\s*\}/
+  );
+  assert.match(html, /async function saveMetaIDB\([^)]*\) \{\s*if \(!sspIsMainWindow\(\)\) return;/);
+  assert.match(html, /async function saveScreenshotFile\([^)]*\) \{\s*if \(!sspIsMainWindow\(\)\) return false;/);
+
+  const hits = swScanAll(html, core);
+  assert.ok(hits.length >= 12, 'expected to find the known write sites, got ' + hits.length);
   const bad = hits.filter(h => !h.ok);
   assert.equal(
     bad.length,
     0,
-    'unguarded localStorage writes reachable without sspIsMainWindow:\n' +
-      bad.map(h => `  L${h.line} ${h.method}: ${h.snippet}`).join('\n')
+    'unguarded persisted writes:\n' +
+      bad.map(h => `  ${h.file}:${h.line} ${h.kind}: ${h.snippet || h.reason || ''}`).join('\n')
   );
+});
+
+test('source scan fails on each unguarded write shape Pia listed (and on an empty sspIsMainWindow block)', () => {
+  const html0 = swNoWriteHtml();
+  const core = swNoWriteCore();
+  const marker = 'function swChildKey(e) {';
+  const at = html0.indexOf(marker);
+  assert.ok(at !== -1);
+  const brace = html0.indexOf('{', at);
+  const injections = [
+    { name: "localStorage['k']=", code: "\n  localStorage['k'] = 'v';\n" },
+    { name: 'sessionStorage.setItem', code: "\n  sessionStorage.setItem('k', 'v');\n" },
+    { name: 'localStorage.clear', code: '\n  localStorage.clear();\n' },
+    { name: 'saveMetaIDB()', code: "\n  saveMetaIDB('k', 1);\n" },
+    { name: 'aliased ls.setItem', code: "\n  const ls = localStorage; ls.setItem('k', 'v');\n" },
+    { name: 'empty if (sspIsMainWindow()) {} then write', code: "\n  if (sspIsMainWindow()) {}\n  localStorage.setItem('k', 'v');\n" },
+  ];
+  for (const inj of injections) {
+    const html = html0.slice(0, brace + 1) + inj.code + html0.slice(brace + 1);
+    const bad = swScanAll(html, core).filter(h => !h.ok);
+    assert.ok(
+      bad.length >= 1,
+      `expected scan to fail for ${inj.name}, but it stayed green`
+    );
+  }
 });
 
 test('main writes saved settings; the second window does not (KEYMAP, default dur, transition, video skip, image updates, autosave, item keys)', () => {
   const html = swNoWriteHtml();
-  const isMainSrc = swSlice(html, 'function sspIsMainWindow()', '\n') + '\n';
+  const isMainSrc = swIsMainSrc(html);
 
   const run = (isChild, src, invoke) => {
     const writes = [];
     const sb = {
       SSP_IS_PLAYLIST_WINDOW: isChild,
-      sspIsMainWindow() { return !sb.SSP_IS_PLAYLIST_WINDOW; },
+      refreshWindowRoleFromTauri() {},
       videoSkipSec: 5,
       clampVideoSkipSec: (s) => Number(s) || 5,
       VIDEO_SKIP_LS: 'ssp_video_skip_sec',
@@ -2845,8 +3027,8 @@ test('main writes saved settings; the second window does not (KEYMAP, default du
       window: { __sspCastActive: false },
       SlideXCore: null,
     };
-    // Bind window for forgetEmptiedSession
     sb.window = sb;
+    // Use the real sspIsMainWindow from the page (refreshes role first).
     vm.runInNewContext(isMainSrc + src + '\n' + invoke, sb);
     return writes;
   };
@@ -2897,7 +3079,6 @@ test('main writes saved settings; the second window does not (KEYMAP, default du
   {
     const src = swSlice(html, "g('dsel').onchange = () => {", '\n(function initDefaultImageDuration');
     assert.match(src, /sspIsMainWindow\(\)/);
-    // Extract only the assignment body as a callable
     const body = src.replace(/^g\('dsel'\)\.onchange = /, 'const __dsel = ').replace(/;\s*$/, '');
     assert.deepEqual(
       run(false, body + '\n', '__dsel();').filter(w => w[1] === 'ssp_default_dur'),
@@ -2953,19 +3134,24 @@ test('main writes saved settings; the second window does not (KEYMAP, default du
     assert.deepEqual(run(true, harness, 'removePlaylistFiles(["a.jpg"], true, false);'), []);
   }
 
-  // saveItemLS (same call-time guard idea as #57)
+  // saveItemLS
   {
     const src = swSlice(html, 'function saveItemLS(item) {', '\nfunction applyImageUpdates');
     assert.match(src, /^function saveItemLS\(item\) \{\n\s*\/\/[^\n]*\n\s*if \(!sspIsMainWindow\(\)\) return;/);
     assert.deepEqual(run(false, src, 'saveItemLS({ id: "x", customDur: 1 });'), [['set', 'ssp|x']]);
     assert.deepEqual(run(true, src, 'saveItemLS({ id: "x", customDur: 1 });'), []);
   }
+
+  // saveMetaIDB / saveScreenshotFile guards
+  {
+    assert.match(html, /async function saveMetaIDB\([^)]*\) \{\n\s*if \(!sspIsMainWindow\(\)\) return;/);
+    assert.match(html, /async function saveScreenshotFile\([^)]*\) \{\n\s*if \(!sspIsMainWindow\(\)\) return false;/);
+  }
 });
 
 test('removing the sspIsMainWindow guard from a saved-settings write makes the behaviour test fail', () => {
-  // Mutation check: strip the guard from saveKeyMap and confirm the child would write.
   const html = swNoWriteHtml();
-  const isMainSrc = swSlice(html, 'function sspIsMainWindow()', '\n') + '\n';
+  const isMainSrc = swIsMainSrc(html);
   let src = swSlice(html, 'function saveKeyMap() {', '\nloadKeyMap();');
   src = src.replace(/\n\s*\/\/[^\n]*\n\s*if \(sspIsMainWindow\(\)\) \{\n\s*try \{ localStorage\.setItem\(KEYMAP_LS, JSON\.stringify\(keyMap\)\); \} catch \(_\) \{\}\n\s*\}/,
     '\n  try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}');
@@ -2973,7 +3159,7 @@ test('removing the sspIsMainWindow guard from a saved-settings write makes the b
   const writes = [];
   const sb = {
     SSP_IS_PLAYLIST_WINDOW: true,
-    sspIsMainWindow() { return !sb.SSP_IS_PLAYLIST_WINDOW; },
+    refreshWindowRoleFromTauri() {},
     keyMap: { next: 'ArrowRight' },
     KEYMAP_LS: 'ssp_keymap',
     refreshMoreToolsTooltip() {},
