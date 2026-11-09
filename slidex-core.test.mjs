@@ -2386,3 +2386,113 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
 });
+
+function pageKeyDefaults() {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const start = html.indexOf('const FNS = [');
+  const end = html.indexOf('];', start);
+  assert.ok(start !== -1 && end > start, 'FNS table found');
+  return { html, fns: vm.runInNewContext('(' + html.slice(start + 'const FNS = '.length, end + 1) + ')') };
+}
+
+test('no two default shortcuts share a key, and k / q are the new defaults', () => {
+  const { fns } = pageKeyDefaults();
+  assert.deepEqual(Array.from(C.duplicateDefaultKeys(fns)), [], 'every default (and co-default) key is unique');
+  const ids = Array.from(fns, f => f.id);
+  assert.equal(new Set(ids).size, ids.length, 'command ids are unique');
+  const byId = Object.fromEntries(Array.from(fns, f => [f.id, f.def]));
+  assert.equal(byId.kenBurns, 'k');
+  assert.equal(byId.colour, 'q');
+  assert.equal(byId.hidectl, 'c', 'c stays Hide controls');
+  assert.equal(byId.mirrorH, 'h', 'h stays Mirror H');
+  // The guard itself catches a shared primary and a primary that equals another co-default.
+  assert.deepEqual(Array.from(C.duplicateDefaultKeys([{ id: 'a', def: 'q' }, { id: 'b', def: 'q' }])), ['q']);
+  assert.deepEqual(Array.from(C.duplicateDefaultKeys([{ id: 'a', def: 'x', coDefs: [','] }, { id: 'b', def: ',' }])), [',']);
+  assert.deepEqual(Array.from(C.duplicateDefaultKeys([{ id: 'a', def: 'r' }, { id: 'b', def: 'R' }])), [], 'r and R are different keys');
+});
+
+test('k and q are free before this change: no default, overlay rule or other key handler uses them', () => {
+  const { html, fns } = pageKeyDefaults();
+  const others = fns.filter(f => f.id !== 'kenBurns' && f.id !== 'colour');
+  for (const k of ['k', 'q', 'K', 'Q']) {
+    assert.ok(!others.some(f => f.def === k || (f.coDefs || []).includes(k)), k + ' is not another default');
+  }
+  // No handler outside the keymap tests these keys directly.
+  assert.doesNotMatch(html, /e2?\.key\s*===?\s*['"][kqKQ]['"]/);
+  assert.doesNotMatch(html, /\.code\s*===?\s*['"]Key[KQ]['"]/);
+  const core = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+  const resolve = core.slice(core.indexOf('function resolveKeyMapReport'), core.indexOf('function sessionItemCount'));
+  assert.doesNotMatch(resolve, /['"][kqKQ]['"]/, 'the overlay logic has no hard-coded letters');
+  // With nothing saved, both resolve to their defaults.
+  const map = C.resolveKeyMap(fns, null);
+  assert.equal(map.kenBurns, 'k');
+  assert.equal(map.colour, 'q');
+});
+
+test('a saved key that collides with a new default keeps the user\'s command and leaves the new one unbound', () => {
+  const { fns } = pageKeyDefaults();
+  const oldDefaults = Object.fromEntries(fns.filter(f => f.id !== 'kenBurns' && f.id !== 'colour').map(f => [f.id, f.def]));
+  // A full map saved before 0.2.0, where the user moved Themes to q and Mirror V to k.
+  const saved = { ...oldDefaults, theme: 'q', mirrorV: 'k' };
+  const report = C.resolveKeyMapReport(fns, saved);
+  assert.equal(report.map.theme, 'q', 'the user keeps q');
+  assert.equal(report.map.mirrorV, 'k', 'the user keeps k');
+  assert.equal(report.map.colour, '', 'Colour is left unbound');
+  assert.equal(report.map.kenBurns, '', 'Ken Burns is left unbound');
+  assert.deepEqual(Array.from(report.unbound, u => [u.id, u.key, u.keptBy]).sort(), [['colour', 'q', 'theme'], ['kenBurns', 'k', 'mirrorV']]);
+  // No key ends up on two commands, so the first match in the list can never win silently.
+  const bound = Object.values(report.map).filter(Boolean);
+  assert.equal(new Set(bound).size, bound.length);
+  // Only the clashing one is unbound; the other new default still gets its key.
+  const one = C.resolveKeyMapReport(fns, { ...oldDefaults, theme: 'q' });
+  assert.equal(one.map.colour, '');
+  assert.equal(one.map.kenBurns, 'k');
+  assert.equal(one.unbound.length, 1);
+  // An old map with no clash gets both new keys and reports nothing.
+  const clean = C.resolveKeyMapReport(fns, oldDefaults);
+  assert.equal(clean.map.colour, 'q');
+  assert.equal(clean.map.kenBurns, 'k');
+  assert.equal(clean.unbound.length, 0);
+  // Keys the user set for the new commands themselves are kept, including an explicit ''.
+  assert.equal(C.resolveKeyMap(fns, { ...oldDefaults, colour: 'z', kenBurns: '' }).colour, 'z');
+  assert.equal(C.resolveKeyMap(fns, { ...oldDefaults, colour: 'z', kenBurns: '' }).kenBurns, '');
+  // The page uses the report, saves the result once and tells the user.
+  const { html } = pageKeyDefaults();
+  const load = html.slice(html.indexOf('function loadKeyMap()'), html.indexOf('function saveKeyMap()'));
+  assert.match(load, /SlideXCore\.resolveKeyMapReport\(FNS, saved\)/);
+  assert.match(load, /report\.unbound\.length\) saveKeyMap\(\)/);
+  assert.match(load, /has no key: you use /);
+});
+
+test('k opens Ken Burns, q opens Colour, and the Tools panel and buttons show their keys after a remap', () => {
+  const { html } = pageKeyDefaults();
+  const run = html.slice(html.indexOf('function runMappedKey(e)'), html.indexOf('document.addEventListener(\'keydown\', e => {', html.indexOf('function runMappedKey(e)')));
+  assert.match(run, /case 'kenBurns': e\.preventDefault\(\); toggleKBModal\(\); break;/);
+  assert.match(run, /case 'colour': e\.preventDefault\(\); g\('bcol'\)\.click\(\); break;/);
+  const start = html.indexOf('<div id="ctrls-overflow"');
+  const panel = html.slice(start, html.indexOf('<!-- Unified Media Dock -->', start));
+  assert.match(panel, /id="bcol"[\s\S]*?<span class="tlbl">Colour…<\/span><span class="kbd" data-cmd="colour"><\/span>/);
+  assert.match(panel, /id="toolKb"[\s\S]*?<span class="tlbl">Ken Burns…<\/span><span class="kbd" data-cmd="kenBurns"><\/span>/);
+  assert.match(html, /g\('toolKb'\)\.onclick = toggleKBModal/);
+  // refreshMoreToolsTooltip runs on load and on every save; run it with a remapped keyMap.
+  const src = html.slice(html.indexOf('function refreshMoreToolsTooltip()'), html.indexOf('function loadKeyMap()'));
+  const els = {};
+  const el = (id) => (els[id] = els[id] || { id, title: '', textContent: '' });
+  const kbds = ['colour', 'kenBurns', 'mirrorH'].map(cmd => ({ dataset: { cmd }, textContent: '' }));
+  const sandbox = {
+    keyMap: { moreTools: 'd', colour: 'w', kenBurns: '', mirrorH: 'h' },
+    g: el,
+    keyLabel: (k) => (k === '' || k == null ? 'None' : k),
+    document: { querySelectorAll: () => kbds },
+  };
+  vm.runInNewContext(src + '\nrefreshMoreToolsTooltip();', sandbox);
+  assert.equal(kbds[0].textContent, 'w', 'Colour row follows the remap');
+  assert.equal(kbds[1].textContent, '', 'unbound Ken Burns shows no key');
+  assert.equal(el('bcol').title, 'Color controls (w)');
+  assert.equal(el('bkb').title, 'Ken Burns settings');
+  sandbox.keyMap.kenBurns = 'k';
+  vm.runInNewContext('refreshMoreToolsTooltip();', sandbox);
+  assert.equal(el('bkb').title, 'Ken Burns settings (k)');
+  assert.equal(el('toolKb').title, 'Ken Burns settings (k)');
+  assert.equal(kbds[1].textContent, 'k');
+});
