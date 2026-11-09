@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 
-const context = { console, Uint8Array, Date, Object, Math, String, Number, Array };
+const context = { console, Uint8Array, Float32Array, Float64Array, Date, Object, Math, String, Number, Array };
 context.globalThis = context;
 vm.runInNewContext(fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8'), context);
 const C = context.SlideXCore;
@@ -2359,4 +2359,96 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
+
+test('removing a song above the playing one keeps it playing', () => {
+  assert.equal(C.loadedIndexAfterRemove(0, 2), 1);
+  assert.equal(C.loadedIndexAfterRemove(2, 2), -1);
+  assert.equal(C.loadedIndexAfterRemove(3, 2), 2);
+  assert.equal(C.loadedIndexAfterRemove(0, -1), -1);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const rm = html.slice(html.indexOf('function removeAt(i)'), html.indexOf('function addEntries('));
+  assert.match(rm, /loadedIdx = C\.loadedIndexAfterRemove\(i, loadedIdx\)/);
+  assert.doesNotMatch(rm, /i < loadedIdx\) \{ audio\.pause/);
+});
+
+function clickTrack(bpm, offset, secs, { sr = 22050, noise = 0.05, accentBeat = 0 } = {}) {
+  const x = new Float32Array(Math.round(secs * sr));
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5);
+  for (let i = 0; i < x.length; i++) x[i] = noise * rnd();
+  const p = 60 / bpm;
+  for (let k = 0; offset + k * p < secs; k++) {
+    const a = k % 4 === accentBeat ? 1 : 0.55;
+    const s0 = Math.round((offset + k * p) * sr);
+    for (let j = 0; j < 400 && s0 + j < x.length; j++) x[s0 + j] += a * Math.exp(-j / 80) * Math.sin(j * 0.3);
+  }
+  return x;
+}
+
+test('beat analysis finds tempo, first beat and downbeat of a click track', () => {
+  for (const [bpm, off] of [[120, 0.25], [90, 0.1], [128, 0.4], [174, 0.05]]) {
+    const r = C.analyzeBeats(clickTrack(bpm, off, 40), 22050);
+    assert.equal(r.ok, true, `${bpm}`);
+    assert.ok(Math.abs(r.grid.bpm - bpm) < 0.5, `${bpm} got ${r.grid.bpm}`);
+    assert.ok(Math.abs(r.grid.offset - off) < 0.03, `${bpm} offset ${r.grid.offset}`);
+    assert.equal(r.grid.beatsPerBar, 4);
+  }
+  const shifted = C.analyzeBeats(clickTrack(120, 0.25, 40, { accentBeat: 2 }), 22050);
+  assert.equal(shifted.grid.barPhase, 2);
+});
+
+test('beat analysis gives up cleanly on noise, silence and short clips', () => {
+  let seed = 7;
+  const noise = new Float32Array(30 * 22050).map(() => ((seed = (seed * 16807) % 2147483647) / 2147483647 - 0.5));
+  assert.equal(C.analyzeBeats(noise, 22050).reason, 'tempo-unclear');
+  assert.equal(C.analyzeBeats(new Float32Array(30 * 22050), 22050).ok, false);
+  assert.equal(C.analyzeBeats(clickTrack(120, 0, 5), 22050).reason, 'too-short');
+  assert.equal(C.analyzeBeats(null, 22050).reason, 'no-audio');
+  const mono = C.mixToMono([Float32Array.from([1, 0]), Float32Array.from([0, 1])]);
+  assert.deepEqual([...mono], [0.5, 0.5]);
+});
+
+test('beat grid lists and snaps to beats and bars', () => {
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0.25, beatsPerBar: 4, barPhase: 1, duration: 60 });
+  assert.equal(grid.period, 0.5);
+  assert.deepEqual([...C.gridTimes(grid, 0, 1.5, 'beat')], [0.25, 0.75, 1.25]);
+  assert.deepEqual([...C.gridTimes(grid, 0, 5, 'bar')], [0.75, 2.75, 4.75]);
+  assert.equal(C.snapToGrid(grid, 1.1, 'beat'), 1.25);
+  assert.equal(C.snapToGrid(grid, 3.9, 'bar'), 4.75);
+  assert.equal(C.snapToGrid(grid, 3.7, 'bar'), 2.75);
+  assert.equal(C.buildBeatGrid({ bpm: 0 }), null);
+  assert.equal(C.buildBeatGrid({ bpm: 120, offset: 1.3 }).offset.toFixed(2), '0.30');
+});
+
+test('beat sync keeps slide times near the setting and falls back off the grid', () => {
+  const grid = C.buildBeatGrid({ bpm: 120, offset: 0.25, beatsPerBar: 4, barPhase: 0, duration: 60 });
+  // 5 s slide from 10.1 s: target 15.1 → nearest beat 15.25.
+  assert.equal(C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 5000, unit: 'beat' }), 5150);
+  // nearest bar to 15.1 is 14.25 (bars at 0.25 + 2k).
+  assert.equal(C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 5000, unit: 'bar' }), 4150);
+  // Never under half the setting: 600 ms slide can't snap to a beat 50 ms away.
+  const short = C.beatSyncDelayMs({ grid, now: 0.2, targetMs: 600, unit: 'beat' });
+  assert.ok(short >= 300 && short <= 1100, `${short}`);
+  // Bars far longer than a short slide fall back to beats.
+  assert.equal(C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 1000, unit: 'bar' }),
+    C.beatSyncDelayMs({ grid, now: 10.1, targetMs: 1000, unit: 'beat' }));
+  // Past the end of the song, or no grid: the user's time unchanged.
+  assert.equal(C.beatSyncDelayMs({ grid, now: 58, targetMs: 5000, unit: 'beat' }), 5000);
+  assert.equal(C.beatSyncDelayMs({ grid: null, now: 10, targetMs: 5000, unit: 'beat' }), 5000);
+  assert.equal(C.beatSyncDelayMs({ grid, now: NaN, targetMs: 5000, unit: 'beat' }), 5000);
+  assert.equal(C.nextBeatSyncMode('off'), 'beat');
+  assert.equal(C.nextBeatSyncMode('beat'), 'bar');
+  assert.equal(C.nextBeatSyncMode('bar'), 'off');
+});
+
+test('beat sync is wired into the slide timer, off by default, PC only', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const sched = html.slice(html.indexOf('function schedNext()'), html.indexOf('function goTo('));
+  assert.match(sched, /ms = window\.sspBeatSnapMs\(ms\)/);
+  assert.match(html, /var beatMode = 'off';/);
+  assert.match(html, /id="musicBeat"/);
+  const snap = html.slice(html.indexOf('window.sspBeatSnapMs = function'), html.indexOf('function maybeAnalyze'));
+  assert.match(snap, /beatMode === 'off' \|\| audio\.paused \|\| window\.__sspCastActive\) return ms/);
+  assert.match(html, /new Offline\(1, 1, 22050\)/);
 });

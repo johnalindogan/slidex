@@ -840,6 +840,9 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 #musicEmpty{font-size:12px;color:rgba(255,255,255,.6);padding:8px 2px;}
 #musicEmpty b{color:#fff;display:block;margin-bottom:2px;}
 #musicVol{flex:1;accent-color:#fff;}
+#musicBpm{font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap;}
+#musicBpm.live{border-color:rgba(159,208,255,.6);color:#cfe7ff;}
+#musicBpm.warn{border-color:rgba(232,179,90,.6);color:#f3d29b;}
 #fimusic{display:none;}
 #castPanel{display:none;position:fixed;right:16px;bottom:16px;z-index:9999;width:320px;max-width:calc(100vw - 32px);background:#1a2230;border:1px solid rgba(90,180,255,.35);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.45);padding:14px 14px 12px;color:#e8eef7;font:13px/1.4 system-ui,sans-serif;}
 #castPanel.open{display:block;}
@@ -5917,7 +5920,8 @@ function waitForVideoFrame(video) {
 
 function schedNext() {
   clearTimeout(tmr); if (!playing || isV(cur)) return;
-  const ms = getEDur(cur);
+  let ms = getEDur(cur);
+  if (typeof window.sspBeatSnapMs === 'function') ms = window.sspBeatSnapMs(ms);
   tmr = setTimeout(() => {
     if (window.__sspCastActive && window.SlideXCore && typeof window.SlideXCore.nextIndexSkippingUnsupported === "function") {
       var skipTo = window.SlideXCore.nextIndexSkippingUnsupported(cur, getMediaItems(), {
@@ -8233,12 +8237,13 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="musicClear" title="Remove all songs">Clear</button>
     <button type="button" id="musicClose" title="Close (Esc)" aria-label="Close">&#x2715;</button>
   </div>
-  <div id="musicNow" aria-live="polite"></div>
+  <div class="mrow"><div id="musicNow" aria-live="polite"></div><span class="msp"></span><span id="musicBpm" hidden></span></div>
   <div class="mrow">
     <button type="button" id="musicPrev" title="Previous song" aria-label="Previous song">&#x2039;</button>
     <button type="button" id="musicPlay" title="Music on or off. Music plays while the slideshow plays.">Music on</button>
     <button type="button" id="musicNext" title="Next song" aria-label="Next song">&#x203A;</button>
     <button type="button" id="musicRepeat" title="Repeat">Repeat all</button>
+    <button type="button" id="musicBeat" title="Change slides on the music's beat. Slide times stay close to your setting.">Beat sync off</button>
     <input type="range" id="musicVol" min="0" max="1" step="0.05" value="0.8" title="Music volume" aria-label="Music volume">
   </div>
   <div id="musicList" role="listbox" aria-label="Music playlist"></div>
@@ -8266,6 +8271,11 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   var loadedIdx = -1;
   var bad = Object.create(null);
   var lastNowText = '';
+  var BEAT_KEY = 'sspBeatSyncV1';
+  var beatMode = 'off';
+  try { var bm = localStorage.getItem(BEAT_KEY); if (C.BEAT_SYNC_MODES.indexOf(bm) >= 0) beatMode = bm; } catch (_) {}
+  var beats = Object.create(null); // track path -> { state: 'analyzing'|'ok'|'unclear'|'failed', grid }
+  var BEAT_MAX_SECONDS = 12 * 60;
 
   function el(id) { return document.getElementById(id); }
   function save() {
@@ -8299,6 +8309,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     });
   }
   function sync() {
+    maybeAnalyze();
     audio.volume = q.volume;
     if (shouldPlay()) {
       if (loadedIdx !== q.index && !loadTrack(q.index)) { render(); return; }
@@ -8315,6 +8326,61 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     render();
   }
   window.sspSoundtrackSync = sync;
+
+  /* Beat sync (off by default). Analysis runs once per song per session, in this webview:
+     decode at 22.05 kHz, mix to mono, then SlideXCore.analyzeBeats. Any failure leaves
+     slides on their normal timer. */
+  function analyzeTrack(t) {
+    if (!t || beats[t.path]) return;
+    var src = srcFor(t);
+    var Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!src || !Offline || typeof fetch !== 'function') { beats[t.path] = { state: 'failed' }; render(); return; }
+    beats[t.path] = { state: 'analyzing' };
+    render();
+    var path = t.path;
+    fetch(src).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.arrayBuffer();
+    }).then(function (buf) {
+      var ctx = new Offline(1, 1, 22050);
+      return new Promise(function (resolve, reject) {
+        var p = ctx.decodeAudioData(buf, resolve, reject);
+        if (p && typeof p.then === 'function') p.then(resolve, reject);
+      });
+    }).then(function (ab) {
+      if (ab.duration > BEAT_MAX_SECONDS) return { ok: false, reason: 'too-long' };
+      var chans = [];
+      for (var c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
+      return new Promise(function (resolve) {
+        setTimeout(function () { resolve(C.analyzeBeats(C.mixToMono(chans), ab.sampleRate)); }, 0);
+      });
+    }).then(function (res) {
+      if (!beats[path]) return; // removed meanwhile
+      beats[path] = res.ok ? { state: 'ok', grid: res.grid } : { state: 'unclear', reason: res.reason };
+      render();
+    }).catch(function (e) {
+      console.warn('[music] beat analysis failed', e);
+      if (beats[path]) beats[path] = { state: 'failed' };
+      render();
+    });
+  }
+  function currentGrid() {
+    var t = q.tracks[loadedIdx];
+    var b = t && beats[t.path];
+    return b && b.state === 'ok' ? b.grid : null;
+  }
+  /** schedNext() asks for the slide delay. Beat sync covers this PC only; while casting the TV keeps fixed timing. */
+  window.sspBeatSnapMs = function (ms) {
+    if (beatMode === 'off' || audio.paused || window.__sspCastActive) return ms;
+    var grid = currentGrid();
+    if (!grid) return ms;
+    return C.beatSyncDelayMs({ grid: grid, now: audio.currentTime, targetMs: ms, unit: beatMode });
+  };
+  function maybeAnalyze() {
+    if (beatMode === 'off') return;
+    var t = q.tracks[q.index];
+    if (t && !beats[t.path]) analyzeTrack(t);
+  }
 
   function setQueue(next) { q = next; save(); sync(); }
   function go(index, restart) {
@@ -8366,6 +8432,15 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     el('musicPlay').textContent = q.on ? 'Music on' : 'Music off';
     el('musicPlay').classList.toggle('on', q.on);
     el('musicRepeat').textContent = q.repeat === 'one' ? 'Repeat one' : (q.repeat === 'off' ? 'Repeat off' : 'Repeat all');
+    el('musicBeat').textContent = beatMode === 'bar' ? 'Beat sync: every bar' : (beatMode === 'beat' ? 'Beat sync: every beat' : 'Beat sync off');
+    el('musicBeat').classList.toggle('on', beatMode !== 'off');
+    var chip = el('musicBpm'), bt = t && beats[t.path];
+    chip.hidden = beatMode === 'off' || !bt;
+    chip.className = '';
+    if (bt && bt.state === 'ok') { chip.textContent = Math.round(bt.grid.bpm) + ' BPM'; chip.className = 'live'; chip.title = 'Slides change on the beat'; }
+    else if (bt && bt.state === 'analyzing') { chip.textContent = 'Analyzing\u2026'; chip.title = 'Finding the beat. Slides keep their normal timing until it is ready.'; }
+    else if (bt && bt.state === 'unclear') { chip.textContent = bt.reason === 'too-long' ? 'Too long to sync' : 'Tempo unclear'; chip.className = 'warn'; chip.title = 'The beat in this song isn\u2019t clear, so slides keep their normal timing.'; }
+    else if (bt) { chip.textContent = 'Can\u2019t sync'; chip.className = 'warn'; chip.title = 'Couldn\u2019t read this song for beat sync. Slides keep their normal timing.'; }
     el('musicVol').value = String(q.volume);
     el('musicEmpty').hidden = q.tracks.length > 0;
     el('musicClear').disabled = !q.tracks.length;
@@ -8401,7 +8476,10 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     if (!t) return;
     if (t.url) { try { URL.revokeObjectURL(t.url); } catch (_) {} }
     delete bad[t.path];
-    if (i === loadedIdx || i < loadedIdx) { audio.pause(); loadedIdx = -1; }
+    delete beats[t.path];
+    // Removing a song above the playing one only shifts its row; it keeps playing.
+    if (i === loadedIdx) audio.pause();
+    loadedIdx = C.loadedIndexAfterRemove(i, loadedIdx);
     var next = C.queueRemoveAt(q, i);
     if (!next.tracks.length) loadTrack(-1);
     setQueue(next);
@@ -8456,6 +8534,11 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   el('musicPlay').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { on: !q.on })); });
   el('musicPrev').onclick = blurAfter(function () { step(-1, false); });
   el('musicNext').onclick = blurAfter(function () { step(1, false); });
+  el('musicBeat').onclick = blurAfter(function () {
+    beatMode = C.nextBeatSyncMode(beatMode);
+    try { localStorage.setItem(BEAT_KEY, beatMode); } catch (_) {}
+    sync();
+  });
   el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });
   el('musicVol').oninput = function () {
     q = Object.assign({}, q, { volume: C.clampVolume(this.value) });

@@ -2081,7 +2081,219 @@
     return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
   }
 
+  /** Where the loaded song sits after removing row i: -1 if it was the one removed. */
+  function loadedIndexAfterRemove(i, loadedIdx) {
+    if (loadedIdx < 0 || i === loadedIdx) return -1;
+    return i < loadedIdx ? loadedIdx - 1 : loadedIdx;
+  }
+
+  /* ── 0.2.0 beat sync: offline tempo + beat grid from decoded PCM (in-house, no services).
+     Pure and generic so export (PR 3) and the 0.3.0 karaoke screen can reuse the grid. ── */
+  var BEAT_ANALYZER_VERSION = 1;
+  var BEAT_HOP = 256;
+  var BEAT_MIN_CONFIDENCE = 2.2;
+  var BEAT_SYNC_MODES = ['off', 'beat', 'bar'];
+
+  /** Onset strength per hop: log energy, positive difference, minus a ~0.5 s local mean. */
+  function onsetEnvelope(samples, sampleRate, hop) {
+    var h = hop || BEAT_HOP;
+    var n = Math.floor(samples.length / h);
+    var logE = new Float64Array(n);
+    for (var f = 0; f < n; f++) {
+      var s = 0, base = f * h;
+      for (var k = 0; k < h; k++) { var x = samples[base + k]; s += x * x; }
+      logE[f] = Math.log(1 + 1000 * (s / h));
+    }
+    var flux = new Float64Array(n);
+    for (var j = 1; j < n; j++) flux[j] = Math.max(0, logE[j] - logE[j - 1]);
+    var w = Math.max(1, Math.round((sampleRate / h) * 0.25));
+    var out = new Float64Array(n), acc = 0;
+    var pre = new Float64Array(n + 1);
+    for (var p = 0; p < n; p++) { acc += flux[p]; pre[p + 1] = acc; }
+    for (var q = 0; q < n; q++) {
+      var a = Math.max(0, q - w), b = Math.min(n, q + w + 1);
+      out[q] = Math.max(0, flux[q] - (pre[b] - pre[a]) / (b - a));
+    }
+    return out;
+  }
+
+  function envAt(env, pos) {
+    var i = Math.floor(pos);
+    if (i < 0 || i + 1 >= env.length) return i >= 0 && i < env.length ? env[i] : 0;
+    var fr = pos - i;
+    return env[i] * (1 - fr) + env[i + 1] * fr;
+  }
+
+  /** Comb score: mean onset strength at offset + k*period (frames). */
+  function combScore(env, period, offset) {
+    var s = 0, c = 0;
+    for (var t = offset; t < env.length - 1; t += period) { s += envAt(env, t); c++; }
+    return c ? s / c : 0;
+  }
+
+  /** Tempo from an onset envelope. Returns { bpm, period (frames), offset (frames), confidence }. */
+  function estimateTempo(env, frameRate, opts) {
+    var o = opts || {};
+    var minBpm = o.minBpm || 70, maxBpm = o.maxBpm || 180;
+    var minLag = Math.max(1, Math.floor(frameRate * 60 / maxBpm));
+    var maxLag = Math.ceil(frameRate * 60 / minBpm);
+    var n = env.length;
+    if (n < maxLag * 4) return { bpm: 0, period: 0, offset: 0, confidence: 0 };
+    var mean = 0;
+    for (var i = 0; i < n; i++) mean += env[i];
+    mean /= n;
+    var ac = [], best = -1, bestLag = 0;
+    for (var lag = minLag; lag <= maxLag; lag++) {
+      var s = 0;
+      for (var t = 0; t + lag < n; t++) s += (env[t] - mean) * (env[t + lag] - mean);
+      s /= (n - lag);
+      // Gentle prior toward ~120 BPM so half/double tempo loses ties.
+      var bpm = frameRate * 60 / lag;
+      var prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 1.0, 2));
+      ac[lag] = s * prior;
+      if (ac[lag] > best) { best = ac[lag]; bestLag = lag; }
+    }
+    if (!(best > 0)) return { bpm: 0, period: 0, offset: 0, confidence: 0 };
+    var p0 = bestLag;
+    if (bestLag > minLag && bestLag < maxLag) {
+      var y0 = ac[bestLag - 1], y1 = ac[bestLag], y2 = ac[bestLag + 1];
+      var d = y0 - 2 * y1 + y2;
+      if (d < 0) p0 = bestLag + 0.5 * (y0 - y2) / d;
+    }
+    // Refine period and phase together over the whole track so the grid doesn't drift.
+    var bestScore = -1, bestP = p0, bestOff = 0;
+    for (var pp = p0 * 0.97; pp <= p0 * 1.03; pp += p0 * 0.0005) {
+      for (var off = 0; off < pp; off += 0.5) {
+        var sc = combScore(env, pp, off);
+        if (sc > bestScore) { bestScore = sc; bestP = pp; bestOff = off; }
+      }
+    }
+    var sum = 0, cnt = 0;
+    for (var off2 = 0; off2 < bestP; off2 += 0.5) { sum += combScore(env, bestP, off2); cnt++; }
+    var avg = cnt ? sum / cnt : 0;
+    var confidence = avg > 0 ? bestScore / avg : 0;
+    return { bpm: frameRate * 60 / bestP, period: bestP, offset: bestOff, confidence: confidence };
+  }
+
+  /** Grid in seconds. Beat k is at offset + k * period; bars start at beat barPhase (mod beatsPerBar). */
+  function buildBeatGrid(g) {
+    var bpm = Number(g && g.bpm);
+    if (!(bpm > 0)) return null;
+    var period = 60 / bpm;
+    var offset = Number(g.offset) || 0;
+    offset = ((offset % period) + period) % period;
+    var bpb = Math.max(1, Math.round(Number(g.beatsPerBar) || 4));
+    return {
+      v: BEAT_ANALYZER_VERSION, bpm: bpm, period: period, offset: offset,
+      beatsPerBar: bpb, barPhase: ((Math.round(Number(g.barPhase) || 0) % bpb) + bpb) % bpb,
+      duration: Number(g.duration) > 0 ? Number(g.duration) : Infinity,
+      confidence: Number(g.confidence) || 0
+    };
+  }
+
+  /** Full analysis of mono PCM. Returns { ok: true, grid } or { ok: false, reason }. */
+  function analyzeBeats(samples, sampleRate, opts) {
+    var o = opts || {};
+    var hop = o.hop || BEAT_HOP;
+    if (!samples || !(sampleRate > 0)) return { ok: false, reason: 'no-audio' };
+    var duration = samples.length / sampleRate;
+    if (duration < 8) return { ok: false, reason: 'too-short' };
+    var env = onsetEnvelope(samples, sampleRate, hop);
+    var frameRate = sampleRate / hop;
+    var t = estimateTempo(env, frameRate, o);
+    if (!(t.bpm > 0) || t.confidence < (o.minConfidence || BEAT_MIN_CONFIDENCE)) {
+      return { ok: false, reason: 'tempo-unclear', bpm: t.bpm, confidence: t.confidence };
+    }
+    var bpb = o.beatsPerBar || 4, bestPhase = 0, bestSum = -1;
+    for (var ph = 0; ph < bpb; ph++) {
+      var s = 0;
+      for (var k = ph; t.offset + k * t.period < env.length - 1; k += bpb) s += envAt(env, t.offset + k * t.period);
+      if (s > bestSum) { bestSum = s; bestPhase = ph; }
+    }
+    return {
+      ok: true,
+      grid: buildBeatGrid({
+        bpm: t.bpm, offset: t.offset / frameRate, beatsPerBar: bpb, barPhase: bestPhase,
+        duration: duration, confidence: t.confidence
+      })
+    };
+  }
+
+  /** Grid times (s) of the given unit ('beat' | 'bar') in [from, to]. */
+  function gridTimes(grid, from, to, unit) {
+    if (!grid) return [];
+    var step = unit === 'bar' ? grid.period * grid.beatsPerBar : grid.period;
+    var first = grid.offset + (unit === 'bar' ? grid.barPhase * grid.period : 0);
+    var k = Math.ceil((from - first) / step - 1e-9);
+    var out = [];
+    for (var t = first + k * step; t <= to + 1e-9 && out.length < 100000; t += step) {
+      if (t >= 0) out.push(t);
+    }
+    return out;
+  }
+
+  /** Nearest grid time to t (unit 'beat' | 'bar'). */
+  function snapToGrid(grid, t, unit) {
+    if (!grid) return t;
+    var step = unit === 'bar' ? grid.period * grid.beatsPerBar : grid.period;
+    var first = grid.offset + (unit === 'bar' ? grid.barPhase * grid.period : 0);
+    var k = Math.round((t - first) / step);
+    var snapped = first + k * step;
+    if (snapped < 0) snapped += step;
+    return snapped;
+  }
+
+  /** Slide delay snapped to the music. now = song position (s), targetMs = the user's slide time.
+      Keeps the delay near targetMs: lands on the nearest beat/bar, never under half the
+      setting (or minMs). Bars longer than the slide fall back to beats. Off-grid → targetMs. */
+  function beatSyncDelayMs(o) {
+    var grid = o && o.grid, targetMs = Number(o && o.targetMs);
+    if (!(targetMs > 0)) return targetMs;
+    var now = Number(o.now);
+    if (!grid || !Number.isFinite(now) || now < 0) return targetMs;
+    var unit = o.unit === 'bar' ? 'bar' : 'beat';
+    if (unit === 'bar' && grid.period * grid.beatsPerBar * 1000 > targetMs * 1.5) unit = 'beat';
+    var step = (unit === 'bar' ? grid.period * grid.beatsPerBar : grid.period);
+    var minDelay = Math.max(Number(o.minMs) || 250, targetMs * (o.minFrac || 0.5)) / 1000;
+    var target = now + targetMs / 1000;
+    if (target > grid.duration) return targetMs;
+    var t = snapToGrid(grid, target, unit);
+    while (t - now < minDelay) t += step;
+    if (t > grid.duration) return targetMs;
+    return Math.round((t - now) * 1000);
+  }
+
+  function nextBeatSyncMode(mode) {
+    var i = BEAT_SYNC_MODES.indexOf(mode);
+    return BEAT_SYNC_MODES[(i + 1) % BEAT_SYNC_MODES.length];
+  }
+
+  /** Stereo → mono for analysis. channels: array of Float32Array. */
+  function mixToMono(channels) {
+    if (!channels || !channels.length) return new Float32Array(0);
+    if (channels.length === 1) return channels[0];
+    var n = channels[0].length, out = new Float32Array(n), c = channels.length;
+    for (var i = 0; i < n; i++) {
+      var s = 0;
+      for (var j = 0; j < c; j++) s += channels[j][i];
+      out[i] = s / c;
+    }
+    return out;
+  }
+
   root.SlideXCore = {
+    loadedIndexAfterRemove: loadedIndexAfterRemove,
+    BEAT_ANALYZER_VERSION: BEAT_ANALYZER_VERSION,
+    BEAT_SYNC_MODES: BEAT_SYNC_MODES,
+    onsetEnvelope: onsetEnvelope,
+    estimateTempo: estimateTempo,
+    buildBeatGrid: buildBeatGrid,
+    analyzeBeats: analyzeBeats,
+    gridTimes: gridTimes,
+    snapToGrid: snapToGrid,
+    beatSyncDelayMs: beatSyncDelayMs,
+    nextBeatSyncMode: nextBeatSyncMode,
+    mixToMono: mixToMono,
     AUDIO_EXTS: AUDIO_EXTS,
     audioMimeForPath: audioMimeForPath,
     isAudioPath: isAudioPath,
