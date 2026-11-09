@@ -1074,8 +1074,18 @@ pub fn undock_blocked_reason() -> Option<&'static str> {
 /// window that was asked to close is never focused again.
 type SecondWindowState = Mutex<second_window::SecondWindowSlot>;
 
+const MAIN_WINDOW_LABEL: &str = "main";
+
 fn second_window_exists(app: &AppHandle) -> impl Fn(&str) -> bool + '_ {
     move |label: &str| app.get_webview_window(label).is_some()
+}
+
+fn require_main_caller(window: &tauri::WebviewWindow, what: &str) -> Result<(), String> {
+    if window.label() == MAIN_WINDOW_LABEL {
+        Ok(())
+    } else {
+        Err(format!("only the main window can {what} the Media Manager"))
+    }
 }
 
 fn build_playlist_window(handle: &AppHandle, label: &str) {
@@ -1087,7 +1097,7 @@ fn build_playlist_window(handle: &AppHandle, label: &str) {
             }
         }
     }
-    if let Err(e) = WebviewWindowBuilder::new(
+    match WebviewWindowBuilder::new(
         handle,
         label,
         WebviewUrl::App("index.html?sspWindow=playlist#sspWindow=playlist".into()),
@@ -1100,11 +1110,25 @@ fn build_playlist_window(handle: &AppHandle, label: &str) {
     .additional_browser_args(HIGH_PERF_BROWSER_ARGS)
     .build()
     {
-        eprintln!("[slideshowpro] open_playlist_window build failed: {e}");
+        Ok(w) => {
+            // A dock that raced the build already closed this label: drop the stray window.
+            // A poisoned lock keeps the window (fail open to the old behaviour).
+            let keep = handle
+                .state::<SecondWindowState>()
+                .lock()
+                .map(|slot| slot.keep_built(label))
+                .unwrap_or(true);
+            if !keep {
+                let _ = w.destroy();
+            }
+        }
+        Err(e) => eprintln!("[slideshowpro] open_playlist_window build failed: {e}"),
     }
 }
 
-/// Open (or focus) the undocked Media Manager window.
+/// Open (or focus) the undocked Media Manager window. Main only. Returns the
+/// label of the window it built or focused; main accepts hello and intents
+/// only from that label.
 ///
 /// Must return promptly: on Windows, calling `WebviewWindowBuilder::build()`
 /// from a *sync* IPC command deadlocks (WebView2). Even in an async command,
@@ -1114,16 +1138,17 @@ fn build_playlist_window(handle: &AppHandle, label: &str) {
 ///
 /// If the last window was asked to close and is still being destroyed (main
 /// waits 2 s for `sw://closed`, then reopens), it is not focused: a new window
-/// is built under a fresh label instead.
+/// is built under the next free label, up to `playlist-9`.
 #[tauri::command]
-async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
+async fn open_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> Result<String, String> {
+    require_main_caller(&window, "open")?;
     if let Some(reason) = undock_blocked_reason() {
         return Err(reason.to_string());
     }
     let action = {
         let state = app.state::<SecondWindowState>();
         let mut slot = state.lock().map_err(|e| e.to_string())?;
-        slot.on_open(second_window_exists(&app))
+        slot.on_open(second_window_exists(&app)).map_err(|e| e.message().to_string())?
     };
     match action {
         second_window::OpenAction::Focus(label) => {
@@ -1131,28 +1156,45 @@ async fn open_playlist_window(app: AppHandle) -> Result<(), String> {
                 let _ = w.show();
                 let _ = w.set_focus();
             }
+            Ok(label)
         }
         second_window::OpenAction::Build(label) => {
             let handle = app.clone();
+            let built = label.clone();
             tauri::async_runtime::spawn(async move {
-                build_playlist_window(&handle, &label);
+                build_playlist_window(&handle, &built);
             });
+            Ok(label)
         }
     }
-    Ok(())
 }
 
-/// Destroy (not close) the playlist window. The window holds no state, so there
-/// is nothing to save first. It is marked as closing before destroy, so a reopen
+/// Destroy (not close) a Media Manager window. The window holds no state, so
+/// there is nothing to save first. From main (or the live Media Manager) this
+/// closes the live window and marks it closing before destroy, so a reopen
 /// that arrives before `Destroyed` builds a new window rather than focusing it.
+/// From an older Media Manager that is still closing, it closes only that
+/// window, so its late Dock-back fallback cannot close the new one.
 #[tauri::command]
-fn close_playlist_window(app: AppHandle) -> Result<(), String> {
-    let label = {
+fn close_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    let caller = window.label();
+    let caller = if second_window::is_second_window_label(caller) {
+        Some(caller.to_string())
+    } else if caller == MAIN_WINDOW_LABEL {
+        None
+    } else {
+        return Err("only SlideX windows can close the Media Manager".into());
+    };
+    let outcome = {
         let state = app.state::<SecondWindowState>();
         let mut slot = state.lock().map_err(|e| e.to_string())?;
-        slot.on_close_requested()
+        slot.on_close_requested_by(caller.as_deref(), second_window_exists(&app))
     };
-    if let Some(label) = label {
+    if outcome.report_closed {
+        // The live window never appeared (failed build): no Destroyed will come.
+        let _ = app.emit_to(MAIN_WINDOW_LABEL, SECOND_WINDOW_CLOSED_EVENT, ());
+    }
+    if let Some(label) = outcome.destroy {
         if let Some(w) = app.get_webview_window(&label) {
             w.destroy().map_err(|e| e.to_string())?;
         }
@@ -1161,7 +1203,8 @@ fn close_playlist_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn focus_playlist_window(app: AppHandle) -> Result<(), String> {
+fn focus_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    require_main_caller(&window, "focus")?;
     let target = {
         let state = app.state::<SecondWindowState>();
         let slot = state.lock().map_err(|e| e.to_string())?;
@@ -1452,9 +1495,11 @@ pub fn run() {
             }
             if second_window::is_second_window_label(webview.label()) {
                 // Ensure JS role even if asset URL drops ?sspWindow= (installed builds).
-                let _ = webview.eval(
-                    "try{window.__SSP_WINDOW_ROLE='playlist';}catch(_e){}",
-                );
+                // The label is one of the fixed second_window::LABELS, so it is safe to inline.
+                let _ = webview.eval(&format!(
+                    "try{{window.__SSP_WINDOW_ROLE='playlist';window.__SSP_WINDOW_LABEL='{}';}}catch(_e){{}}",
+                    webview.label()
+                ));
                 return;
             }
             if webview.label() != "main" {
@@ -1467,6 +1512,9 @@ pub fn run() {
                 if let tauri::WindowEvent::Destroyed = event {
                     // Only tell main when the live window went. A slow-dying
                     // window that was already replaced must not re-dock the new one.
+                    // A poisoned lock (a panic while it was held) can no longer say
+                    // which window is live, so report the close: main re-docks rather
+                    // than stay undocked with no window.
                     let report = window
                         .app_handle()
                         .state::<SecondWindowState>()
