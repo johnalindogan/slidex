@@ -484,6 +484,54 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
+test('readable text in the main UI is at least 60% white and meets WCAG AA', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  /* Decoration only (P1-8 keeps 30% for these): glyph icons that carry no state. */
+  const decor = new Set(['.pc', '.pldrag']);
+  const styles = [];
+  html.replace(/<style[^>]*>([\s\S]*?)<\/style>/g, (m, body, at) => { styles.push([at, at + m.length]); return m; });
+  const inStyle = i => styles.some(([a, b]) => i >= a && i < b);
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const lum = rgb => 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+  const ratio = (a, bg) => { const fg = bg.map(v => a * 255 + (1 - a) * v); const x = lum(fg), y = lum(bg); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const re = /(?<![-a-z])color:\s*rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*([0-9.]+)\s*\)/g;
+  const low = [];
+  let m;
+  while ((m = re.exec(html))) {
+    const a = Number(m[1]);
+    if (a >= 0.6) continue;
+    let sel = '(inline)';
+    if (inStyle(m.index)) {
+      const open = html.lastIndexOf('{', m.index);
+      const prevClose = html.lastIndexOf('}', open);
+      sel = html.slice(prevClose + 1, open).trim();
+    }
+    if (decor.has(sel)) continue;
+    low.push(sel + ' @' + html.slice(0, m.index).split('\n').length + ' = ' + a);
+  }
+  assert.deepEqual(low, [], 'text below 60% white:\n' + low.join('\n'));
+  /* 60% white passes AA (4.5:1) on the lightest main-UI panel (#1a1a1a) and on the Cast panel (#1a2230). */
+  assert.ok(ratio(0.6, [26, 26, 26]) >= 4.5);
+  assert.ok(ratio(0.6, [26, 34, 48]) >= 4.5);
+  assert.ok(ratio(0.45, [26, 26, 26]) < 4.5, 'the old 45% text failed AA');
+  /* Meaningful glyphs (folder open arrow, modified-key marker) reach 3:1 as graphics, even on a hovered row. */
+  const rule = sel => { const i = html.indexOf(sel + '{') >= 0 ? html.indexOf(sel + '{') : html.indexOf(sel + ' {'); assert.ok(i >= 0, sel); return html.slice(i, html.indexOf('}', i)); };
+  const alpha = (sel, prop) => Number((rule(sel).match(new RegExp('(?<![-a-z])' + prop + ':\\s*rgba\\([^)]*,\\s*([0-9.]+)\\s*\\)')) || [])[1]);
+  for (const sel of ['.pf-arr', '.kerow.modified .kelbl::after']) {
+    const a = alpha(sel, 'color');
+    assert.ok(ratio(a, [26, 26, 26]) >= 3 && ratio(a, [44, 44, 44]) >= 3, sel + ' reaches 3:1');
+  }
+  /* Text overlays on the slide (#fnov file name, #watchbadge) stay readable over a pure white slide. */
+  for (const sel of ['#fnov', '#watchbadge']) {
+    const bgA = alpha(sel, 'background'), fgA = alpha(sel, 'color');
+    assert.ok(bgA >= 0.75, sel + ' backing is at least 75% black');
+    const backing = [255, 255, 255].map(v => v * (1 - bgA));
+    const r = ratio(fgA, backing);
+    assert.ok(r >= 4.5, sel + ' over #fff is ' + r.toFixed(2) + ':1');
+  }
+  assert.ok(ratio(0.75, [255 * 0.45, 255 * 0.45, 255 * 0.45]) < 4.5, 'the old .55 backing failed over white');
+});
+
 test('a saved duration off the list falls back to the closest choice', () => {
   const lines = [];
   const orig = console.log;
