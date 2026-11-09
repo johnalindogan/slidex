@@ -1361,6 +1361,42 @@
     return list;
   }
 
+  /* Playlist undo (P1-10): whole snapshots, newest last. commit() clears redo. */
+  var PLAYLIST_UNDO_CAP = 100;
+  function undoHistory() { return { past: [], future: [] }; }
+  function undoCommit(hist, label, snapshot, cap) {
+    var max = cap > 0 ? cap : PLAYLIST_UNDO_CAP;
+    var past = (hist && hist.past ? hist.past : []).concat([{ label: String(label || 'Edit'), snap: snapshot }]);
+    if (past.length > max) past = past.slice(past.length - max);
+    return { past: past, future: [] };
+  }
+  function undoStep(hist, current) {
+    if (!hist || !hist.past || !hist.past.length) return null;
+    var entry = hist.past[hist.past.length - 1];
+    return {
+      history: { past: hist.past.slice(0, -1), future: hist.future.concat([{ label: entry.label, snap: current }]) },
+      label: entry.label,
+      snap: entry.snap
+    };
+  }
+  function redoStep(hist, current) {
+    if (!hist || !hist.future || !hist.future.length) return null;
+    var entry = hist.future[hist.future.length - 1];
+    return {
+      history: { past: hist.past.concat([{ label: entry.label, snap: current }]), future: hist.future.slice(0, -1) },
+      label: entry.label,
+      snap: entry.snap
+    };
+  }
+  /** 'undo' for Ctrl+Z, 'redo' for Ctrl+Y or Ctrl+Shift+Z, else null. Alt chords are not undo. */
+  function undoKeyAction(e) {
+    if (!e || !(e.ctrlKey || e.metaKey) || e.altKey) return null;
+    var k = String(e.key || '').toLowerCase();
+    if (k === 'z') return e.shiftKey ? 'redo' : 'undo';
+    if (k === 'y' && !e.shiftKey) return 'redo';
+    return null;
+  }
+
   function movePlaylistItems(items, srcIdx, tgtIdx, after, selectedMediaIndexes) {
     var source = items || [];
     if (srcIdx == null || tgtIdx == null) return { items: source.slice(), moved: false, clearedSelection: false };
@@ -2200,6 +2236,12 @@
     playbackMedia: playbackMedia,
     itemsIndexForPlayback: itemsIndexForPlayback,
     movePlaylistItems: movePlaylistItems,
+    PLAYLIST_UNDO_CAP: PLAYLIST_UNDO_CAP,
+    undoHistory: undoHistory,
+    undoCommit: undoCommit,
+    undoStep: undoStep,
+    redoStep: redoStep,
+    undoKeyAction: undoKeyAction,
     listReorderHit: listReorderHit,
     stackMediaRows: stackMediaRows,
     reorderByHandle: reorderByHandle,
