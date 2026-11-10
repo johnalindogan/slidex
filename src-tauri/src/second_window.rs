@@ -31,6 +31,81 @@ pub fn is_second_window_label(label: &str) -> bool {
     LABELS.contains(&label)
 }
 
+pub const MAIN_LABEL: &str = "main";
+
+/// Who called a Media Manager command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Caller {
+    Main,
+    SecondWindow(String),
+}
+
+/// Main, one of the nine Media Manager labels, or refused.
+pub fn classify_caller(label: &str) -> Result<Caller, String> {
+    if label == MAIN_LABEL {
+        Ok(Caller::Main)
+    } else if is_second_window_label(label) {
+        Ok(Caller::SecondWindow(label.to_string()))
+    } else {
+        Err(format!("window '{label}' may not use the Media Manager commands"))
+    }
+}
+
+/// Open and focus are main-only.
+pub fn require_main(label: &str, what: &str) -> Result<(), String> {
+    match classify_caller(label)? {
+        Caller::Main => Ok(()),
+        Caller::SecondWindow(_) => Err(format!("only the main window can {what} the Media Manager")),
+    }
+}
+
+/// What `focus_playlist_window` should do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusTarget {
+    /// Show and focus this window.
+    Window(String),
+    /// The live window is still being built: it opens focused, nothing to do.
+    Pending,
+    /// No live window (main re-docks).
+    Gone,
+}
+
+/// The Tauri side of a close, so the close flow can be tested without Tauri.
+pub trait WindowHost {
+    fn exists(&self, label: &str) -> bool;
+    fn destroy(&self, label: &str) -> Result<(), String>;
+    /// Send `sw://closed` to main.
+    fn emit_closed(&self);
+}
+
+/// The whole `close_playlist_window` flow: classify the caller, update the
+/// slot, release the lock, then emit and destroy. The lock is released before
+/// `destroy`, since `Destroyed` can run on this thread and lock the slot again.
+pub fn handle_close(
+    slot: &std::sync::Mutex<SecondWindowSlot>,
+    caller_label: &str,
+    host: &impl WindowHost,
+) -> Result<(), String> {
+    let caller = match classify_caller(caller_label)? {
+        Caller::Main => None,
+        Caller::SecondWindow(l) => Some(l),
+    };
+    let outcome = {
+        let mut slot = slot.lock().map_err(|e| e.to_string())?;
+        slot.on_close_requested_by(caller.as_deref(), |l| host.exists(l))
+    };
+    if outcome.report_closed {
+        // The live window never appeared (failed build): no Destroyed will come.
+        host.emit_closed();
+    }
+    if let Some(label) = outcome.destroy {
+        if host.exists(&label) {
+            host.destroy(&label)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenAction {
     /// The live window exists: show and focus it.
@@ -71,6 +146,8 @@ pub struct SecondWindowSlot {
     current: Option<String>,
     /// Windows that were asked to close and have not reported `Destroyed` yet.
     dying: Vec<String>,
+    /// Labels whose `build()` has been scheduled and has not returned yet.
+    building: Vec<String>,
 }
 
 impl SecondWindowSlot {
@@ -99,22 +176,36 @@ impl SecondWindowSlot {
     pub fn on_open(&mut self, exists: impl Fn(&str) -> bool) -> Result<OpenAction, OpenError> {
         self.dying.retain(|l| exists(l));
         if let Some(cur) = self.current.clone() {
-            if exists(&cur) {
+            // A live window that is still being built counts as open: focusing it
+            // is a no-op until it appears (it opens focused).
+            if exists(&cur) || self.is_building(&cur) {
                 return Ok(OpenAction::Focus(cur));
             }
         }
+        // After the retain above every closing label still has a window, so
+        // `!exists` already excludes them; no separate is_dying check is needed.
         let label = LABELS
             .iter()
-            .find(|l| !exists(l) && !self.is_dying(l))
+            .find(|l| !exists(l) && !self.is_building(l))
             .ok_or(OpenError::AllLabelsBusy)?;
         self.current = Some(label.to_string());
+        self.building.push(label.to_string());
         Ok(OpenAction::Build(label.to_string()))
     }
 
-    /// The window to focus for `focus_playlist_window`, or None when the live
-    /// window is gone or closing.
-    pub fn focus_target(&self, exists: impl Fn(&str) -> bool) -> Option<String> {
-        self.current.as_deref().filter(|l| exists(l)).map(str::to_string)
+    pub fn is_building(&self, label: &str) -> bool {
+        self.building.iter().any(|l| l == label)
+    }
+
+    /// What `focus_playlist_window` should do. A live window whose build is
+    /// still in flight is `Pending`, not `Gone`, so main does not re-dock and
+    /// leave the new window unlinked.
+    pub fn focus_target(&self, exists: impl Fn(&str) -> bool) -> FocusTarget {
+        match self.current.as_deref() {
+            Some(l) if exists(l) => FocusTarget::Window(l.to_string()),
+            Some(l) if self.is_building(l) => FocusTarget::Pending,
+            _ => FocusTarget::Gone,
+        }
     }
 
     /// A close request. `caller` is the Media Manager label that asked, or None
@@ -164,9 +255,14 @@ impl SecondWindowSlot {
         }
     }
 
-    /// After `build()`: false when a dock raced the build and this window is no
-    /// longer the live one, so the caller destroys it.
-    pub fn keep_built(&self, label: &str) -> bool {
+    /// `build()` returned (`ok` = a window was created). Returns false when a
+    /// dock raced the build and this window is no longer the live one, so the
+    /// caller destroys it.
+    pub fn on_built(&mut self, label: &str, ok: bool) -> bool {
+        self.building.retain(|l| l != label);
+        if !ok {
+            return false;
+        }
         self.current.as_deref() == Some(label)
     }
 }
@@ -194,7 +290,12 @@ mod tests {
 
     fn build(s: &mut SecondWindowSlot, w: &Wins) -> String {
         match s.on_open(w.has()).expect("a free label") {
-            OpenAction::Build(l) => { w.add(&l); invariant(s); l }
+            OpenAction::Build(l) => {
+                w.add(&l);
+                assert!(s.on_built(&l, true), "a fresh build is kept");
+                invariant(s);
+                l
+            }
             other => panic!("expected Build, got {other:?}"),
         }
     }
@@ -215,7 +316,7 @@ mod tests {
         let (mut s, w) = (SecondWindowSlot::new(), Wins::default());
         assert_eq!(build(&mut s, &w), "playlist");
         assert_eq!(s.on_open(w.has()), Ok(OpenAction::Focus("playlist".into())));
-        assert_eq!(s.focus_target(w.has()).as_deref(), Some("playlist"));
+        assert_eq!(s.focus_target(w.has()), FocusTarget::Window("playlist".into()));
     }
 
     #[test]
@@ -236,7 +337,7 @@ mod tests {
         s.on_close_requested_by(None, w.has());
         invariant(&s);
         // 2 s later the old window is still registered: main reopens.
-        assert!(s.focus_target(w.has()).is_none(), "a dying window is never a focus target");
+        assert_eq!(s.focus_target(w.has()), FocusTarget::Gone, "a dying window is never a focus target");
         assert_eq!(build(&mut s, &w), "playlist-2", "rebuild, never Focus(\"playlist\")");
         // The old window finally goes: main must not re-dock the new one.
         w.rm("playlist");
@@ -259,7 +360,7 @@ mod tests {
         let out = s.on_close_requested_by(Some("playlist"), w.has());
         assert_eq!(out, CloseOutcome { destroy: Some("playlist".into()), report_closed: false }, "only the caller");
         assert_eq!(s.current(), Some("playlist-2"), "the new window stays live");
-        assert_eq!(s.focus_target(w.has()).as_deref(), Some("playlist-2"));
+        assert_eq!(s.focus_target(w.has()), FocusTarget::Window("playlist-2".into()));
         invariant(&s);
         // A Media Manager that is the live one may still close itself (link dropped).
         let own = s.on_close_requested_by(Some("playlist-2"), w.has());
@@ -289,6 +390,7 @@ mod tests {
         for _ in 0..5 {
             // build() fails: the label is claimed but no window appears. Then the user docks.
             assert_eq!(s.on_open(w.has()), Ok(OpenAction::Build("playlist".into())));
+            assert!(!s.on_built("playlist", false));
             let out = s.on_close_requested_by(None, w.has());
             assert_eq!(out, CloseOutcome { destroy: None, report_closed: true }, "nothing to destroy, tell main now");
             assert!(s.dying().is_empty(), "no phantom closing label");
@@ -308,13 +410,103 @@ mod tests {
         assert_eq!(s.on_open(w.has()), Ok(OpenAction::Build("playlist".into())));
         // Main docks before build() returns.
         assert!(s.on_close_requested_by(None, w.has()).report_closed);
+        // A reopen before that build returns does not reuse its label.
+        assert_eq!(s.on_open(w.has()), Ok(OpenAction::Build("playlist-2".into())));
         w.add("playlist");
-        assert!(!s.keep_built("playlist"), "the builder destroys the stray window");
+        assert!(!s.on_built("playlist", true), "the builder destroys the stray window");
         w.rm("playlist");
         assert!(!s.on_destroyed("playlist"), "main already heard sw://closed");
+        w.add("playlist-2");
+        assert!(s.on_built("playlist-2", true));
+        assert_eq!(s.current(), Some("playlist-2"));
         let mut t = SecondWindowSlot::new();
         assert_eq!(t.on_open(w.has()), Ok(OpenAction::Build("playlist".into())));
-        assert!(t.keep_built("playlist"));
+        assert!(t.on_built("playlist", true));
+    }
+
+    #[test]
+    fn a_pending_build_counts_as_open_for_focus_and_reopen() {
+        let (mut s, w) = (SecondWindowSlot::new(), Wins::default());
+        assert_eq!(s.on_open(w.has()), Ok(OpenAction::Build("playlist".into())));
+        // The playlist button (focus) or a second open while build() is in flight.
+        assert_eq!(s.focus_target(w.has()), FocusTarget::Pending, "not Gone: main must not re-dock");
+        assert_eq!(s.on_open(w.has()), Ok(OpenAction::Focus("playlist".into())), "no second build");
+        w.add("playlist");
+        assert!(s.on_built("playlist", true));
+        assert_eq!(s.focus_target(w.has()), FocusTarget::Window("playlist".into()));
+        // A failed build is Gone, so main re-docks then.
+        let (mut f, w2) = (SecondWindowSlot::new(), Wins::default());
+        f.on_open(w2.has()).unwrap();
+        assert!(!f.on_built("playlist", false));
+        assert_eq!(f.focus_target(w2.has()), FocusTarget::Gone);
+    }
+
+    #[test]
+    fn callers_are_main_a_media_manager_label_or_refused() {
+        assert_eq!(classify_caller("main"), Ok(Caller::Main));
+        for l in LABELS {
+            assert_eq!(classify_caller(l), Ok(Caller::SecondWindow(l.to_string())));
+        }
+        for bad in ["", "Main", "playlist-10", "playlist-x", "evil", "main "] {
+            assert!(classify_caller(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(require_main("main", "open"), Ok(()));
+        for l in LABELS {
+            assert!(require_main(l, "open").is_err(), "{l} cannot open");
+        }
+        assert!(require_main("evil", "focus").is_err());
+    }
+
+    /// A fake Tauri: records calls, and `destroy` runs `Destroyed` on the same
+    /// thread (it locks the slot, like on_window_event does).
+    struct FakeHost<'a> {
+        wins: &'a Wins,
+        slot: &'a std::sync::Mutex<SecondWindowSlot>,
+        log: RefCell<Vec<String>>,
+    }
+    impl WindowHost for FakeHost<'_> {
+        fn exists(&self, l: &str) -> bool { self.wins.0.borrow().contains(l) }
+        fn destroy(&self, l: &str) -> Result<(), String> {
+            self.log.borrow_mut().push(format!("destroy {l}"));
+            self.wins.rm(l);
+            let report = self.slot.try_lock().expect("slot unlocked before destroy").on_destroyed(l);
+            if report { self.emit_closed(); }
+            Ok(())
+        }
+        fn emit_closed(&self) { self.log.borrow_mut().push("closed".into()); }
+    }
+
+    #[test]
+    fn close_flow_emits_and_destroys_from_the_right_callers() {
+        let w = Wins::default();
+        let slot = std::sync::Mutex::new(SecondWindowSlot::new());
+        let host = FakeHost { wins: &w, slot: &slot, log: RefCell::new(vec![]) };
+        let take = || std::mem::take(&mut *host.log.borrow_mut());
+        // Failed build, then main docks: no window, so main hears sw://closed now.
+        slot.lock().unwrap().on_open(w.has()).unwrap();
+        slot.lock().unwrap().on_built("playlist", false);
+        assert_eq!(handle_close(&slot, "main", &host), Ok(()));
+        assert_eq!(take(), ["closed"], "report_closed is emitted");
+        // Normal dock from main: destroy, and Destroyed reports.
+        build(&mut slot.lock().unwrap(), &w);
+        assert_eq!(handle_close(&slot, "main", &host), Ok(()));
+        assert_eq!(take(), ["destroy playlist", "closed"]);
+        // A refused caller changes nothing.
+        build(&mut slot.lock().unwrap(), &w);
+        assert!(handle_close(&slot, "evil", &host).is_err());
+        assert!(take().is_empty());
+        assert_eq!(slot.lock().unwrap().current(), Some("playlist"));
+        // A late close from an old window closes only that window and reports nothing.
+        w.add("playlist-3");
+        slot.lock().unwrap().dying.push("playlist-3".into());
+        assert_eq!(handle_close(&slot, "playlist-3", &host), Ok(()));
+        assert_eq!(take(), ["destroy playlist-3"]);
+        assert_eq!(slot.lock().unwrap().current(), Some("playlist"));
+        // Closing with nothing open emits nothing.
+        assert_eq!(handle_close(&slot, "main", &host), Ok(()));
+        take();
+        assert_eq!(handle_close(&slot, "main", &host), Ok(()));
+        assert!(take().is_empty());
     }
 
     #[test]

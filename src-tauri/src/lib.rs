@@ -1074,17 +1074,27 @@ pub fn undock_blocked_reason() -> Option<&'static str> {
 /// window that was asked to close is never focused again.
 type SecondWindowState = Mutex<second_window::SecondWindowSlot>;
 
-const MAIN_WINDOW_LABEL: &str = "main";
+const MAIN_WINDOW_LABEL: &str = second_window::MAIN_LABEL;
 
 fn second_window_exists(app: &AppHandle) -> impl Fn(&str) -> bool + '_ {
     move |label: &str| app.get_webview_window(label).is_some()
 }
 
-fn require_main_caller(window: &tauri::WebviewWindow, what: &str) -> Result<(), String> {
-    if window.label() == MAIN_WINDOW_LABEL {
-        Ok(())
-    } else {
-        Err(format!("only the main window can {what} the Media Manager"))
+/// The Tauri side of `second_window::handle_close`.
+struct TauriWindowHost<'a>(&'a AppHandle);
+
+impl second_window::WindowHost for TauriWindowHost<'_> {
+    fn exists(&self, label: &str) -> bool {
+        self.0.get_webview_window(label).is_some()
+    }
+    fn destroy(&self, label: &str) -> Result<(), String> {
+        match self.0.get_webview_window(label) {
+            Some(w) => w.destroy().map_err(|e| e.to_string()),
+            None => Ok(()),
+        }
+    }
+    fn emit_closed(&self) {
+        let _ = self.0.emit_to(MAIN_WINDOW_LABEL, SECOND_WINDOW_CLOSED_EVENT, ());
     }
 }
 
@@ -1116,13 +1126,18 @@ fn build_playlist_window(handle: &AppHandle, label: &str) {
             let keep = handle
                 .state::<SecondWindowState>()
                 .lock()
-                .map(|slot| slot.keep_built(label))
+                .map(|mut slot| slot.on_built(label, true))
                 .unwrap_or(true);
             if !keep {
                 let _ = w.destroy();
             }
         }
-        Err(e) => eprintln!("[slideshowpro] open_playlist_window build failed: {e}"),
+        Err(e) => {
+            if let Ok(mut slot) = handle.state::<SecondWindowState>().lock() {
+                slot.on_built(label, false);
+            }
+            eprintln!("[slideshowpro] open_playlist_window build failed: {e}");
+        }
     }
 }
 
@@ -1141,7 +1156,7 @@ fn build_playlist_window(handle: &AppHandle, label: &str) {
 /// is built under the next free label, up to `playlist-9`.
 #[tauri::command]
 async fn open_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> Result<String, String> {
-    require_main_caller(&window, "open")?;
+    second_window::require_main(window.label(), "open")?;
     if let Some(reason) = undock_blocked_reason() {
         return Err(reason.to_string());
     }
@@ -1177,46 +1192,30 @@ async fn open_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> R
 /// window, so its late Dock-back fallback cannot close the new one.
 #[tauri::command]
 fn close_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
-    let caller = window.label();
-    let caller = if second_window::is_second_window_label(caller) {
-        Some(caller.to_string())
-    } else if caller == MAIN_WINDOW_LABEL {
-        None
-    } else {
-        return Err("only SlideX windows can close the Media Manager".into());
-    };
-    let outcome = {
-        let state = app.state::<SecondWindowState>();
-        let mut slot = state.lock().map_err(|e| e.to_string())?;
-        slot.on_close_requested_by(caller.as_deref(), second_window_exists(&app))
-    };
-    if outcome.report_closed {
-        // The live window never appeared (failed build): no Destroyed will come.
-        let _ = app.emit_to(MAIN_WINDOW_LABEL, SECOND_WINDOW_CLOSED_EVENT, ());
-    }
-    if let Some(label) = outcome.destroy {
-        if let Some(w) = app.get_webview_window(&label) {
-            w.destroy().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
+    let state = app.state::<SecondWindowState>();
+    second_window::handle_close(&state, window.label(), &TauriWindowHost(&app))
 }
 
 #[tauri::command]
 fn focus_playlist_window(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
-    require_main_caller(&window, "focus")?;
+    second_window::require_main(window.label(), "focus")?;
     let target = {
         let state = app.state::<SecondWindowState>();
         let slot = state.lock().map_err(|e| e.to_string())?;
         slot.focus_target(second_window_exists(&app))
     };
-    match target.and_then(|label| app.get_webview_window(&label)) {
-        Some(w) => {
-            let _ = w.show();
-            let _ = w.set_focus();
-            Ok(())
-        }
-        None => Err("playlist window not open".into()),
+    match target {
+        second_window::FocusTarget::Window(label) => match app.get_webview_window(&label) {
+            Some(w) => {
+                let _ = w.show();
+                let _ = w.set_focus();
+                Ok(())
+            }
+            None => Err("playlist window not open".into()),
+        },
+        // Still being built: it opens focused. Treat it as open so main stays undocked.
+        second_window::FocusTarget::Pending => Ok(()),
+        second_window::FocusTarget::Gone => Err("playlist window not open".into()),
     }
 }
 
