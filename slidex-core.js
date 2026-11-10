@@ -1841,10 +1841,14 @@
    * Main side. send(event, payload) emits to the second window. snapshot()
    * returns the state to send. apply(intent) runs one validated intent on
    * main's own state and returns true when it changed something.
+   * open(label) takes the window label Rust built or focused. From then on,
+   * hello and intents count only when msg.from is that label; any other
+   * window (an old one still closing) is refused with reason 'stale'.
    */
   function createSwHub(opts) {
     var o = opts || {};
-    var hub = { open: false, v: 0 };
+    var hub = { open: false, v: 0, from: null };
+    function fromOk(msg) { return hub.from == null || msg.from === hub.from; }
     function send(ev, payload) { if (typeof o.send === 'function') o.send(ev, payload); }
     function sendSnapshot() {
       if (!hub.open) return null;
@@ -1856,7 +1860,12 @@
     return {
       get isOpen() { return hub.open; },
       get version() { return hub.v; },
-      open: function () { hub.open = true; return sendSnapshot(); },
+      get label() { return hub.from; },
+      open: function (label) {
+        hub.open = true;
+        hub.from = typeof label === 'string' && label ? label : null;
+        return sendSnapshot();
+      },
       close: function () { hub.open = false; },
       changed: function () { return sendSnapshot(); },
       beat: function () {
@@ -1866,12 +1875,14 @@
         return payload;
       },
       onHello: function (msg) {
-        if (!hub.open || !msg || msg.origin !== 'playlist') return null;
+        if (!hub.open || !msg || msg.origin !== 'playlist' || !fromOk(msg)) return null;
         return sendSnapshot();
       },
       onIntent: function (msg) {
         if (!hub.open) return { ok: false, reason: 'closed' };
         if (!msg || msg.origin !== 'playlist') return { ok: false, reason: 'origin' };
+        // Not the live window: do not touch state, and do not answer it.
+        if (!fromOk(msg)) return { ok: false, reason: 'stale' };
         var intent = swNormalizeIntent(msg);
         if (!intent) {
           sendSnapshot();
@@ -1901,8 +1912,10 @@
       if (!st.state) return (t - st.openedAt) > SW_LINK_TIMEOUT_MS ? 'unlinked' : 'opening';
       return (t - st.lastHeard) > SW_LINK_TIMEOUT_MS ? 'unlinked' : 'linked';
     }
+    var from = typeof o.from === 'string' && o.from ? o.from : null;
     function hello() {
       var payload = { origin: 'playlist', v: st.v };
+      if (from) payload.from = from;
       send(SW_EVENTS.hello, payload);
       return payload;
     }
@@ -1943,6 +1956,7 @@
         st.link = linkAt(now());
         if (st.link !== 'linked' && intent.op !== 'dock') return false;
         intent.origin = 'playlist';
+        if (from) intent.from = from;
         intent.baseV = st.v;
         send(SW_EVENTS.intent, intent);
         return true;
