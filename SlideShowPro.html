@@ -1534,6 +1534,21 @@ let SSP_WINDOW_ROLE = (function () {
   return 'main';
 })();
 let SSP_IS_PLAYLIST_WINDOW = SSP_WINDOW_ROLE === 'playlist';
+/** True in the main window. Read live: the role can late-bind from the Tauri label. Only main writes saved state. */
+function sspIsMainWindow() {
+  try { refreshWindowRoleFromTauri(); } catch (_) {}
+  return !SSP_IS_PLAYLIST_WINDOW;
+}
+/** Second window: its own Tauri label (playlist or playlist-2..9), sent as `from` so main can ignore old windows. */
+function swOwnLabel() {
+  try {
+    const WW = window.__TAURI__ && window.__TAURI__.webviewWindow;
+    const cur = WW && typeof WW.getCurrentWebviewWindow === 'function' ? WW.getCurrentWebviewWindow() : null;
+    if (cur && typeof cur.label === 'string' && cur.label) return cur.label;
+  } catch (_) {}
+  try { if (typeof window.__SSP_WINDOW_LABEL === 'string' && window.__SSP_WINDOW_LABEL) return window.__SSP_WINDOW_LABEL; } catch (_) {}
+  return 'playlist';
+}
 /** 0.2.0: Undock is back. The second window is a remote for the main window. */
 const SSP_UNDOCK_ENABLED = true;
 if (SSP_UNDOCK_ENABLED) document.body.classList.add('ssp-undock-enabled');
@@ -1569,7 +1584,7 @@ function refreshWindowRoleFromTauri() {
       : (WW.WebviewWindow && typeof WW.WebviewWindow.getCurrent === 'function'
         ? WW.WebviewWindow.getCurrent()
         : null));
-    if (cur && cur.label === 'playlist') {
+    if (cur && /^playlist(-[2-9])?$/.test(cur.label || '')) {
       SSP_WINDOW_ROLE = 'playlist';
       SSP_IS_PLAYLIST_WINDOW = true;
       return true;
@@ -1788,8 +1803,11 @@ async function undockPlaylistWindow() {
     // A window that is still closing would be focused instead of rebuilt.
     if (swChildAlive) await swWaitChildClosed(2000);
     if (!swEnsureHub()) return;
+    let label = null;
     try {
-      await tauriInvoke('open_playlist_window');
+      // Rust says which window it built or focused; the hub listens to that one only.
+      label = await tauriInvoke('open_playlist_window');
+      if (typeof label !== 'string' || !label) throw new Error('no window label');
     } catch (e) {
       console.warn(e);
       showToast('Could not open the Media Manager window: ' + (e && e.message ? e.message : e), 5000);
@@ -1805,7 +1823,7 @@ async function undockPlaylistWindow() {
     }
     applyUndockedMainChrome();
     // The window may not be listening yet; it says hello when ready and gets a snapshot then.
-    swHub.open();
+    swHub.open(label);
     clearInterval(swBeatTimer);
     swBeatTimer = setInterval(() => { if (swHub) swHub.beat(); }, SlideXCore.SW_BEAT_MS);
     showToast('Media Manager opened in its own window. Drag it to your other screen.', 2600);
@@ -2087,7 +2105,7 @@ function enterPlaylistWindowShell() {
   }, true);
   if (g('swDock')) g('swDock').onclick = () => dockPlaylistWindow();
   if (g('swReconnect')) g('swReconnect').onclick = () => { if (swChild) swChild.hello(); };
-  swChild = SlideXCore.createSwChild({ send: swEmit });
+  swChild = SlideXCore.createSwChild({ send: swEmit, from: swOwnLabel() });
   swRenderBar();
   try { renderPlaylist(); } catch (_) {}
   swChild.hello();
@@ -2732,6 +2750,8 @@ function loadItemLS(item) {
 }
 
 function saveItemLS(item) {
+  // Main owns the state: the second window never writes per-item edits to localStorage.
+  if (!sspIsMainWindow()) return;
   ensureItemId(item);
   try {
     localStorage.setItem(lsKey(item), JSON.stringify({
@@ -8480,6 +8500,8 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function el(id) { return document.getElementById(id); }
   function save() {
     if (!sspIsTauri()) return;
+    // Main owns the soundtrack. The pane is hidden in the second window by CSS; this makes it a rule.
+    if (!(typeof sspIsMainWindow === 'function' ? sspIsMainWindow() : isMain)) return;
     try { localStorage.setItem(LS_KEY, C.serializeAudioQueue(q)); } catch (_) {}
   }
   function toast(msg) { try { showToast(msg, 4000); } catch (_) {} }
