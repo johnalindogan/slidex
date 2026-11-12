@@ -1843,12 +1843,14 @@
    * main's own state and returns true when it changed something.
    * open(label) takes the window label Rust built or focused. From then on,
    * hello and intents count only when msg.from is that label; any other
-   * window (an old one still closing) is refused with reason 'stale'.
+   * window (an old one still closing) is refused with reason 'stale'. Opened
+   * without a label, the hub refuses everything.
    */
   function createSwHub(opts) {
     var o = opts || {};
     var hub = { open: false, v: 0, from: null };
-    function fromOk(msg) { return hub.from == null || msg.from === hub.from; }
+    // Fail closed: with no label from Rust, no window is the live one.
+    function fromOk(msg) { return hub.from != null && msg.from === hub.from; }
     function send(ev, payload) { if (typeof o.send === 'function') o.send(ev, payload); }
     function sendSnapshot() {
       if (!hub.open) return null;

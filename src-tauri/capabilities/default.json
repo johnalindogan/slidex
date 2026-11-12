@@ -18,7 +18,6 @@
     "core:default",
     "core:event:default",
     "core:window:default",
-    "core:webview:allow-create-webview-window",
     "core:path:default",
     "core:app:default",
     "dialog:default",
