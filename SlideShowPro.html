@@ -2649,7 +2649,10 @@ function loadVideoSkipSec() {
 let videoSkipSec = loadVideoSkipSec();
 function persistVideoSkipSec(sec) {
   videoSkipSec = clampVideoSkipSec(sec);
-  try { localStorage.setItem(VIDEO_SKIP_LS, String(videoSkipSec)); } catch (_) {}
+  // Main owns saved settings: the second window never writes video-skip.
+  if (sspIsMainWindow()) {
+    try { localStorage.setItem(VIDEO_SKIP_LS, String(videoSkipSec)); } catch (_) {}
+  }
   const inp = g('vskip');
   if (inp && String(inp.value) !== String(videoSkipSec)) inp.value = String(videoSkipSec);
   return videoSkipSec;
@@ -2710,6 +2713,8 @@ function loadPersistedImageUpdates() {
 
 function persistImageUpdatesSource(data) {
   sharedImageUpdates = normalizeImageUpdatesSource(data);
+  // Main owns saved settings: the second window never writes image-updates.
+  if (!sspIsMainWindow()) return;
   try { localStorage.setItem('ssp_image_updates', JSON.stringify(data)); } catch(e) {}
 }
 
@@ -2943,7 +2948,10 @@ function loadKeyMap() {
   refreshMoreToolsTooltip();
 }
 function saveKeyMap() {
-  try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}
+  // Main owns saved settings: the second window never writes the keymap.
+  if (sspIsMainWindow()) {
+    try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}
+  }
   if (typeof refreshMoreToolsTooltip === 'function') refreshMoreToolsTooltip();
 }
 loadKeyMap();
@@ -3929,6 +3937,8 @@ window.addEventListener('resize', () => { if (getMediaItems().length) showMaxCom
 function forgetEmptiedSession() {
   sessionLoaded = false;
   sessionDirty = false;
+  // Main owns saved settings: the second window never clears the autosave.
+  if (!sspIsMainWindow()) return;
   if (window.SlideXCore && SlideXCore.forgetEmptiedSession) SlideXCore.forgetEmptiedSession(localStorage, 0);
   else { try { localStorage.removeItem('ssp_autosave'); } catch (_) {} }
 }
@@ -3936,7 +3946,8 @@ function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
   if (!item) return;
   if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
-  if (clearLS) [item.id, item.name].filter(Boolean).forEach(key => localStorage.removeItem(lsKey(key)));
+  // The sspIsMainWindow() guard is redundant on purpose (playlist early-return already covers it); the source-scan requires a call-time guard on this write.
+  if (clearLS && sspIsMainWindow()) [item.id, item.name].filter(Boolean).forEach(key => localStorage.removeItem(lsKey(key)));
   items.splice(itemsIdx, 1);
   selectedItems.clear();
   const cnt = getMediaItems().length;
@@ -4009,6 +4020,7 @@ function openHandleDB() {
   });
 }
 async function saveMetaIDB(key, value) {
+  if (!sspIsMainWindow()) return;
   const db = await openHandleDB();
   return new Promise((res, rej) => {
     const tx = db.transaction('meta', 'readwrite');
@@ -4027,6 +4039,7 @@ async function getMetaIDB(key) {
 }
 
 async function getScreenshotDirHandle() {
+  if (!sspIsMainWindow()) return null;
   if (!window.showDirectoryPicker) return null;
   if (screenshotDirHandle) return screenshotDirHandle;
   try {
@@ -4055,6 +4068,7 @@ async function getScreenshotDirHandle() {
 }
 
 async function saveScreenshotFile(name, blob) {
+  if (!sspIsMainWindow()) return false;
   const dir = await getScreenshotDirHandle();
   if (!dir) return false;
   try {
@@ -4071,6 +4085,7 @@ async function saveScreenshotFile(name, blob) {
 }
 
 async function saveHandleIDB(name, handle) {
+  if (!sspIsMainWindow()) return;
   const db = await openHandleDB();
   return new Promise((res, rej) => {
     const tx = db.transaction('handles', 'readwrite');
@@ -4121,7 +4136,7 @@ function schedAutoSave() { sessionDirty = true; clearTimeout(autoSaveTimer); aut
 function saveSessionBeforeExit(ack) {
   clearTimeout(autoSaveTimer);
   // The second window shares localStorage with main but owns no state, so it never saves.
-  if (SSP_IS_PLAYLIST_WINDOW) return;
+  if (!sspIsMainWindow()) return;
   const sel = g('dsel');
   const parsed = sel ? parseInt(sel.value, 10) : NaN;
   const ms = Number.isFinite(parsed) ? parsed : (window.SlideXCore ? SlideXCore.DEFAULT_IMAGE_DURATION_MS : 10000);
@@ -6308,6 +6323,8 @@ async function blobToBase64(blob) {
 }
 /** Save blob via Tauri dialog+write_export_file, showSaveFilePicker, or <a download>. */
 async function saveExportBlob(defaultName, blob, filters, extra) {
+  // Second window never exports (stage tools run in main). Quiet cancel so callers don't toast.
+  if (!sspIsMainWindow()) return { ok: false, reason: 'cancel' };
   if (!blob) return { ok: false, reason: 'empty' };
   if (sspIsTauri()) {
     try {
@@ -6509,7 +6526,10 @@ g('bpr').onclick = () => goTo(cur - 1);
 g('bne').onclick = () => goTo(cur + 1);
 g('btheme').onclick = e => { if (e.shiftKey) applyThemeToCurrent(true); else if (e.altKey) applyThemeToAll(true); else applyThemeToCurrent(false); };
 g('dsel').onchange = () => {
-  try { localStorage.setItem('ssp_default_dur', g('dsel').value); } catch (_) {}
+  // Main owns saved settings: the second window never writes the default duration.
+  if (sspIsMainWindow()) {
+    try { localStorage.setItem('ssp_default_dur', g('dsel').value); } catch (_) {}
+  }
   // Casting: leave the photo timer. Ken Burns and the bar take the new duration, even if paused.
   if (window.__sspCastActive) {
     if (!isV(cur)) { startKB(cur); startProg(); }
@@ -6528,7 +6548,10 @@ g('dsel').onchange = () => {
 g('tsel').value = transitionType;
 g('tsel').onchange = function() {
   transitionType = this.value;
-  localStorage.setItem('ssp_transition', transitionType);
+  // Main owns saved settings: the second window never writes the transition.
+  if (sspIsMainWindow()) {
+    try { localStorage.setItem('ssp_transition', transitionType); } catch (_) {}
+  }
 };
 (function initVideoSkipControl() {
   const inp = g('vskip');
@@ -6829,7 +6852,7 @@ function removePlaylistFiles(files, clearLS, byPath) {
   if (!window.SlideXCore || !SlideXCore.removePlaylistMatches) return;
   const plan = SlideXCore.removePlaylistMatches(items, files, cur, !!byPath);
   if (!plan.removed) return;
-  if (clearLS) {
+  if (clearLS && sspIsMainWindow()) {
     (plan.matched || []).forEach(item => {
       [item.id, item.name].filter(Boolean).forEach(key => {
         try { localStorage.removeItem(lsKey(key)); } catch (_) {}
@@ -8501,7 +8524,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function save() {
     if (!sspIsTauri()) return;
     // Main owns the soundtrack. The pane is hidden in the second window by CSS; this makes it a rule.
-    if (!(typeof sspIsMainWindow === 'function' ? sspIsMainWindow() : isMain)) return;
+    if (!sspIsMainWindow()) return;
     try { localStorage.setItem(LS_KEY, C.serializeAudioQueue(q)); } catch (_) {}
   }
   function toast(msg) { try { showToast(msg, 4000); } catch (_) {} }
