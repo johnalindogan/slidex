@@ -1502,8 +1502,8 @@
   }
 
   var CAST_CONNECT_TIMEOUT_MS = 15000;
-  /** 0.1.19 keeps Undock off. The second window is rebuilt in 0.2.0. */
-  var UNDOCK_MAIN_WINDOW = false;
+  /** 0.2.0 brings Undock back: the main window owns the state, the second window is a remote. */
+  var UNDOCK_MAIN_WINDOW = true;
 
   function castFailureMessage(tv) {
     var name = tv ? String(tv) : 'the TV';
@@ -1657,6 +1657,332 @@
 
   function undockControlShown(enabled) {
     return enabled === true;
+  }
+
+  /*
+   * Second window (0.2.0). The main window owns the playlist and playback
+   * state. It sends sw://snapshot {v, state} on open and after every change,
+   * and sw://beat {v} every 2 s. The second window keeps a frozen copy, renders
+   * it, and sends only sw://intent {op, ...}. It never writes state itself.
+   */
+  var SW_EVENTS = {
+    snapshot: 'sw://snapshot',
+    beat: 'sw://beat',
+    hello: 'sw://hello',
+    intent: 'sw://intent',
+    closed: 'sw://closed'
+  };
+  var SW_BEAT_MS = 2000;
+  var SW_LINK_TIMEOUT_MS = 6000;
+  var SW_HELLO_RETRY_MS = 500;
+  var SW_DURATIONS_MS = [3000, 4000, 6000, 8000, 10000, 12000, 20000];
+  var SW_TOOL_IDS = ['pladd', 'plopenfolder', 'plshuffle', 'plnewfolder', 'plsave', 'plload', 'pllocate'];
+  var SW_MAX_IDS = 20000;
+
+  function swId(v) {
+    if (typeof v !== 'string') return null;
+    if (!v || v.length > 200) return null;
+    return v;
+  }
+
+  function swIdList(list, allowEmpty) {
+    if (!Array.isArray(list) || list.length > SW_MAX_IDS) return null;
+    if (!allowEmpty && !list.length) return null;
+    var out = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < list.length; i++) {
+      var id = swId(list[i]);
+      if (id == null || seen[id]) return null;
+      seen[id] = true;
+      out.push(id);
+    }
+    return out;
+  }
+
+  /*
+   * Validate one intent from the second window. Returns a new object holding
+   * only the fields that op needs, or null. Unknown ops and bad fields are null.
+   */
+  function swNormalizeIntent(msg) {
+    if (!msg || typeof msg !== 'object') return null;
+    var op = msg.op;
+    var out = { op: op };
+    switch (op) {
+      case 'goTo': {
+        var id = swId(msg.id);
+        if (id == null) return null;
+        out.id = id;
+        out.clearSelection = msg.clearSelection === true;
+        return out;
+      }
+      case 'select': {
+        var ids = swIdList(msg.ids, true);
+        if (!ids) return null;
+        out.ids = ids;
+        out.lastId = msg.lastId == null ? null : swId(msg.lastId);
+        if (msg.lastId != null && out.lastId == null) return null;
+        return out;
+      }
+      case 'step':
+        if (msg.dir !== 1 && msg.dir !== -1) return null;
+        out.dir = msg.dir;
+        return out;
+      case 'reorder': {
+        var order = swIdList(msg.order, false);
+        if (!order) return null;
+        out.order = order;
+        return out;
+      }
+      case 'remove': {
+        var rm = swIdList(msg.ids, false);
+        if (!rm) return null;
+        out.ids = rm;
+        return out;
+      }
+      case 'toggleFolder': {
+        var fid = swId(msg.id);
+        if (fid == null) return null;
+        out.id = fid;
+        return out;
+      }
+      case 'renameFolder': {
+        var rid = swId(msg.id);
+        var name = typeof msg.name === 'string' ? msg.name.trim() : '';
+        if (rid == null || !name || name.length > 200) return null;
+        out.id = rid;
+        out.name = name;
+        return out;
+      }
+      case 'setDuration': {
+        var did = swId(msg.id);
+        if (did == null || SW_DURATIONS_MS.indexOf(msg.ms) === -1) return null;
+        out.id = did;
+        out.ms = msg.ms;
+        return out;
+      }
+      case 'setKenBurns': {
+        var kid = swId(msg.id);
+        if (kid == null) return null;
+        var preset = msg.preset;
+        if (preset !== 'auto' && !(typeof preset === 'number' && Number.isInteger(preset) && preset >= -1 && preset < 64)) return null;
+        out.id = kid;
+        out.preset = preset;
+        return out;
+      }
+      case 'tool':
+        if (SW_TOOL_IDS.indexOf(msg.id) === -1) return null;
+        out.id = msg.id;
+        return out;
+      case 'togglePlay':
+      case 'dock':
+        return out;
+      default:
+        return null;
+    }
+  }
+
+  /*
+   * A reorder intent carries the new id order. Main applies it only when it is
+   * an exact permutation of the ids it holds now, so a stale or partial order
+   * can never drop, add or duplicate an item. Returns the reordered items or null.
+   */
+  function swApplyOrder(items, order) {
+    var list = items || [];
+    if (!Array.isArray(order) || order.length !== list.length) return null;
+    var byId = Object.create(null);
+    for (var i = 0; i < list.length; i++) {
+      var id = list[i] && list[i].id;
+      if (!id || byId[id]) return null;
+      byId[id] = list[i];
+    }
+    var out = [];
+    var used = Object.create(null);
+    for (var j = 0; j < order.length; j++) {
+      var it = byId[order[j]];
+      if (!it || used[order[j]]) return null;
+      used[order[j]] = true;
+      out.push(it);
+    }
+    var same = out.every(function (x, k) { return x === list[k]; });
+    return same ? null : out;
+  }
+
+  function swIdsToIndices(mediaIds, ids) {
+    var pos = Object.create(null);
+    (mediaIds || []).forEach(function (id, i) { if (id != null && pos[id] == null) pos[id] = i; });
+    var out = [];
+    (ids || []).forEach(function (id) { if (pos[id] != null) out.push(pos[id]); });
+    return out;
+  }
+
+  function swIndicesToIds(mediaIds, indices) {
+    var out = [];
+    var list = mediaIds || [];
+    (indices || []).forEach(function (n) {
+      var id = list[n];
+      if (id != null && out.indexOf(id) === -1) out.push(id);
+    });
+    return out;
+  }
+
+  function swClone(v) {
+    return v == null ? v : JSON.parse(JSON.stringify(v));
+  }
+
+  function swDeepFreeze(v) {
+    if (v && typeof v === 'object' && !Object.isFrozen(v)) {
+      Object.freeze(v);
+      Object.keys(v).forEach(function (k) { swDeepFreeze(v[k]); });
+    }
+    return v;
+  }
+
+  /*
+   * Main side. send(event, payload) emits to the second window. snapshot()
+   * returns the state to send. apply(intent) runs one validated intent on
+   * main's own state and returns true when it changed something.
+   * open(label) takes the window label Rust built or focused. From then on,
+   * hello and intents count only when msg.from is that label; any other
+   * window (an old one still closing) is refused with reason 'stale'. Opened
+   * without a label, the hub refuses everything.
+   */
+  function createSwHub(opts) {
+    var o = opts || {};
+    var hub = { open: false, v: 0, from: null };
+    // Fail closed: with no label from Rust, no window is the live one.
+    function fromOk(msg) { return hub.from != null && msg.from === hub.from; }
+    function send(ev, payload) { if (typeof o.send === 'function') o.send(ev, payload); }
+    function sendSnapshot() {
+      if (!hub.open) return null;
+      hub.v += 1;
+      var payload = { v: hub.v, origin: 'main', state: swClone(o.snapshot ? o.snapshot() : null) };
+      send(SW_EVENTS.snapshot, payload);
+      return payload;
+    }
+    return {
+      get isOpen() { return hub.open; },
+      get version() { return hub.v; },
+      get label() { return hub.from; },
+      open: function (label) {
+        hub.open = true;
+        hub.from = typeof label === 'string' && label ? label : null;
+        return sendSnapshot();
+      },
+      close: function () { hub.open = false; },
+      changed: function () { return sendSnapshot(); },
+      beat: function () {
+        if (!hub.open) return null;
+        var payload = { v: hub.v, origin: 'main' };
+        send(SW_EVENTS.beat, payload);
+        return payload;
+      },
+      onHello: function (msg) {
+        if (!hub.open || !msg || msg.origin !== 'playlist' || !fromOk(msg)) return null;
+        return sendSnapshot();
+      },
+      onIntent: function (msg) {
+        if (!hub.open) return { ok: false, reason: 'closed' };
+        if (!msg || msg.origin !== 'playlist') return { ok: false, reason: 'origin' };
+        // Not the live window: do not touch state, and do not answer it.
+        if (!fromOk(msg)) return { ok: false, reason: 'stale' };
+        var intent = swNormalizeIntent(msg);
+        if (!intent) {
+          sendSnapshot();
+          return { ok: false, reason: 'invalid' };
+        }
+        var changed = false;
+        try { changed = typeof o.apply === 'function' ? o.apply(intent) === true : false; } catch (e) { changed = false; }
+        // Always answer with main's truth, so a refused intent snaps the window back.
+        if (hub.open) sendSnapshot();
+        return { ok: changed, reason: changed ? '' : 'refused', op: intent.op };
+      }
+    };
+  }
+
+  /*
+   * Second-window side. It holds a frozen copy of the last snapshot and the
+   * link state: 'opening' until the first snapshot, 'linked', or 'unlinked'
+   * after SW_LINK_TIMEOUT_MS without a snapshot or beat. Intents are refused
+   * unless linked, except Dock back.
+   */
+  function createSwChild(opts) {
+    var o = opts || {};
+    var now = typeof o.now === 'function' ? o.now : function () { return Date.now(); };
+    var st = { v: 0, state: null, lastHeard: 0, openedAt: now(), link: 'opening' };
+    function send(ev, payload) { if (typeof o.send === 'function') o.send(ev, payload); }
+    function linkAt(t) {
+      if (!st.state) return (t - st.openedAt) > SW_LINK_TIMEOUT_MS ? 'unlinked' : 'opening';
+      return (t - st.lastHeard) > SW_LINK_TIMEOUT_MS ? 'unlinked' : 'linked';
+    }
+    var from = typeof o.from === 'string' && o.from ? o.from : null;
+    function hello() {
+      var payload = { origin: 'playlist', v: st.v };
+      if (from) payload.from = from;
+      send(SW_EVENTS.hello, payload);
+      return payload;
+    }
+    return {
+      get state() { return st.state; },
+      get version() { return st.v; },
+      get link() { return st.link; },
+      lastHeardAgo: function () { return st.lastHeard ? now() - st.lastHeard : null; },
+      hello: hello,
+      onSnapshot: function (msg) {
+        if (!msg || msg.origin !== 'main' || typeof msg.v !== 'number' || !msg.state || typeof msg.state !== 'object') return false;
+        st.lastHeard = now();
+        if (st.state && msg.v <= st.v) { st.link = 'linked'; return false; }
+        st.v = msg.v;
+        st.state = swDeepFreeze(swClone(msg.state));
+        st.link = 'linked';
+        return true;
+      },
+      onBeat: function (msg) {
+        if (!msg || msg.origin !== 'main' || typeof msg.v !== 'number') return false;
+        if (!st.state) { hello(); return false; }
+        st.lastHeard = now();
+        st.link = 'linked';
+        if (msg.v > st.v) { hello(); return true; }
+        return false;
+      },
+      tick: function () {
+        var next = linkAt(now());
+        var changed = next !== st.link;
+        st.link = next;
+        return changed;
+      },
+      intent: function (op, args) {
+        var msg = { op: op };
+        if (args && typeof args === 'object') Object.keys(args).forEach(function (k) { if (k !== 'op') msg[k] = args[k]; });
+        var intent = swNormalizeIntent(msg);
+        if (!intent) return false;
+        st.link = linkAt(now());
+        if (st.link !== 'linked' && intent.op !== 'dock') return false;
+        intent.origin = 'playlist';
+        if (from) intent.from = from;
+        intent.baseV = st.v;
+        send(SW_EVENTS.intent, intent);
+        return true;
+      }
+    };
+  }
+
+  /* Ctrl+Shift+U opens the second window from main and docks it back from either window. */
+  function isDockToggleKey(e) {
+    if (!e || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return false;
+    return e.code === 'KeyU' || String(e.key || '').toLowerCase() === 'u';
+  }
+
+  /* Text for the second window's link chip and banner. */
+  function swLinkText(link, agoMs) {
+    if (link === 'linked') return { chip: 'Linked to main window', banner: '' };
+    if (link === 'opening') return { chip: 'Connecting to main window…', banner: '' };
+    var secs = agoMs == null ? null : Math.max(0, Math.round(agoMs / 1000));
+    var ago = secs == null ? 'No update yet' : (secs < 60 ? 'Last update ' + secs + ' s ago' : 'Last update ' + Math.round(secs / 60) + ' min ago');
+    return {
+      chip: 'Not linked',
+      ago: ago,
+      banner: 'Lost the link to the main window. This is the last copy it sent. Editing is paused so nothing gets out of step. Reconnect, or dock back to continue.'
+    };
   }
 
   var DRIVE_REMOVABLE = 2;
@@ -2223,6 +2549,19 @@
     castConnectStepTexts: castConnectStepTexts,
     castConnectStepMarks: castConnectStepMarks,
     undockControlShown: undockControlShown,
+    SW_EVENTS: SW_EVENTS,
+    SW_BEAT_MS: SW_BEAT_MS,
+    SW_LINK_TIMEOUT_MS: SW_LINK_TIMEOUT_MS,
+    SW_HELLO_RETRY_MS: SW_HELLO_RETRY_MS,
+    SW_TOOL_IDS: SW_TOOL_IDS,
+    swNormalizeIntent: swNormalizeIntent,
+    swApplyOrder: swApplyOrder,
+    swIdsToIndices: swIdsToIndices,
+    swIndicesToIds: swIndicesToIds,
+    createSwHub: createSwHub,
+    createSwChild: createSwChild,
+    isDockToggleKey: isDockToggleKey,
+    swLinkText: swLinkText,
     DRIVE_FIXED: DRIVE_FIXED,
     DRIVE_REMOVABLE: DRIVE_REMOVABLE,
     DRIVE_REMOTE: DRIVE_REMOTE,
