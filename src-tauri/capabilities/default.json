@@ -4,13 +4,20 @@
   "description": "Default capabilities for SlideShowPro desktop wrapper",
   "windows": [
     "main",
-    "playlist"
+    "playlist",
+    "playlist-2",
+    "playlist-3",
+    "playlist-4",
+    "playlist-5",
+    "playlist-6",
+    "playlist-7",
+    "playlist-8",
+    "playlist-9"
   ],
   "permissions": [
     "core:default",
     "core:event:default",
     "core:window:default",
-    "core:webview:allow-create-webview-window",
     "core:path:default",
     "core:app:default",
     "dialog:default",

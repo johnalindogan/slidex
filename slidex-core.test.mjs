@@ -648,6 +648,8 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   const sandbox = {
     console,
     SlideXCore: C,
+    SSP_IS_PLAYLIST_WINDOW: false,
+    sspIsMainWindow() { return !sandbox.SSP_IS_PLAYLIST_WINDOW; },
     cur: 0,
     playing: true,
     tmr: null,
@@ -1133,6 +1135,34 @@ test('cancel leaves shortcuts, playlists, and locate paths unchanged', () => {
   assert.equal(C.missingFilesNotice(0), '');
 });
 
+test('one Settings modal holds Ken Burns, shortcuts and Image Updates; no other settings modals', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const markup = html.slice(0, html.indexOf('<script'));
+  /* Exactly one settings dialog, with the three sections inside it. */
+  assert.equal((markup.match(/id="settings"/g) || []).length, 1);
+  const box = markup.slice(markup.indexOf('id="settings"'), markup.indexOf('<!-- Context menu -->'));
+  for (const id of ['setPane-kb', 'setPane-keys', 'setPane-adv', 'kbbody', 'kedbody', 'kedlist', 'kbslidelist', 'setImgUpd']) {
+    assert.ok(box.includes('id="' + id + '"'), id + ' is inside #settings');
+  }
+  /* The old separate modals and their own Close buttons are gone. */
+  for (const id of ['kbmodal', 'keditor', 'kbclose', 'kedclose', 'lbupdates-link']) {
+    assert.ok(!markup.includes('id="' + id + '"'), id + ' is not a separate surface');
+    assert.ok(!html.includes("g('" + id + "')"), id + ' is not wired');
+  }
+  /* Every way in opens the same modal. */
+  assert.match(html, /g\('bkb'\)\.onclick = toggleKBModal;/);
+  assert.match(html, /function toggleKBModal\(\) \{[^\n]*openSettings\('kb'\)/);
+  assert.match(html, /function toggleKeyEditor\(force\) \{[\s\S]{0,200}openSettings\('keys'\)/);
+  assert.match(html, /g\('bsettings'\)\.onclick = /);
+  assert.match(html, /g\('lbsettings'\)\.onclick = \(e\) => \{ e\.preventDefault\(\); openSettings\(\); \};/);
+  assert.match(html, /g\('setImgUpd'\)\.onclick = \(\) => openImageUpdatesPicker\(\);/);
+  /* Ctrl+, toggles it and Esc closes it. */
+  assert.match(html, /\(e\.ctrlKey \|\| e\.metaKey\) && !e\.altKey && !e\.shiftKey && e\.key === ','\)/);
+  assert.match(html, /if \(settingsOpen\(\)\) \{ closeSettings\(\); return; \}/);
+  /* The undocked Media Manager window still hides it. */
+  assert.match(html, /body\.ssp-playlist-window #settings,/);
+});
+
 test('HTML and JS have no bare confirm() and the four prompts await a dialog', () => {
   const bare = /(?<![\w$.])confirm\s*\(/;
   ['./SlideShowPro.html', './slidex-core.js', './demo/SlideShowPro.html'].forEach(rel => {
@@ -1538,6 +1568,7 @@ test('a photo timer then a video FINISHED leaves cur on item 3', () => {
     notifyPlaylistSync() {},
     playCurVid() {},
     startVProg() {},
+    SSP_IS_PLAYLIST_WINDOW: false,
     window: { __sspCastActive: true },
   };
   vm.runInNewContext(`
@@ -2267,24 +2298,377 @@ test('cast connect shows the three steps, then timeout, cancel, and retry reset 
   assert.equal(C.castFailureMessage('Living Room TV'), failed.message);
 });
 
-test('the Undock button stays in the code and is not shown in 0.1.19', () => {
-  assert.equal(C.UNDOCK_MAIN_WINDOW, false);
+const swIds = (list) => Array.from(list, it => it.id);
+
+test('Undock is back in 0.2.0 as "Open in window", behind one flag on each side', () => {
+  assert.equal(C.UNDOCK_MAIN_WINDOW, true);
   assert.equal(C.undockControlShown(false), false);
   assert.equal(C.undockControlShown(true), true);
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
-  assert.match(html, /id="plundock"/);
-  assert.match(html, /const SSP_UNDOCK_ENABLED = false/);
+  assert.match(html, /<button id="plundock" title="Open in window \(Ctrl\+Shift\+U\)">Open in window<\/button>/);
+  assert.match(html, /const SSP_UNDOCK_ENABLED = true;/);
   assert.match(html, /if \(SSP_UNDOCK_ENABLED\) document\.body\.classList\.add\('ssp-undock-enabled'\)/);
   assert.match(html, /body\.ssp-tauri\.ssp-undock-enabled #plundock/);
-  assert.doesNotMatch(html, /body\.ssp-tauri #plundock \{/);
-  const undockFn = html.slice(html.indexOf('async function undockPlaylistWindow'), html.indexOf('let _plCloseBound'));
+  const undockFn = html.slice(html.indexOf('async function undockPlaylistWindow'), html.indexOf('function swRedockMain'));
   assert.match(undockFn, /if \(!SSP_UNDOCK_ENABLED\) return/);
-  assert.match(html, /function undockPlaylistWindow/);
-  assert.match(html, /open_playlist_window/);
+  assert.match(undockFn, /open_playlist_window/);
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  assert.match(lib, /const UNDOCK_MAIN_WINDOW: bool = true;/);
   const open = lib.slice(lib.indexOf('fn open_playlist_window') - 40, lib.indexOf('fn close_playlist_window'));
   assert.match(open, /undock_blocked_reason/);
-  assert.match(lib, /Undock is off in 0\.1\.19/);
+});
+
+test('second-window intents are allow-listed and keep only the fields each op needs', () => {
+  const N = C.swNormalizeIntent;
+  assert.equal(N(null), null);
+  assert.equal(N({ op: 'setItems', items: [] }), null, 'no op can hand main a whole list');
+  assert.equal(N({ op: 'eval', code: '1' }), null);
+  assert.deepEqual({ ...N({ op: 'goTo', id: 'a', extra: 1 }) }, { op: 'goTo', id: 'a', clearSelection: false });
+  assert.equal(N({ op: 'goTo', id: 3 }), null);
+  assert.deepEqual({ ...N({ op: 'step', dir: -1 }) }, { op: 'step', dir: -1 });
+  assert.equal(N({ op: 'step', dir: 5 }), null);
+  assert.deepEqual(Array.from(N({ op: 'reorder', order: ['b', 'a'] }).order), ['b', 'a']);
+  assert.equal(N({ op: 'reorder', order: ['a', 'a'] }), null, 'duplicate ids');
+  assert.equal(N({ op: 'reorder', order: [] }), null);
+  assert.equal(N({ op: 'remove', ids: [] }), null);
+  assert.deepEqual(Array.from(N({ op: 'select', ids: [] }).ids), []);
+  assert.equal(N({ op: 'select', ids: ['a'], lastId: 7 }), null);
+  assert.equal(N({ op: 'renameFolder', id: 'f', name: '   ' }), null);
+  assert.equal(N({ op: 'renameFolder', id: 'f', name: ' Day 1 ' }).name, 'Day 1');
+  assert.equal(N({ op: 'setDuration', id: 'a', ms: 7000 }), null, 'only the durations the menu offers');
+  assert.equal(N({ op: 'setDuration', id: 'a', ms: 6000 }).ms, 6000);
+  assert.equal(N({ op: 'setKenBurns', id: 'a', preset: 'auto' }).preset, 'auto');
+  assert.equal(N({ op: 'setKenBurns', id: 'a', preset: 2.5 }), null);
+  assert.equal(N({ op: 'tool', id: 'plshuffle' }).id, 'plshuffle');
+  assert.equal(N({ op: 'tool', id: 'bru' }), null, 'only Media Manager toolbar buttons');
+  assert.equal(N({ op: 'tool', id: 'ctx-del' }), null, 'never the Recycle Bin');
+  assert.deepEqual({ ...N({ op: 'dock', origin: 'x' }) }, { op: 'dock' });
+});
+
+test('the second window keeps a frozen copy and never sends state back', () => {
+  const sent = [];
+  let t = 1000;
+  const child = C.createSwChild({ send: (ev, p) => sent.push([ev, p]), now: () => t });
+  assert.equal(child.link, 'opening');
+  assert.equal(child.intent('goTo', { id: 'a' }), false, 'no edits before the first snapshot');
+  child.hello();
+  assert.equal(child.onSnapshot({ v: 3, origin: 'main', state: { items: [{ id: 'a' }, { id: 'b' }], curId: 'a' } }), true);
+  assert.equal(child.link, 'linked');
+  const st = child.state;
+  assert.ok(Object.isFrozen(st) && Object.isFrozen(st.items) && Object.isFrozen(st.items[0]));
+  assert.throws(() => { st.items.push({ id: 'z' }); }, /not extensible/);
+  assert.throws(() => { st.items[0].id = 'z'; }, /read only/);
+  assert.throws(() => { st.curId = 'b'; }, /read only/);
+  assert.equal(child.state.items.length, 2);
+  // Older, equal or foreign snapshots never replace the copy.
+  assert.equal(child.onSnapshot({ v: 2, origin: 'main', state: { items: [] } }), false);
+  assert.equal(child.onSnapshot({ v: 9, origin: 'playlist', state: { items: [] } }), false);
+  assert.equal(child.state.items.length, 2);
+  assert.equal(child.intent('reorder', { order: ['b', 'a'] }), true);
+  assert.equal(child.intent('setItems', { items: [] }), false);
+  assert.equal(child.state.items[0].id, 'a', 'sending an intent does not touch the copy');
+  const kinds = sent.map(([ev]) => ev);
+  assert.ok(kinds.every(ev => ev === C.SW_EVENTS.hello || ev === C.SW_EVENTS.intent), kinds.join(','));
+  const intent = sent.find(([ev]) => ev === C.SW_EVENTS.intent)[1];
+  assert.equal(intent.origin, 'playlist');
+  assert.equal(intent.baseV, 3);
+  assert.deepEqual(Array.from(intent.order), ['b', 'a']);
+});
+
+test('main applies an intent on its own state and then broadcasts a new snapshot', () => {
+  const sent = [];
+  const model = { items: [{ id: 'a' }, { id: 'b' }, { id: 'c' }], cur: 0 };
+  const applied = [];
+  const hub = C.createSwHub({
+    send: (ev, p) => sent.push([ev, p]),
+    snapshot: () => ({ items: model.items.map(it => ({ id: it.id })), curId: model.items[model.cur].id }),
+    apply: (intent) => {
+      applied.push(intent.op);
+      if (intent.op === 'reorder') {
+        const next = C.swApplyOrder(model.items, intent.order);
+        if (!next) return false;
+        model.items = next;
+        return true;
+      }
+      if (intent.op === 'goTo') { model.cur = model.items.findIndex(it => it.id === intent.id); return true; }
+      if (intent.op === 'togglePlay') throw new Error('boom');
+      return false;
+    }
+  });
+  assert.equal(hub.onIntent({ op: 'goTo', id: 'b', origin: 'playlist', from: 'playlist' }).reason, 'closed', 'nothing before open');
+  assert.equal(sent.length, 0);
+  const first = hub.open('playlist');
+  assert.equal(first.v, 1);
+  assert.equal(sent[0][0], C.SW_EVENTS.snapshot);
+  const r = hub.onIntent({ op: 'reorder', order: ['c', 'a', 'b'], origin: 'playlist', from: 'playlist' });
+  assert.equal(r.ok, true);
+  assert.deepEqual(swIds(model.items), ['c', 'a', 'b']);
+  const snap = sent[sent.length - 1];
+  assert.equal(snap[0], C.SW_EVENTS.snapshot);
+  assert.equal(snap[1].v, 2);
+  assert.deepEqual(swIds(snap[1].state.items), ['c', 'a', 'b']);
+  // A stale order (an item main no longer has) is refused, and main resends its truth.
+  const before = sent.length;
+  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'x'], origin: 'playlist', from: 'playlist' }).ok, false);
+  assert.deepEqual(swIds(model.items), ['c', 'a', 'b']);
+  assert.equal(sent.length, before + 1);
+  assert.equal(sent[sent.length - 1][1].v, 3);
+  // Invalid ops never reach apply; intents from main itself are ignored.
+  const nApplied = applied.length;
+  assert.equal(hub.onIntent({ op: 'setItems', items: [], origin: 'playlist', from: 'playlist' }).reason, 'invalid');
+  assert.equal(hub.onIntent({ op: 'goTo', id: 'a', origin: 'main' }).reason, 'origin');
+  assert.equal(applied.length, nApplied);
+  // An apply that throws changes nothing and still answers with a snapshot.
+  const n2 = sent.length;
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, false);
+  assert.equal(sent.length, n2 + 1);
+  assert.equal(hub.beat().v, hub.version);
+});
+
+test('a reorder from the second window applies only as an exact permutation of main\'s items', () => {
+  const a = { id: 'a' }, b = { id: 'b' }, c = { id: 'c' };
+  const items = [a, b, c];
+  const next = C.swApplyOrder(items, ['c', 'a', 'b']);
+  assert.equal(next.length, 3);
+  assert.ok(next[0] === c && next[1] === a && next[2] === b, 'same objects, so per-slide settings travel with them');
+  assert.deepEqual(items, [a, b, c], 'input untouched');
+  assert.equal(C.swApplyOrder(items, ['a', 'b', 'c']), null, 'no move');
+  assert.equal(C.swApplyOrder(items, ['a', 'b']), null, 'missing item');
+  assert.equal(C.swApplyOrder(items, ['a', 'b', 'c', 'd']), null, 'extra item');
+  assert.equal(C.swApplyOrder(items, ['a', 'a', 'b']), null, 'duplicate');
+  assert.equal(C.swApplyOrder([{ id: 'a' }, {}], ['a', 'x']), null, 'main item without id');
+  assert.deepEqual(Array.from(C.swIdsToIndices(['a', 'b', 'c'], ['c', 'x', 'a'])), [2, 0]);
+  assert.deepEqual(Array.from(C.swIndicesToIds(['a', 'b', 'c'], [2, 9, 0, 2])), ['c', 'a']);
+});
+
+test('the link drops after 6 s without word from main, and edits pause until it is back', () => {
+  const sent = [];
+  let t = 0;
+  const child = C.createSwChild({ send: (ev, p) => sent.push([ev, p]), now: () => t });
+  t = 7000;
+  child.tick();
+  assert.equal(child.link, 'unlinked', 'never stuck on Connecting');
+  assert.equal(C.swLinkText('opening').chip, 'Connecting to main window…');
+  child.onSnapshot({ v: 1, origin: 'main', state: { items: [{ id: 'a' }] } });
+  assert.equal(child.link, 'linked');
+  t += C.SW_BEAT_MS;
+  child.onBeat({ v: 1, origin: 'main' });
+  t += C.SW_LINK_TIMEOUT_MS - 1;
+  assert.equal(child.tick(), false);
+  assert.equal(child.link, 'linked');
+  t += 2;
+  assert.equal(child.tick(), true);
+  assert.equal(child.link, 'unlinked');
+  const text = C.swLinkText('unlinked', child.lastHeardAgo());
+  assert.equal(text.chip, 'Not linked');
+  assert.match(text.banner, /Editing is paused/);
+  const n = sent.length;
+  assert.equal(child.intent('remove', { ids: ['a'] }), false);
+  assert.equal(child.intent('dock'), true, 'Dock back still works');
+  assert.equal(sent.length, n + 1);
+  // A beat with a newer version brings the link back and asks for the snapshot it missed.
+  t += 1;
+  assert.equal(child.onBeat({ v: 4, origin: 'main' }), true);
+  assert.equal(child.link, 'linked');
+  assert.equal(sent[sent.length - 1][0], C.SW_EVENTS.hello);
+  assert.equal(child.intent('remove', { ids: ['a'] }), true);
+});
+
+test('closing and reopening the second window is safe and never loses main\'s order', () => {
+  const toChild = [];
+  const toMain = [];
+  const model = { items: ['a', 'b', 'c'].map(id => ({ id })), cur: 0 };
+  const hub = C.createSwHub({
+    send: (ev, p) => toChild.push([ev, p]),
+    snapshot: () => ({ items: model.items.map(it => ({ id: it.id })), curId: model.items[model.cur].id }),
+    apply: (intent) => {
+      if (intent.op === 'reorder') {
+        const next = C.swApplyOrder(model.items, intent.order);
+        if (!next) return false;
+        model.items = next;
+        return true;
+      }
+      if (intent.op === 'dock') { hub.close(); return true; }
+      return false;
+    }
+  });
+  const deliver = (child) => {
+    while (toChild.length) {
+      const [ev, p] = toChild.shift();
+      if (ev === C.SW_EVENTS.snapshot) child.onSnapshot(p);
+      if (ev === C.SW_EVENTS.beat) child.onBeat(p);
+    }
+  };
+  const pump = () => {
+    while (toMain.length) {
+      const [ev, p] = toMain.shift();
+      if (ev === C.SW_EVENTS.hello) hub.onHello(p);
+      if (ev === C.SW_EVENTS.intent) hub.onIntent(p);
+    }
+  };
+  // Open: main's first snapshot is lost because the window is not listening yet.
+  hub.open('playlist');
+  toChild.length = 0;
+  const child1 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]), from: 'playlist' });
+  child1.hello(); pump(); deliver(child1);
+  assert.deepEqual(swIds(child1.state.items), ['a', 'b', 'c'], 'hello fixes the create race');
+  child1.intent('reorder', { order: ['c', 'b', 'a'] }); pump(); deliver(child1);
+  assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
+  assert.deepEqual(swIds(child1.state.items), ['c', 'b', 'a']);
+  // Dock back: main keeps its order; nothing has to be flushed from the window.
+  child1.intent('dock'); pump();
+  assert.equal(hub.isOpen, false);
+  assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
+  const vAtClose = hub.version;
+  // Late messages from the closed window change nothing and get no answer.
+  toChild.length = 0;
+  assert.equal(hub.onIntent({ op: 'reorder', order: ['a', 'b', 'c'], origin: 'playlist', from: 'playlist' }).reason, 'closed');
+  assert.equal(hub.onHello({ origin: 'playlist', from: 'playlist', v: 0 }), null);
+  assert.equal(hub.beat(), null);
+  assert.equal(toChild.length, 0);
+  assert.deepEqual(swIds(model.items), ['c', 'b', 'a']);
+  // Reopen: a fresh window gets main's current order, with a higher version.
+  const again = hub.open('playlist');
+  assert.ok(again.v > vAtClose);
+  const child2 = C.createSwChild({ send: (ev, p) => toMain.push([ev, p]), from: 'playlist' });
+  deliver(child2);
+  assert.deepEqual(swIds(child2.state.items), ['c', 'b', 'a']);
+  // Opening twice in a row only re-sends the snapshot.
+  hub.open('playlist'); deliver(child2);
+  assert.deepEqual(swIds(child2.state.items), ['c', 'b', 'a']);
+});
+
+test('page code in the second window asks main instead of writing items, selection or playback', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const fn = (start, end) => {
+    const at = html.indexOf(start);
+    assert.ok(at !== -1, start);
+    return html.slice(at, html.indexOf(end, at));
+  };
+  const src = [
+    fn('function removeItem(itemsIdx, clearLS)', '/* ── Context menu ── */'),
+    fn('function shufflePlaylist()', '/* ── Slide DOM'),
+    fn('function applyReorderResult(result)', '/** Map pointer Y inside #pllist'),
+    fn('function goTo(i, source)', '  clearTimeout(tmr); clearInterval(ptmr);\n  if (kbId)') + '}',
+    fn('function togglePlay()', '  playing = !playing; updPlayBtn();') + '}',
+    fn('function swChildGoToIndex(i)', 'function swRenderBar()'),
+    fn('function saveSessionBeforeExit(ack)', 'function autoSave()'),
+  ].join('\n');
+  const intents = [];
+  const writes = [];
+  const store = {
+    getItem: () => null,
+    setItem: (k) => writes.push(k),
+    removeItem: (k) => writes.push(k)
+  };
+  const startItems = [{ id: 'a', type: 'image' }, { id: 'b', type: 'image' }, { id: 'c', type: 'image' }];
+  const sandbox = {
+    SSP_IS_PLAYLIST_WINDOW: true,
+    sspIsMainWindow() { return !sandbox.SSP_IS_PLAYLIST_WINDOW; },
+    items: startItems.slice(),
+    cur: 1,
+    playing: true,
+    selectedItems: new Set([0]),
+    autoSaveTimer: null,
+    localStorage: store,
+    clearTimeout() {},
+    getMediaItems() { return sandbox.items.filter(it => it.type !== 'folder'); },
+    swChildIntent(op, args) { intents.push([op, args]); return true; },
+    getPlaylistSnapshot() { writes.push('snapshot'); return { items: [] }; },
+    rebuildSlides() { writes.push('rebuild'); },
+    updPlayBtn() { writes.push('playbtn'); },
+    lsKey: (k) => k,
+    g: () => null,
+  };
+  vm.runInNewContext(src + '\nthis.api = { removeItem, shufflePlaylist, applyReorderResult, goTo, togglePlay, saveSessionBeforeExit };', sandbox);
+  const api = sandbox.api;
+  api.removeItem(0, true);
+  api.shufflePlaylist();
+  api.applyReorderResult({ moved: true, items: [startItems[2], startItems[0], startItems[1]] });
+  api.goTo(4);
+  api.togglePlay();
+  api.saveSessionBeforeExit(() => writes.push('ack'));
+  assert.deepEqual(swIds(sandbox.items), ['a', 'b', 'c'], 'items untouched');
+  assert.equal(sandbox.cur, 1);
+  assert.equal(sandbox.playing, true);
+  assert.deepEqual(Array.from(sandbox.selectedItems), [0]);
+  assert.deepEqual(writes, [], 'no rebuild, no localStorage, no premature exit ack');
+  assert.deepEqual(intents.map(([op]) => op), ['remove', 'tool', 'reorder', 'goTo', 'togglePlay']);
+  assert.deepEqual(Array.from(intents[0][1].ids), ['a']);
+  assert.equal(intents[1][1].id, 'plshuffle');
+  assert.deepEqual(Array.from(intents[2][1].order), ['c', 'a', 'b']);
+  assert.equal(intents[3][1].id, 'b', 'goTo(4) wraps to the 2nd item by id');
+});
+
+test('Ctrl+Shift+U opens the second window and docks it back', () => {
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: true, key: 'U', code: 'KeyU' }), true);
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: true, key: 'u' }), true);
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: false, key: 'u' }), false);
+  assert.equal(C.isDockToggleKey({ ctrlKey: true, shiftKey: true, altKey: true, key: 'U' }), false);
+  assert.equal(C.isDockToggleKey({ shiftKey: true, key: 'U' }), false);
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const keydown = html.slice(html.indexOf('/* Ctrl+Shift+U: open the Media Manager'), html.indexOf('/* Escape: close shortcut editor'));
+  assert.match(keydown, /SlideXCore\.isDockToggleKey\(e\)/);
+  assert.match(keydown, /if \(SSP_IS_PLAYLIST_WINDOW \|\| playlistUndocked\) dockPlaylistWindow\(\);/);
+  assert.match(keydown, /else if \(SSP_UNDOCK_ENABLED\) undockPlaylistWindow\(\);/);
+});
+
+test('in the page, the second window only sends intents and main owns every write', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const body = (name) => {
+    const at = html.indexOf(name);
+    assert.ok(at !== -1, name);
+    return html.slice(at, at + 400);
+  };
+  // The old two-way sync is gone: no window pushes whole playlists at the other.
+  assert.doesNotMatch(html, /ssp-pl-sync|ssp-pl-dock|ssp-pl-ack|ssp-playlist-sync|applyLiveSync/);
+  assert.match(body('function notifyPlaylistSync()'), /if \(SSP_IS_PLAYLIST_WINDOW\) return;/);
+  const save = html.slice(html.indexOf('function saveSessionBeforeExit(ack)'), html.indexOf('function autoSave()'));
+  assert.ok(save.indexOf('if (!sspIsMainWindow()) return;') !== -1);
+  assert.ok(save.indexOf('if (!sspIsMainWindow()) return;') < save.indexOf('getPlaylistSnapshot()'), 'returns before reading or writing the session');
+  assert.match(body('function goTo(i, source)'), /^function goTo\(i, source\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildGoToIndex\(i\); return; \}/);
+  assert.match(body('function togglePlay()'), /^function togglePlay\(\) \{\n  if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('togglePlay'\); return; \}/);
+  assert.match(body('function shufflePlaylist()'), /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('tool', \{ id: 'plshuffle' \}\); return; \}/);
+  const rmAt = html.indexOf('function removeItem(itemsIdx, clearLS)');
+  const rm = html.slice(rmAt, rmAt + 700);
+  assert.ok(rm.indexOf("swChildIntent('remove'") < rm.indexOf('items.splice'), 'remove asks main before any splice');
+  const ro = body('function applyReorderResult(result)');
+  assert.ok(ro.indexOf("swChildIntent('reorder'") < ro.indexOf('items = result.items'), 'reorder asks main before any write');
+  // Folder rename, delete and open, plus per-slide duration and Ken Burns, go to main.
+  for (const op of ['renameFolder', 'toggleFolder', 'setDuration', 'setKenBurns', 'select']) {
+    assert.match(html, new RegExp("swChildIntent\\('" + op + "'"), op);
+  }
+  // Toolbar buttons are run by main, so pickers and prompts act on main's state.
+  const shell = body('function enterPlaylistWindowShell()') + html.slice(html.indexOf('function enterPlaylistWindowShell()'), html.indexOf('function initPlaylistWindowSync()'));
+  assert.match(shell, /SW_TOOL_IDS\.includes\(b\.id\)[\s\S]*stopImmediatePropagation\(\)[\s\S]*swChildIntent\('tool'/);
+  assert.match(shell, /swChild\.hello\(\)/);
+  // Keys in the second window become intents; stage keys never run there.
+  assert.match(html, /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildKey\(e\); return; \}/);
+  // Wiring: main answers hello/intent and re-docks on sw://closed; the window listens to snapshot/beat.
+  const init = html.slice(html.indexOf('function initPlaylistWindowSync()'), html.indexOf('/* ── Android TV SAF bridge'));
+  assert.match(init, /listen\(E\.snapshot/);
+  assert.match(init, /listen\(E\.beat/);
+  assert.match(init, /listen\(E\.hello, \(event\) => \{ if \(swHub\) swHub\.onHello/);
+  assert.match(init, /listen\(E\.intent, \(event\) => \{ if \(swHub\) swHub\.onIntent/);
+  assert.match(init, /listen\(E\.closed, \(\) => swOnChildClosed\(\)\)/);
+  // Black window: #media-dock sits inside #viewer, so the second window must not hide #viewer.
+  const hideList = html.slice(html.indexOf('body.ssp-playlist-window #dz,'), html.indexOf('display: none !important;', html.indexOf('body.ssp-playlist-window #dz,')));
+  assert.doesNotMatch(hideList, /#viewer/);
+  assert.match(html, /body\.ssp-playlist-window #viewer > :not\(#media-dock\) \{\n  display: none !important;/);
+  assert.doesNotMatch(shell, /viewer\.style\.display/);
+  assert.match(html, /<div id="viewer"[\s\S]*<div id="media-dock"/);
+  // Second-window chrome from the 0.2.0 design.
+  for (const id of ['swBar', 'swStatus', 'swDock', 'swReconnect', 'swBanner', 'swSkeleton']) assert.match(html, new RegExp('id="' + id + '"'), id);
+  assert.match(html, /Media Manager is back here\. Order and selection kept\./);
+  // Rust: destroy (no half-closed window to refocus) and tell main when the window is gone.
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  const host = lib.slice(lib.indexOf('impl second_window::WindowHost for TauriWindowHost'), lib.indexOf('fn build_playlist_window'));
+  assert.match(host, /w\.destroy\(\)/);
+  assert.doesNotMatch(host, /w\.close\(\)/);
+  // The adapter's emit_closed is the one line Rust tests cannot reach.
+  assert.match(host, /fn emit_closed\(&self\) \{\s*let _ = self\.0\.emit_to\(MAIN_WINDOW_LABEL, SECOND_WINDOW_CLOSED_EVENT, \(\)\);\s*\}/);
+  assert.match(lib, /const SECOND_WINDOW_CLOSED_EVENT: &str = "sw:\/\/closed";/);
+  assert.match(lib, /is_second_window_label\(window\.label\(\)\)[\s\S]{0,120}WindowEvent::Destroyed[\s\S]{0,1200}emit_to\("main", SECOND_WINDOW_CLOSED_EVENT/);
 });
 
 test('emptying the playlist forgets the saved session so Continue is not offered', () => {
@@ -2385,4 +2769,2219 @@ test('the soundtrack follows slideshow play and pause, local files only', () => 
   const conf = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.equal(conf.app.security.assetProtocol.enable, true);
   assert.ok(conf.app.security.assetProtocol.scope.includes('**'), 'asset scope must cover local music paths');
+});
+
+
+// ---- 0.2.0: second window never writes saved settings ----
+
+function swNoWriteHtml() {
+  return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+}
+function swNoWriteCore() {
+  return fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+}
+function swSlice(src, startMarker, endMarker) {
+  const start = src.indexOf(startMarker);
+  assert.ok(start !== -1, 'found ' + startMarker);
+  const end = endMarker == null ? src.length : src.indexOf(endMarker, start + startMarker.length);
+  assert.ok(end > start, 'found end ' + endMarker);
+  return src.slice(start, end);
+}
+function swIsMainSrc(html) {
+  return swSlice(html, 'function sspIsMainWindow()', '\n/** 0.2.0: Undock') + '\n';
+}
+
+/**
+ * Blank comments, strings, template literals and regex literals to spaces
+ * (same length) so a `}` or `{` inside them cannot throw off brace counting.
+ */
+const swBlankCache = new WeakMap();
+const swBlankCacheByStr = new Map();
+function swBlankLiterals(src) {
+  if (typeof src === 'string' && swBlankCacheByStr.has(src)) return swBlankCacheByStr.get(src);
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  const space = (from, to) => ' '.repeat(Math.max(0, to - from));
+  while (i < n) {
+    const c = src[i];
+    const c2 = src[i + 1];
+    if (c === '/' && c2 === '/') {
+      let j = i + 2;
+      while (j < n && src[j] !== '\n') j++;
+      out += space(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '/' && c2 === '*') {
+      let j = i + 2;
+      while (j + 1 < n && !(src[j] === '*' && src[j + 1] === '/')) j++;
+      j = Math.min(n, j + 2);
+      out += space(i, j);
+      i = j;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      const q = c;
+      let j = i + 1;
+      while (j < n) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === q) { j++; break; }
+        if (src[j] === '\n') break;
+        j++;
+      }
+      out += space(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '`') {
+      let j = i + 1;
+      while (j < n) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === '`') { j++; break; }
+        if (src[j] === '$' && src[j + 1] === '{') {
+          j += 2;
+          let depth = 1;
+          while (j < n && depth > 0) {
+            const ch = src[j];
+            if (ch === "'" || ch === '"') {
+              const qq = ch; j++;
+              while (j < n) {
+                if (src[j] === '\\') { j += 2; continue; }
+                if (src[j] === qq) { j++; break; }
+                j++;
+              }
+              continue;
+            }
+            if (ch === '`') {
+              j++;
+              while (j < n) {
+                if (src[j] === '\\') { j += 2; continue; }
+                if (src[j] === '`') { j++; break; }
+                j++;
+              }
+              continue;
+            }
+            if (ch === '{') depth++;
+            else if (ch === '}') depth--;
+            j++;
+          }
+          continue;
+        }
+        j++;
+      }
+      out += space(i, j);
+      i = j;
+      continue;
+    }
+    if (c === '/') {
+      let k = out.length - 1;
+      while (k >= 0 && /[ \t\r\n]/.test(out[k])) k--;
+      const prev = k >= 0 ? out[k] : '';
+      const returnish = k >= 5 && out.slice(k - 5, k + 1) === 'return';
+      // Division, not regex: / after ++, --, ) or ] (Pia: i++ / 2 must not blank a write).
+      const afterInc = k >= 1 && ((out[k - 1] === '+' && prev === '+') || (out[k - 1] === '-' && prev === '-'));
+      const afterClose = prev === ')' || prev === ']';
+      if (afterInc || afterClose) {
+        out += c;
+        i++;
+        continue;
+      }
+      if (k < 0 || /[(=:[,;!&|?+\-~*%^<>]/.test(prev) || returnish) {
+        let j = i + 1;
+        while (j < n) {
+          if (src[j] === '\\') { j += 2; continue; }
+          if (src[j] === '/') { j++; break; }
+          if (src[j] === '\n') break;
+          j++;
+        }
+        while (j < n && /[a-z]/i.test(src[j])) j++;
+        out += space(i, j);
+        i = j;
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  if (typeof src === 'string') {
+    if (swBlankCacheByStr.size > 32) swBlankCacheByStr.clear();
+    swBlankCacheByStr.set(src, out);
+  }
+  return out;
+}
+
+function swBraceDepthBlanked(blanked, from, to) {
+  let depth = 0;
+  for (let i = from; i < to; i++) {
+    if (blanked[i] === '{') depth++;
+    else if (blanked[i] === '}') depth--;
+  }
+  return depth;
+}
+
+function swMatchBraceBlanked(blanked, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < blanked.length; i++) {
+    if (blanked[i] === '{') depth++;
+    else if (blanked[i] === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function swSkipWs(blanked, i) {
+  while (i < blanked.length && /\s/.test(blanked[i])) i++;
+  return i;
+}
+
+function swMatchParenBlanked(blanked, openIdx) {
+  if (blanked[openIdx] !== '(') return -1;
+  let depth = 0;
+  for (let i = openIdx; i < blanked.length; i++) {
+    if (blanked[i] === '(') depth++;
+    else if (blanked[i] === ')') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Build every function / arrow / method span once from blanked source.
+ * Each span is { start, end } covering the whole construct; the write must
+ * fall inside [start, end). Innermost span wins.
+ */
+function swBuildFnSpans(src, blanked) {
+  const spans = [];
+  const n = blanked.length;
+
+  const pushBraceBody = (start, bodyOpen) => {
+    const bodyClose = swMatchBraceBlanked(blanked, bodyOpen);
+    if (bodyClose < 0) return;
+    spans.push({ start, end: bodyClose + 1 });
+  };
+
+  // function / async function (decl, expr, or default export already includes keyword)
+  const fnKw = /\b(?:async\s+)?function\b/g;
+  let m;
+  while ((m = fnKw.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    let i = m.index + m[0].length;
+    i = swSkipWs(blanked, i);
+    // optional name
+    if (/[A-Za-z_$#]/.test(blanked[i])) {
+      while (i < n && /[A-Za-z0-9_$#]/.test(blanked[i])) i++;
+      i = swSkipWs(blanked, i);
+    }
+    if (blanked[i] !== '(') continue;
+    const closeParen = swMatchParenBlanked(blanked, i);
+    if (closeParen < 0) continue;
+    i = swSkipWs(blanked, closeParen + 1);
+    if (blanked[i] !== '{') continue;
+    pushBraceBody(m.index, i);
+  }
+
+  // Arrows: =>  (braced or braceless; params with or without parens)
+  const arrowRe = /=>/g;
+  while ((m = arrowRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    // Find start of params
+    let pre = m.index - 1;
+    while (pre >= 0 && /\s/.test(blanked[pre])) pre--;
+    let start;
+    if (pre >= 0 && blanked[pre] === ')') {
+      // walk back to matching (
+      let depth = 0;
+      let j = pre;
+      for (; j >= 0; j--) {
+        if (blanked[j] === ')') depth++;
+        else if (blanked[j] === '(') {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      if (j < 0) continue;
+      start = j;
+      // optional async before params
+      let a = j - 1;
+      while (a >= 0 && /\s/.test(blanked[a])) a--;
+      if (a >= 4 && blanked.slice(a - 4, a + 1) === 'async') start = a - 4;
+    } else if (pre >= 0 && /[A-Za-z0-9_$#]/.test(blanked[pre])) {
+      let j = pre;
+      while (j >= 0 && /[A-Za-z0-9_$#]/.test(blanked[j])) j--;
+      start = j + 1;
+      let a = j;
+      while (a >= 0 && /\s/.test(blanked[a])) a--;
+      if (a >= 4 && blanked.slice(a - 4, a + 1) === 'async') start = a - 4;
+    } else {
+      continue;
+    }
+
+    let i = swSkipWs(blanked, m.index + 2);
+    if (blanked[i] === '{') {
+      pushBraceBody(start, i);
+      continue;
+    }
+    // Braceless: body runs to matching ), , or ; at expression depth 0
+    let depth = 0;
+    let end = i;
+    while (end < n) {
+      const ch = blanked[end];
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        if (depth === 0) break;
+        depth--;
+      } else if ((ch === ',' || ch === ';') && depth === 0) {
+        break;
+      }
+      end++;
+    }
+    if (end > i) spans.push({ start, end });
+  }
+
+  // Class / object methods: name(params) { … } without function/if/while/for/switch/catch
+  // Scan for ){ and verify a method-like header before it.
+  for (let i = 0; i < n - 1; i++) {
+    if (blanked[i] !== ')') continue;
+    let j = swSkipWs(blanked, i + 1);
+    if (blanked[j] !== '{') continue;
+    // Reject if this ){ already consumed as function/arrow body start — still OK to add; innermost wins
+    // Walk back from ) to matching (
+    let depth = 0;
+    let open = -1;
+    for (let k = i; k >= 0; k--) {
+      if (blanked[k] === ')') depth++;
+      else if (blanked[k] === '(') {
+        depth--;
+        if (depth === 0) { open = k; break; }
+      }
+    }
+    if (open < 0) continue;
+    // Name before (
+    let nameEnd = open - 1;
+    while (nameEnd >= 0 && /\s/.test(blanked[nameEnd])) nameEnd--;
+    if (nameEnd < 0 || !/[A-Za-z0-9_$#]/.test(blanked[nameEnd])) continue;
+    let nameStart = nameEnd;
+    while (nameStart >= 0 && /[A-Za-z0-9_$#]/.test(blanked[nameStart])) nameStart--;
+    nameStart++;
+    // Optional get/set/async/# already in name; check keyword before name
+    let before = nameStart - 1;
+    while (before >= 0 && /\s/.test(blanked[before])) before--;
+    // Skip async/get/set keywords that are separate tokens
+    const sliceBefore = (len) => blanked.slice(Math.max(0, before - len + 1), before + 1);
+    if (before >= 4 && sliceBefore(5) === 'async' && !/[A-Za-z0-9_$#]/.test(blanked[before - 5] || '')) {
+      nameStart = before - 4;
+      before = nameStart - 1;
+      while (before >= 0 && /\s/.test(blanked[before])) before--;
+    } else if (before >= 2 && (sliceBefore(3) === 'get' || sliceBefore(3) === 'set') && !/[A-Za-z0-9_$#]/.test(blanked[before - 3] || '')) {
+      nameStart = before - 2;
+      before = nameStart - 1;
+      while (before >= 0 && /\s/.test(blanked[before])) before--;
+    }
+    // Reject control-flow / function keyword
+    const prevWord = (() => {
+      if (before < 0 || !/[A-Za-z0-9_$#]/.test(blanked[before])) return '';
+      let s = before;
+      while (s >= 0 && /[A-Za-z0-9_$#]/.test(blanked[s])) s--;
+      return blanked.slice(s + 1, before + 1);
+    })();
+    if (/^(?:if|while|for|switch|catch|with|function|else)$/.test(prevWord)) continue;
+    // Reject arrows: => just before { would be arrow, already handled; method has no => between ) and {
+    pushBraceBody(nameStart, j);
+  }
+
+  return spans;
+}
+
+const swSpanCache = new Map();
+function swGetFnSpans(src) {
+  if (swSpanCache.has(src)) return swSpanCache.get(src);
+  const blanked = swBlankLiterals(src);
+  const spans = swBuildFnSpans(src, blanked);
+  const entry = { blanked, spans };
+  if (swSpanCache.size > 32) swSpanCache.clear();
+  swSpanCache.set(src, entry);
+  return entry;
+}
+
+/**
+ * All function/arrow/method spans containing offset, innermost first.
+ * Empty ⇒ top-level (writes fail). A guard on any ancestor that still
+ * contains the write counts (e.g. forEach callback inside a guarded if);
+ * a closed sibling function never appears here.
+ */
+function swContainingFns(src, offset) {
+  const { blanked, spans } = swGetFnSpans(src);
+  return spans
+    .filter(sp => offset >= sp.start && offset < sp.end)
+    .sort((a, b) => (a.end - a.start) - (b.end - b.start))
+    .map(sp => ({
+      start: sp.start,
+      end: sp.end,
+      text: src.slice(sp.start, sp.end),
+      blanked: blanked.slice(sp.start, sp.end),
+    }));
+}
+
+/** Innermost containing function, or null if top-level. */
+function swEnclosingFn(src, offset) {
+  const all = swContainingFns(src, offset);
+  return all.length ? all[0] : null;
+}
+
+function swIfCondition(fnText, blanked, ifIdx) {
+  const open = blanked.indexOf('(', ifIdx);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < blanked.length; i++) {
+    if (blanked[i] === '(') depth++;
+    else if (blanked[i] === ')') {
+      depth--;
+      if (depth === 0) {
+        return {
+          cond: fnText.slice(open + 1, i),
+          headerEnd: i + 1,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Guard covers write only when:
+ * - early `if (!sspIsMainWindow()) return…;` at fn-body depth, NOT preceded by else,
+ *   and the if-condition has no `||` or `?`; or
+ * - write sits inside `if (sspIsMainWindow()) {…}` / `if (a && sspIsMainWindow())`
+ *   whose condition has no `||` or `?`.
+ */
+function swGuardCoversWrite(fnText, writeRel, blankedFn) {
+  const blanked = blankedFn || swBlankLiterals(fnText);
+  const bodyOpen = blanked.indexOf('{');
+  if (bodyOpen < 0) return false;
+  const before = fnText.slice(0, writeRel);
+
+  const earlyRe = /\bif\s*\(/g;
+  let m;
+  while ((m = earlyRe.exec(before)) !== null) {
+    const pre = before.slice(0, m.index).replace(/\s+$/, '');
+    if (/\belse$/.test(pre)) continue;
+    const ic = swIfCondition(fnText, blanked, m.index);
+    if (!ic) continue;
+    if (/[|?]/.test(ic.cond)) continue;
+    if (!/^\s*!\s*sspIsMainWindow\s*\(\s*\)\s*$/.test(ic.cond)) continue;
+    const afterHdr = fnText.slice(ic.headerEnd, writeRel);
+    if (!/^\s*return\b[^;]*;/.test(afterHdr)) continue;
+    if (swBraceDepthBlanked(blanked, bodyOpen, m.index) !== 1) continue;
+    return true;
+  }
+
+  const ifRe = /\bif\s*\(/g;
+  while ((m = ifRe.exec(fnText)) !== null) {
+    if (m.index >= writeRel) break;
+    const pre = fnText.slice(0, m.index).replace(/\s+$/, '');
+    if (/\belse$/.test(pre)) continue;
+    const ic = swIfCondition(fnText, blanked, m.index);
+    if (!ic) continue;
+    if (/[|?]/.test(ic.cond)) continue;
+    if (!/sspIsMainWindow\s*\(\s*\)/.test(ic.cond)) continue;
+    if (/!\s*sspIsMainWindow/.test(ic.cond)) continue;
+    const parts = ic.cond.split('&&').map(s => s.trim());
+    if (!parts.some(p => /^sspIsMainWindow\s*\(\s*\)$/.test(p))) continue;
+
+    let i = ic.headerEnd;
+    while (i < blanked.length && /\s/.test(blanked[i])) i++;
+    if (blanked[i] === '{') {
+      const close = swMatchBraceBlanked(blanked, i);
+      if (close > 0 && writeRel > i && writeRel < close) return true;
+    } else {
+      const baseDepth = swBraceDepthBlanked(blanked, bodyOpen, i);
+      let j = i;
+      while (j < blanked.length) {
+        if (blanked[j] === '{') {
+          const end = swMatchBraceBlanked(blanked, j);
+          if (end < 0) break;
+          j = end + 1;
+          continue;
+        }
+        if (blanked[j] === ';' && swBraceDepthBlanked(blanked, bodyOpen, j) === baseDepth) {
+          if (writeRel >= i && writeRel <= j) return true;
+          break;
+        }
+        j++;
+      }
+    }
+  }
+  return false;
+}
+
+const SW_CORE_LS_CALL = /SlideXCore\s*\.\s*(?:forgetEmptiedSession|saveBeforeExitThenAck)\s*\(\s*localStorage\b/;
+
+/**
+ * Deny-by-default: every localStorage / sessionStorage / Storage.prototype /
+ * indexedDB / navigator.storage token outside comments must be a direct
+ * .getItem( read, a matched guarded write, or one of the 2 allow-listed core
+ * calls. Computed window/globalThis/self/top/parent/frames/opener/this access
+ * always fails, as do eval(, new Function, Function(, Reflect.get( and
+ * getOwnPropertyDescriptor(.
+ *
+ * A lexical scan has limits (dynamic code, proxies, indirection the grammar
+ * cannot see). The runtime vm sandbox with a throwing storage Proxy is the
+ * backstop if we ever need it.
+ */
+function swScanSource(src, fileLabel, opts = {}) {
+  const blanked = swBlankLiterals(src);
+  const hits = [];
+  const allowlist = opts.allowlist || [];
+
+  const computedRe = /\b(?:window|globalThis|self|top|parent|frames|opener|this)\s*\[/g;
+  let m;
+  while ((m = computedRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    const slice = src.slice(m.index, Math.min(src.length, m.index + 100));
+    const line = src.slice(0, m.index).split('\n').length;
+    hits.push({
+      file: fileLabel, line, kind: 'computed-access', ok: false,
+      snippet: slice.replace(/\s+/g, ' ').slice(0, 100),
+    });
+  }
+
+  // Dynamic code / reflection that can reach storage without a direct token write.
+  const dynRe = /\beval\s*\(|\bnew\s+Function\b|\bFunction\s*\(|\bReflect\s*\.\s*get\s*\(|\bgetOwnPropertyDescriptor\s*\(/g;
+  while ((m = dynRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    const line = src.slice(0, m.index).split('\n').length;
+    const snippet = src.slice(m.index, Math.min(src.length, m.index + 80)).replace(/\s+/g, ' ');
+    hits.push({ file: fileLabel, line, kind: 'dynamic-access', ok: false, snippet });
+  }
+
+  const tokenRe = /\b(?:localStorage|sessionStorage|Storage\.prototype|indexedDB|navigator\.storage)\b/g;
+  while ((m = tokenRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    const line = src.slice(0, m.index).split('\n').length;
+    const token = m[0];
+    const afterBlank = blanked.slice(m.index + token.length, m.index + token.length + 80);
+    const snippet = src.slice(Math.max(0, m.index - 40), Math.min(src.length, m.index + 60)).replace(/\s+/g, ' ');
+
+    if (token === 'localStorage') {
+      const lookBehind = src.slice(Math.max(0, m.index - 70), m.index + token.length);
+      if (SW_CORE_LS_CALL.test(lookBehind) ||
+          /SlideXCore\s*\.\s*(?:forgetEmptiedSession|saveBeforeExitThenAck)\s*\(\s*$/.test(src.slice(Math.max(0, m.index - 70), m.index))) {
+        hits.push({ file: fileLabel, line, kind: 'core-call:' + token, ok: true, reason: 'allow-listed SlideXCore.*(localStorage)' });
+        continue;
+      }
+    }
+
+    if (/^\s*\.\s*getItem\s*\(/.test(afterBlank)) {
+      hits.push({ file: fileLabel, line, kind: token + '.getItem', ok: true, reason: 'read' });
+      continue;
+    }
+
+    const writeFollow = /^\s*(?:\.\s*(?:setItem|removeItem|clear)\s*\(|\[[^\]]+\]\s*=|\.\w+\s*=)/.test(afterBlank);
+    const containers = swContainingFns(src, m.index);
+    if (writeFollow) {
+      if (!containers.length) {
+        hits.push({ file: fileLabel, line, kind: 'top-level-write', ok: false, snippet });
+        continue;
+      }
+      const allowed = allowlist.find(a => containers.some(enc => a.re.test(enc.text)) || a.re.test(snippet));
+      if (allowed) {
+        hits.push({ file: fileLabel, line, kind: token, ok: true, reason: allowed.reason });
+        continue;
+      }
+      const ok = containers.some(enc => swGuardCoversWrite(enc.text, m.index - enc.start, enc.blanked));
+      hits.push({ file: fileLabel, line, kind: token + '-write', ok, snippet });
+      continue;
+    }
+
+    // Non-write, non-read token use (alias, destructure, …). Allowlist on any container.
+    const allowed = allowlist.find(a => containers.some(enc => a.re.test(enc.text)) || a.re.test(snippet));
+    if (allowed) {
+      hits.push({ file: fileLabel, line, kind: token, ok: true, reason: allowed.reason });
+      continue;
+    }
+    hits.push({ file: fileLabel, line, kind: token + '-denied', ok: false, snippet });
+  }
+
+  const secondaryRe = /\bsaveMetaIDB\s*\(|\.put\s*\(|(?:getFileHandle|getDirectoryHandle)\s*\([^;]{0,120}?create\s*:\s*true|\bcreateWritable\s*\(|navigator\s*\.\s*storage\s*\.\s*getDirectory\s*\(/g;
+  while ((m = secondaryRe.exec(blanked)) !== null) {
+    if (blanked[m.index] === ' ') continue;
+    if (/^saveMetaIDB\s*\(/.test(src.slice(m.index, m.index + 20))) {
+      const pre = src.slice(Math.max(0, m.index - 24), m.index);
+      if (/(?:async\s+)?function\s*$/.test(pre)) continue;
+    }
+    const line = src.slice(0, m.index).split('\n').length;
+    const containers = swContainingFns(src, m.index);
+    const snippet = src.slice(Math.max(0, m.index - 40), Math.min(src.length, m.index + 60)).replace(/\s+/g, ' ');
+    if (!containers.length) {
+      hits.push({ file: fileLabel, line, kind: 'top-level-write', ok: false, snippet });
+      continue;
+    }
+    const allowed = allowlist.find(a => containers.some(enc => a.re.test(enc.text)) || a.re.test(snippet));
+    if (allowed) {
+      hits.push({ file: fileLabel, line, kind: m[0].slice(0, 40), ok: true, reason: allowed.reason });
+      continue;
+    }
+    const ok = containers.some(enc => swGuardCoversWrite(enc.text, m.index - enc.start, enc.blanked));
+    hits.push({ file: fileLabel, line, kind: m[0].slice(0, 40), ok, snippet });
+  }
+
+  return hits;
+}
+
+function swScanAll(html, core) {
+  const htmlAllow = [
+    {
+      re: /function openHandleDB\s*\(/,
+      reason: 'indexedDB.open shared plumbing; writes go through guarded saveMetaIDB/saveHandleIDB',
+    },
+  ];
+  const coreAllow = [
+    {
+      re: /function forgetEmptiedSession\s*\(\s*storage/,
+      reason: 'storage arg; HTML caller forgetEmptiedSession() is sspIsMainWindow-guarded',
+    },
+    {
+      re: /function saveBeforeExitThenAck\s*\(\s*storage/,
+      reason: 'storage arg; HTML caller saveSessionBeforeExit() is sspIsMainWindow-guarded',
+    },
+  ];
+  assert.match(html, /if\s*\(\s*!sspIsMainWindow\s*\(\s*\)\s*\)\s*return;[\s\S]{0,400}SlideXCore\.forgetEmptiedSession\(\s*localStorage/);
+  assert.match(html, /if\s*\(\s*!sspIsMainWindow\s*\(\s*\)\s*\)\s*return;[\s\S]{0,800}SlideXCore\.saveBeforeExitThenAck\(\s*localStorage/);
+
+  return swScanSource(html, 'SlideShowPro.html', { allowlist: htmlAllow })
+    .concat(swScanSource(core, 'slidex-core.js', { allowlist: coreAllow }));
+}
+
+/** Permanent injection fixtures: scanner must fail on each. */
+const SW_NO_WRITE_INJECTIONS = [
+  // Prior 6
+  { name: "localStorage['k']=", code: "\n  localStorage['k'] = 'v';\n" },
+  { name: 'sessionStorage.setItem', code: "\n  sessionStorage.setItem('k', 'v');\n" },
+  { name: 'localStorage.clear', code: '\n  localStorage.clear();\n' },
+  { name: 'saveMetaIDB()', code: "\n  saveMetaIDB('k', 1);\n" },
+  { name: 'aliased ls.setItem', code: "\n  const ls = localStorage; ls.setItem('k', 'v');\n" },
+  { name: 'empty if (sspIsMainWindow()) {} then write', code: "\n  if (sspIsMainWindow()) {}\n  localStorage.setItem('k', 'v');\n" },
+  // Prior 8
+  { name: "window['local'+'Storage'].setItem", code: "\n  window['local'+'Storage'].setItem('k', 'v');\n" },
+  { name: 'const ls = window.localStorage', code: '\n  const ls = window.localStorage;\n  ls.setItem("k", "v");\n' },
+  { name: 'const {localStorage: ls} = window', code: '\n  const {localStorage: ls} = window;\n  ls.setItem("k", "v");\n' },
+  { name: 'const {setItem} = localStorage; setItem.call', code: "\n  const {setItem} = localStorage; setItem.call(localStorage, 'k', 'v');\n" },
+  { name: 'Storage.prototype.setItem.call', code: "\n  Storage.prototype.setItem.call(localStorage, 'k', 'v');\n" },
+  { name: 'if (true || e && sspIsMainWindow()) { write }', code: "\n  if (true || e && sspIsMainWindow()) { localStorage.setItem('k', 'v'); }\n" },
+  { name: 'else if (!sspIsMainWindow()) return; write', code: "\n  if (e) {} else if (!sspIsMainWindow()) return;\n  localStorage.setItem('k', 'v');\n" },
+  { name: "'}' inside string throws off brace counter", code: '\n  if (sspIsMainWindow()) { const _s = "{"; }\n  localStorage.setItem("k", "v");\n' },
+  // After saveMetaIDB: page-style handlers must not inherit saveMetaIDB's guard
+  { name: 'addEventListener arrow after saveMetaIDB', after: 'saveMetaIDB',
+    code: "\ndocument.addEventListener('keyup', () => { localStorage.setItem('k', 'v'); });\n" },
+  { name: 'onchange braceless arrow after saveMetaIDB', after: 'saveMetaIDB',
+    code: "\ng('vskip').onchange = () => localStorage.setItem('k', 'v');\n" },
+  // Free nit: dynamic / cross-frame access
+  { name: 'eval/Reflect.get/top computed',
+    code: "\n  eval('1'); Reflect.get(window, 'localStorage').setItem('k', 'v'); top['localStorage'].setItem('a', 'b');\n" },
+];
+
+/** Inject fixture code into the page source (swChildKey body, or just after saveMetaIDB). */
+function swInjectFixture(html0, inj) {
+  if (inj.after === 'saveMetaIDB') {
+    const start = html0.indexOf('async function saveMetaIDB');
+    assert.ok(start !== -1, 'saveMetaIDB');
+    const enc = swEnclosingFn(html0, start + 10);
+    assert.ok(enc, 'saveMetaIDB span');
+    return html0.slice(0, enc.end) + inj.code + html0.slice(enc.end);
+  }
+  const marker = 'function swChildKey(e) {';
+  const at = html0.indexOf(marker);
+  assert.ok(at !== -1);
+  const brace = html0.indexOf('{', at);
+  return html0.slice(0, brace + 1) + inj.code + html0.slice(brace + 1);
+}
+
+// Lexical scan known limits (runtime VM backstop catches these):
+// 1. Hoisted helper registered before the guard but declared after it.
+// 2. A / after ++/--/) /] misread as regex (mitigated above; still note as a class of risk).
+test('source scan: every persisted write in the page and core is covered by sspIsMainWindow before the write', () => {
+  const html = swNoWriteHtml();
+  const core = swNoWriteCore();
+  assert.match(
+    html,
+    /function sspIsMainWindow\(\) \{\s*try \{ refreshWindowRoleFromTauri\(\); \} catch \(_\) \{\}\s*return !SSP_IS_PLAYLIST_WINDOW;\s*\}/
+  );
+  assert.match(html, /async function saveMetaIDB\([^)]*\) \{\s*if \(!sspIsMainWindow\(\)\) return;/);
+  assert.match(html, /async function saveScreenshotFile\([^)]*\) \{\s*if \(!sspIsMainWindow\(\)\) return false;/);
+
+  const hits = swScanAll(html, core);
+  assert.ok(hits.length >= 12, 'expected to find the known write sites, got ' + hits.length);
+  const bad = hits.filter(h => !h.ok);
+  assert.equal(
+    bad.length,
+    0,
+    'unguarded persisted writes:\n' +
+      bad.map(h => `  ${h.file}:${h.line} ${h.kind}: ${h.snippet || h.reason || ''}`).join('\n')
+  );
+});
+
+test('source scan fails on each no-write injection fixture (14 prior + 2 after saveMetaIDB + 1 dynamic)', () => {
+  const html0 = swNoWriteHtml();
+  const core = swNoWriteCore();
+  assert.equal(SW_NO_WRITE_INJECTIONS.length, 17);
+  for (const inj of SW_NO_WRITE_INJECTIONS) {
+    const html = swInjectFixture(html0, inj);
+    // Fresh span cache per injected source
+    swSpanCache.clear();
+    swBlankCacheByStr.clear();
+    const bad = swScanAll(html, core).filter(h => !h.ok);
+    assert.ok(
+      bad.length >= 1,
+      `expected scan to fail for ${inj.name}, but it stayed green`
+    );
+  }
+  swSpanCache.clear();
+  swBlankCacheByStr.clear();
+  assert.equal(swScanAll(html0, core).filter(h => !h.ok).length, 0, 'real page must still pass');
+});
+
+
+// ---- Runtime VM backstop: second window must not persist ----
+// Lexical scan is the fast first check; this runs the real page scripts in
+// node:vm as playlist-2 and as main. A lexical scan has limits (hoisted
+// helpers registered before their guard, exotic parse edge cases); the
+// runtime recording Proxy is the backstop.
+
+const SW_RUNTIME_HANDLER_FLOOR = 25; // sensible floor; reported in the test
+const SW_RUNTIME_FLUSH_CAP = 1000;
+const SW_RUNTIME_INTERVAL_FIRES = 3;
+
+/** Optional allow-list: empty when stubs are honest. Each entry needs a reason. */
+const SW_RUNTIME_ALLOW_HANDLER_FAIL = [];
+const SW_RUNTIME_ALLOW_LOAD_THROW = [];
+
+function swFakeFileList(files) {
+  const arr = Array.from(files);
+  const fl = {
+    length: arr.length,
+    item(i) { return arr[i] ?? null; },
+    [Symbol.iterator]: function* () { yield* arr; },
+  };
+  for (let i = 0; i < arr.length; i++) fl[i] = arr[i];
+  return fl;
+}
+
+function swDefaultFiles() {
+  return swFakeFileList([new File(['{}'], 'x.json', { type: 'application/json' })]);
+}
+
+function swExtractInlineScripts(html) {
+  const out = [];
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (/\bsrc\s*=/i.test(m[1] || '')) continue;
+    if (!(m[2] || '').trim()) continue;
+    out.push(m[2]);
+  }
+  return out;
+}
+
+function swRecordingStorage() {
+  const data = new Map();
+  const writes = [];
+  const api = {
+    getItem(k) {
+      const key = String(k);
+      return data.has(key) ? data.get(key) : null;
+    },
+    setItem(k, v) {
+      const key = String(k);
+      writes.push({ op: 'setItem', key, storage: 'local' });
+      data.set(key, String(v));
+    },
+    removeItem(k) {
+      const key = String(k);
+      writes.push({ op: 'removeItem', key, storage: 'local' });
+      data.delete(key);
+    },
+    clear() {
+      writes.push({ op: 'clear', key: '*', storage: 'local' });
+      data.clear();
+    },
+    key(i) { return [...data.keys()][i | 0] ?? null; },
+    get length() { return data.size; },
+  };
+  const proxy = new Proxy(api, {
+    get(t, prop, recv) {
+      if (prop === 'writes') return writes;
+      if (typeof prop === 'symbol') return Reflect.get(t, prop, recv);
+      if (prop in t) {
+        const v = t[prop];
+        return typeof v === 'function' ? v.bind(t) : v;
+      }
+      return t.getItem(prop);
+    },
+    set(t, prop, value) {
+      if (typeof prop === 'symbol') return Reflect.set(t, prop, value);
+      if (prop === 'length') return true;
+      writes.push({ op: 'prop-set', key: String(prop), storage: 'local' });
+      t.setItem(prop, value);
+      return true;
+    },
+    has(t, prop) { return prop in t || data.has(String(prop)); },
+    ownKeys() { return [...data.keys()]; },
+    getOwnPropertyDescriptor(t, prop) {
+      if (prop in t) return Reflect.getOwnPropertyDescriptor(t, prop);
+      if (data.has(String(prop))) return { configurable: true, enumerable: true, writable: true, value: data.get(String(prop)) };
+      return undefined;
+    },
+  });
+  return { proxy, writes, data, tagStorage(name) {
+    const sdata = new Map();
+    const sapi = {
+      getItem(k) { const key = String(k); return sdata.has(key) ? sdata.get(key) : null; },
+      setItem(k, v) { writes.push({ op: 'setItem', key: String(k), storage: name }); sdata.set(String(k), String(v)); },
+      removeItem(k) { writes.push({ op: 'removeItem', key: String(k), storage: name }); sdata.delete(String(k)); },
+      clear() { writes.push({ op: 'clear', key: '*', storage: name }); sdata.clear(); },
+      key(i) { return [...sdata.keys()][i | 0] ?? null; },
+      get length() { return sdata.size; },
+    };
+    return new Proxy(sapi, {
+      get(t, prop, recv) {
+        if (typeof prop === 'symbol') return Reflect.get(t, prop, recv);
+        if (prop in t) {
+          const v = t[prop];
+          return typeof v === 'function' ? v.bind(t) : v;
+        }
+        return t.getItem(prop);
+      },
+      set(t, prop, value) {
+        if (typeof prop === 'symbol') return Reflect.set(t, prop, value);
+        writes.push({ op: 'prop-set', key: String(prop), storage: name });
+        t.setItem(prop, value);
+        return true;
+      },
+    });
+  } };
+}
+
+function swMakeFileHandle(store, name) {
+  return {
+    kind: 'file',
+    name: name || 'file',
+    async createWritable() {
+      store.writes.push({ op: 'createWritable', key: String(name || 'createWritable'), storage: 'fs' });
+      return {
+        write: async () => {},
+        close: async () => {},
+        abort: async () => {},
+      };
+    },
+    async getFile() { return new File(['x'], name || 'file'); },
+  };
+}
+
+function swMakeDirHandle(store, name) {
+  return {
+    kind: 'directory',
+    name: name || 'dir',
+    async queryPermission() { return 'granted'; },
+    async requestPermission() { return 'granted'; },
+    async getDirectoryHandle(child, _opts) {
+      store.writes.push({ op: 'getDirectoryHandle', key: String(child), storage: 'fs' });
+      return swMakeDirHandle(store, child);
+    },
+    async getFileHandle(child, _opts) {
+      store.writes.push({ op: 'getFileHandle', key: String(child), storage: 'fs' });
+      return swMakeFileHandle(store, child);
+    },
+  };
+}
+
+function swStubElement(id, bag, elFactory) {
+  const listeners = [];
+  const makeChild = () => elFactory('qs-' + id + '-' + (listeners.length));
+  const base = {
+    id,
+    nodeType: 1,
+    nodeName: (id === 'musicAudio' ? 'AUDIO' : 'DIV'),
+    tagName: (id === 'musicAudio' ? 'AUDIO' : 'DIV'),
+    style: new Proxy({}, { get: () => '', set: () => true }),
+    classList: {
+      _s: new Set(),
+      add(...xs) { xs.forEach(x => this._s.add(x)); },
+      remove(...xs) { xs.forEach(x => this._s.delete(x)); },
+      toggle(x, force) {
+        if (force === true) { this._s.add(x); return true; }
+        if (force === false) { this._s.delete(x); return false; }
+        if (this._s.has(x)) { this._s.delete(x); return false; }
+        this._s.add(x); return true;
+      },
+      contains(x) { return this._s.has(x); },
+    },
+    dataset: {},
+    children: [],
+    childNodes: [],
+    parentElement: null,
+    parentNode: null,
+    value: id === 'dsel' ? '10000' : (id === 'vskip' ? '5' : (id === 'tsel' ? 'fade' : '')),
+    textContent: '',
+    innerHTML: '',
+    innerText: '',
+    hidden: false,
+    disabled: false,
+    checked: false,
+    selectedIndex: 0,
+    options: [],
+    files: swDefaultFiles(),
+    href: '',
+    src: '',
+    currentTime: 0,
+    duration: NaN,
+    paused: true,
+    volume: 0.8,
+    muted: false,
+    title: '',
+    type: '',
+    name: id,
+    width: 0,
+    height: 0,
+    naturalWidth: 0,
+    naturalHeight: 0,
+    offsetWidth: 100,
+    offsetHeight: 100,
+    clientWidth: 100,
+    clientHeight: 100,
+    scrollTop: 0,
+    scrollLeft: 0,
+    tabIndex: 0,
+    onclick: null,
+    onchange: null,
+    oninput: null,
+    addEventListener(type, fn) {
+      listeners.push({ type, fn });
+      bag.domListeners.push({ id, type, fn });
+    },
+    removeEventListener() {},
+    dispatchEvent() { return true; },
+    appendChild(c) { this.children.push(c); return c; },
+    removeChild() { return null; },
+    insertBefore(c) { return c; },
+    replaceChild(c) { return c; },
+    remove() {},
+    focus() {},
+    blur() {},
+    click() {
+      const ev = swFakeEvent(base);
+      if (typeof base.onclick === 'function') base.onclick(ev);
+    },
+    play() { return Promise.resolve(); },
+    pause() {},
+    load() {},
+    querySelector(_sel) { return makeChild(); },
+    querySelectorAll(_sel) { return [makeChild()]; },
+    getElementsByTagName() { return []; },
+    getElementsByClassName() { return []; },
+    closest() { return null; },
+    matches() { return false; },
+    contains() { return false; },
+    setAttribute() {},
+    getAttribute(n) { return n === 'id' ? id : null; },
+    removeAttribute() {},
+    hasAttribute() { return false; },
+    getBoundingClientRect() { return { top: 0, left: 0, width: 100, height: 100, bottom: 100, right: 100, x: 0, y: 0 }; },
+    getContext() {
+      return {
+        canvas: base, fillRect() {}, clearRect() {}, drawImage() {},
+        getImageData() { return { data: new Uint8ClampedArray(4), width: 1, height: 1 }; },
+        putImageData() {}, save() {}, restore() {}, scale() {}, rotate() {}, translate() {},
+        setTransform() {}, measureText() { return { width: 0 }; }, beginPath() {}, closePath() {},
+        fill() {}, stroke() {}, arc() {}, rect() {}, fillText() {},
+      };
+    },
+    toDataURL() { return 'data:image/png;base64,xx'; },
+    toBlob(cb) { if (typeof cb === 'function') cb(new Blob(['x'])); },
+  };
+  // Seed a span under bmusic so soundtrack render's querySelector('span') is stable even if
+  // a caller inspects children; querySelector itself always returns a stub.
+  if (id === 'bmusic') {
+    const span = elFactory('bmusic-span');
+    span.tagName = 'SPAN';
+    span.nodeName = 'SPAN';
+    span.textContent = 'Music';
+    base.children.push(span);
+  }
+  return new Proxy(base, {
+    set(t, prop, value) {
+      if (typeof prop === 'string' && prop.startsWith('on') && typeof value === 'function') {
+        bag.onHandlers.push({ id, prop, fn: value });
+      }
+      t[prop] = value;
+      return true;
+    },
+    get(t, prop) {
+      if (prop === '__listeners') return listeners;
+      if (prop in t) return t[prop];
+      return undefined;
+    },
+  });
+}
+
+function swFakeEvent(target, overrides = {}) {
+  return {
+    target,
+    currentTarget: target,
+    type: overrides.type || 'change',
+    key: overrides.key || '',
+    code: overrides.code || '',
+    ctrlKey: !!overrides.ctrlKey,
+    metaKey: !!overrides.metaKey,
+    altKey: !!overrides.altKey,
+    shiftKey: !!overrides.shiftKey,
+    button: 0,
+    preventDefault() {},
+    stopPropagation() {},
+    stopImmediatePropagation() {},
+    ...overrides,
+  };
+}
+
+function swKeymapKeysFromHtml(html) {
+  const keys = new Set();
+  const re = /def:\s*'((?:\\'|[^'])*)'/g;
+  let m;
+  const fns = html.indexOf('const FNS = [');
+  const fnsEnd = html.indexOf('];', fns);
+  const slice = fns !== -1 && fnsEnd !== -1 ? html.slice(fns, fnsEnd) : html;
+  while ((m = re.exec(slice)) !== null) keys.add(m[1].replace(/\\'/g, "'"));
+  for (const k of ['Delete', 'Backspace', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']) keys.add(k);
+  return [...keys];
+}
+
+/**
+ * Run the real page scripts as role 'main' | 'playlist'.
+ * Returns { writes, handlersRun, handlersFailed, handlerTotal, keys, loadThrow, ... }.
+ */
+function swRuntimeRun(html, role, opts = {}) {
+  const coreSrc = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+  let scripts = swExtractInlineScripts(html);
+  assert.ok(scripts.length >= 2, 'expected main + soundtrack inline scripts');
+  scripts = scripts.map(s => s.includes('initSoundtrack')
+    ? s.replace('window.sspSoundtrackSync = sync;',
+      'window.sspSoundtrackSync = sync; window.__sspTestSoundtrackSave = save;')
+    : s);
+
+  const store = swRecordingStorage();
+  const bag = { onHandlers: [], domListeners: [], idb: [], fsWrites: [], loadThrow: [], handlerErrors: [] };
+  const elements = new Map();
+  const el = (id) => {
+    if (!elements.has(id)) elements.set(id, swStubElement(id, bag, el));
+    return elements.get(id);
+  };
+
+  let timerSeq = 1;
+  const pendingTimers = new Map();
+
+  const body = el('body');
+  body.tagName = 'BODY';
+  const documentStub = {
+    body,
+    documentElement: el('html'),
+    readyState: 'complete',
+    title: '',
+    hidden: false,
+    getElementById: (id) => el(String(id)),
+    querySelector: (_sel) => el('document-qs'),
+    querySelectorAll: (_sel) => [el('document-qsa')],
+    getElementsByTagName: () => [],
+    getElementsByClassName: () => [],
+    createElement: (tag) => {
+      const e = swStubElement('created-' + tag, bag, el);
+      e.tagName = String(tag).toUpperCase();
+      e.nodeName = e.tagName;
+      return e;
+    },
+    createElementNS: (_ns, tag) => documentStub.createElement(tag),
+    createTextNode: (t) => ({ nodeType: 3, textContent: String(t) }),
+    createDocumentFragment: () => ({ appendChild() {}, childNodes: [] }),
+    addEventListener: (type, fn) => { bag.domListeners.push({ id: 'document', type, fn }); },
+    removeEventListener() {},
+    dispatchEvent() { return true; },
+  };
+
+  const locationStub = {
+    search: role === 'playlist' ? '?sspWindow=playlist' : '',
+    hash: '',
+    href: role === 'playlist' ? 'https://app.local/?sspWindow=playlist' : 'https://app.local/',
+    pathname: '/',
+    origin: 'https://app.local',
+    protocol: 'https:',
+    host: 'app.local',
+    hostname: 'app.local',
+    port: '',
+    assign() {},
+    replace() {},
+    reload() {},
+  };
+
+  const tauriListen = async () => ({ unlisten: () => {} });
+  const sandbox = {
+    console,
+    Object, Array, String, Number, Boolean, Math, Date, JSON, RegExp, Error, TypeError, RangeError, SyntaxError,
+    Promise, Map, Set, WeakMap, WeakSet, Symbol, Proxy, Reflect,
+    Uint8Array, Uint8ClampedArray, ArrayBuffer, DataView, Blob, File,
+    TextEncoder, TextDecoder, URL, URLSearchParams, atob, btoa,
+    parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent,
+    structuredClone,
+    AbortController,
+    DOMException,
+    FileReader: class FileReader {
+      constructor() { this.onload = null; this.onerror = null; this.result = null; this.readyState = 0; }
+      readAsDataURL() { this.readyState = 2; this.result = 'data:application/octet-stream;base64,eA=='; if (typeof this.onload === 'function') this.onload({ target: this }); }
+      readAsArrayBuffer() { this.readyState = 2; this.result = new ArrayBuffer(1); if (typeof this.onload === 'function') this.onload({ target: this }); }
+      readAsText(file) {
+        this.readyState = 2;
+        // Prefer real text when the stub File carries '{}'.
+        this.result = (file && typeof file === 'object' && file.name === 'x.json') ? '{}' : '{}';
+        if (typeof this.onload === 'function') this.onload({ target: this });
+      }
+    },
+    setTimeout(fn, ms) {
+      const id = timerSeq++;
+      pendingTimers.set(id, { fn, ms: ms || 0, interval: false });
+      return id;
+    },
+    clearTimeout(id) { pendingTimers.delete(id); },
+    setInterval(fn, ms) {
+      const id = timerSeq++;
+      pendingTimers.set(id, { fn, ms: ms || 0, interval: true });
+      return id;
+    },
+    clearInterval(id) { pendingTimers.delete(id); },
+    requestAnimationFrame(fn) { return sandbox.setTimeout(fn, 0); },
+    cancelAnimationFrame(id) { sandbox.clearTimeout(id); },
+    queueMicrotask(fn) { Promise.resolve().then(fn); },
+    localStorage: store.proxy,
+    sessionStorage: store.tagStorage('session'),
+    document: documentStub,
+    location: locationStub,
+    navigator: {
+      userAgent: 'SlideXRuntimeTest',
+      storage: {
+        getDirectory: async () => {
+          bag.fsWrites.push({ op: 'navigator.storage.getDirectory' });
+          store.writes.push({ op: 'fs', key: 'navigator.storage.getDirectory', storage: 'idb' });
+          throw new Error('stub getDirectory');
+        },
+      },
+    },
+    indexedDB: {
+      open(name, version) {
+        bag.idb.push({ op: 'open', name, version });
+        store.writes.push({ op: 'idb-open', key: String(name), storage: 'idb' });
+        const req = {
+          result: null,
+          error: null,
+          onsuccess: null,
+          onerror: null,
+          onupgradeneeded: null,
+        };
+        // Microtasks (not setTimeout) so awaited saveMetaIDB/saveScreenshotFile can settle
+        // without depending on flushAsync to pump the timer queue.
+        const finishOpen = () => {
+          req.result = {
+            name: String(name),
+            objectStoreNames: { contains: () => true },
+            createObjectStore: () => ({ createIndex() {} }),
+            transaction: () => {
+              const tx = { oncomplete: null, onerror: null };
+              const storeApi = {
+                put: (v) => {
+                  store.writes.push({ op: 'idb-put', key: String(name), storage: 'idb' });
+                  const r = { onsuccess: null, onerror: null, result: v };
+                  Promise.resolve().then(() => {
+                    if (typeof r.onsuccess === 'function') r.onsuccess({ target: r });
+                    if (typeof tx.oncomplete === 'function') tx.oncomplete({ target: tx });
+                  });
+                  return r;
+                },
+                get: () => {
+                  const r = { onsuccess: null, onerror: null, result: null };
+                  Promise.resolve().then(() => {
+                    if (typeof r.onsuccess === 'function') r.onsuccess({ target: r });
+                    if (typeof tx.oncomplete === 'function') tx.oncomplete({ target: tx });
+                  });
+                  return r;
+                },
+              };
+              tx.objectStore = () => storeApi;
+              return tx;
+            },
+          };
+          if (typeof req.onupgradeneeded === 'function') {
+            try { req.onupgradeneeded({ target: req }); } catch (_) {}
+          }
+          if (typeof req.onsuccess === 'function') {
+            try { req.onsuccess({ target: req }); } catch (_) {}
+          }
+        };
+        Promise.resolve().then(finishOpen);
+        return req;
+      },
+    },
+    __SSP_WINDOW_ROLE: role === 'playlist' ? 'playlist' : 'main',
+    __SSP_WINDOW_LABEL: role === 'playlist' ? 'playlist-2' : 'main',
+    __TAURI__: {
+      core: {
+        invoke: async () => null,
+        convertFileSrc: (p) => 'asset://' + p,
+      },
+      event: {
+        listen: tauriListen,
+        emit: async () => {},
+      },
+      webviewWindow: {
+        getCurrentWebviewWindow: () => ({
+          label: role === 'playlist' ? 'playlist-2' : 'main',
+        }),
+      },
+      app: { getVersion: async () => '0.1.19' },
+      dialog: {
+        open: async () => null,
+        save: async () => null,
+      },
+    },
+    __TAURI_INTERNALS__: {},
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} }),
+    getComputedStyle: () => new Proxy({}, { get: () => '' }),
+    ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+    IntersectionObserver: class { observe() {} unobserve() {} disconnect() {} },
+    MutationObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
+    performance: { now: () => Date.now() },
+    screen: { width: 1920, height: 1080 },
+    devicePixelRatio: 1,
+    innerWidth: 1280,
+    innerHeight: 720,
+    scrollX: 0,
+    scrollY: 0,
+    alert() {},
+    confirm() { return false; },
+    prompt() { return null; },
+    open() { return null; },
+    close() {},
+    getSelection: () => ({ rangeCount: 0, removeAllRanges() {}, addRange() {} }),
+    Image: class { constructor() { this.onload = null; this.onerror = null; this.src = ''; this.width = 0; this.height = 0; } },
+    HTMLElement: class {},
+    CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init && init.detail; } },
+    Event: class { constructor(type) { this.type = type; } },
+    // Wired FS access pickers: getDirectoryHandle / getFileHandle / createWritable all record.
+    showOpenFilePicker: async () => [swMakeFileHandle(store, 'picked.bin')],
+    showSaveFilePicker: async () => swMakeFileHandle(store, 'export.bin'),
+    showDirectoryPicker: async () => swMakeDirHandle(store, 'Screenshots'),
+  };
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  sandbox.addEventListener = (type, fn) => { bag.domListeners.push({ id: 'window', type, fn }); };
+  sandbox.removeEventListener = () => {};
+  sandbox.dispatchEvent = () => true;
+  sandbox.attachEvent = undefined;
+  sandbox.__swBag = bag;
+
+  let loadError = null;
+  try {
+    vm.runInNewContext(coreSrc, sandbox, { filename: 'slidex-core.js' });
+  } catch (e) {
+    loadError = e;
+  }
+  assert.ok(sandbox.SlideXCore, 'SlideXCore must load' + (loadError ? ': ' + loadError.message : ''));
+
+  for (let i = 0; i < scripts.length; i++) {
+    try {
+      vm.runInNewContext(scripts[i], sandbox, { filename: 'inline-' + (i + 1) + '.js' });
+    } catch (e) {
+      bag.loadThrow.push({ script: i + 1, message: e && e.message });
+    }
+  }
+
+  if (role === 'playlist') {
+    try {
+      sandbox.__SSP_WINDOW_ROLE = 'playlist';
+      if (typeof sandbox.refreshWindowRoleFromTauri === 'function') sandbox.refreshWindowRoleFromTauri();
+    } catch (_) {}
+    assert.equal(sandbox.sspIsMainWindow(), false, 'playlist role must make sspIsMainWindow false');
+  } else {
+    assert.equal(sandbox.sspIsMainWindow(), true, 'main role must make sspIsMainWindow true');
+  }
+
+  try {
+    if (typeof sandbox.initPlaylistWindowSync === 'function') sandbox.initPlaylistWindowSync();
+  } catch (_) {}
+  try {
+    if (typeof sandbox.enterPlaylistWindowShell === 'function' && role === 'playlist') {
+      sandbox.enterPlaylistWindowShell();
+    }
+  } catch (_) {}
+
+  async function flushAsync() {
+    // Drain one-shot timeouts + microtasks. Fire each interval callback a few times.
+    // Cap total steps so runaway timer chains cannot hang the suite.
+    const intervalFires = new Map();
+    for (let step = 0; step < SW_RUNTIME_FLUSH_CAP; step++) {
+      await Promise.resolve();
+      await Promise.resolve();
+
+      let progressed = false;
+      for (const [id, t] of [...pendingTimers.entries()]) {
+        if (t.interval) continue;
+        pendingTimers.delete(id);
+        progressed = true;
+        try { t.fn(); } catch (_) {}
+      }
+      for (const [id, t] of [...pendingTimers.entries()]) {
+        if (!t.interval) continue;
+        const n = intervalFires.get(id) || 0;
+        if (n >= SW_RUNTIME_INTERVAL_FIRES) continue;
+        intervalFires.set(id, n + 1);
+        progressed = true;
+        try { t.fn(); } catch (_) {}
+      }
+
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const hasTimeouts = [...pendingTimers.values()].some(tm => !tm.interval);
+      if (!hasTimeouts && !progressed) break;
+    }
+  }
+
+  const directCalls = [];
+  async function callDirect(name, fn) {
+    directCalls.push(name);
+    try {
+      const ret = fn();
+      if (ret && typeof ret.then === 'function') {
+        // Pump microtasks + one-shot timers until the promise settles or the cap hits.
+        let settled = false;
+        let outcome;
+        let error;
+        ret.then(v => { settled = true; outcome = v; }, e => { settled = true; error = e; });
+        for (let i = 0; i < SW_RUNTIME_FLUSH_CAP && !settled; i++) {
+          // Only drain one-shot timers + microtasks here (intervals handled in flushAsync).
+          await Promise.resolve();
+          for (const [id, tm] of [...pendingTimers.entries()]) {
+            if (tm.interval) continue;
+            pendingTimers.delete(id);
+            try { tm.fn(); } catch (_) {}
+          }
+          await Promise.resolve();
+        }
+        if (!settled) {
+          bag.directErrors = bag.directErrors || [];
+          bag.directErrors.push({ name, message: 'timed out waiting for async save*' });
+          return;
+        }
+        if (error) throw error;
+        return outcome;
+      }
+      return ret;
+    } catch (e) {
+      bag.directErrors = bag.directErrors || [];
+      bag.directErrors.push({ name, message: e && e.message });
+    }
+  }
+
+  return (async () => {
+    await flushAsync();
+
+    await callDirect('saveKeyMap', () => sandbox.saveKeyMap && sandbox.saveKeyMap());
+    await callDirect('persistVideoSkipSec', () => sandbox.persistVideoSkipSec && sandbox.persistVideoSkipSec(7));
+    await callDirect('persistImageUpdatesSource', () => sandbox.persistImageUpdatesSource && sandbox.persistImageUpdatesSource({ v: 1 }));
+    await callDirect('saveItemLS', () => sandbox.saveItemLS && sandbox.saveItemLS({ id: 't1', name: 't1.jpg', type: 'image', customDur: 5000 }));
+    await callDirect('saveSessionBeforeExit', () => sandbox.saveSessionBeforeExit && sandbox.saveSessionBeforeExit(null));
+    await callDirect('forgetEmptiedSession', () => sandbox.forgetEmptiedSession && sandbox.forgetEmptiedSession());
+    await callDirect('removePlaylistFiles', () => {
+      if (!sandbox.removePlaylistFiles) return;
+      try {
+        sandbox.items = [{ id: 't1', name: 't1.jpg', type: 'image', path: '/t/t1.jpg' }];
+        sandbox.cur = 0;
+        sandbox.selectedItems = sandbox.selectedItems || new Set();
+      } catch (_) {}
+      return sandbox.removePlaylistFiles(['t1.jpg'], true, false);
+    });
+    await callDirect('soundtrack save', () => sandbox.__sspTestSoundtrackSave && sandbox.__sspTestSoundtrackSave());
+    await callDirect('saveMetaIDB', () => sandbox.saveMetaIDB && sandbox.saveMetaIDB('k', 1));
+    await callDirect('saveHandleIDB', () => sandbox.saveHandleIDB && sandbox.saveHandleIDB('h', {}));
+    await callDirect('saveScreenshotFile', () => sandbox.saveScreenshotFile && sandbox.saveScreenshotFile('x.png', new Blob(['x'])));
+    await callDirect('saveExportBlob', () => sandbox.saveExportBlob && sandbox.saveExportBlob('x.jpg', new Blob(['x'])));
+
+    await flushAsync();
+
+    let handlersRun = 0;
+    let handlersFailed = 0;
+    const allHandlers = [];
+    for (const h of bag.onHandlers) allHandlers.push({ kind: 'on', ...h, run: h.fn });
+    for (const h of bag.domListeners) allHandlers.push({ kind: 'addEventListener', id: h.id, type: h.type, prop: 'on' + h.type, run: h.fn });
+    for (const [id, node] of elements) {
+      for (const prop of ['onclick', 'onchange', 'oninput', 'onkeydown', 'onkeyup', 'onplaying', 'onpause']) {
+        if (typeof node[prop] === 'function' && !allHandlers.some(h => h.id === id && h.prop === prop)) {
+          allHandlers.push({ kind: 'on-direct', id, prop, run: node[prop] });
+        }
+      }
+    }
+
+    const keyHandlers = allHandlers.filter(h =>
+      (h.type === 'keydown' || h.type === 'keyup' || h.prop === 'onkeydown' || h.prop === 'onkeyup')
+    );
+    const nonKeyHandlers = allHandlers.filter(h => !keyHandlers.includes(h));
+
+    async function fireOne(h, ev) {
+      try {
+        const target = elements.get(h.id) || el(h.id || 'unknown');
+        const ret = h.run.call(target, ev || swFakeEvent(target));
+        if (ret && typeof ret.then === 'function') {
+          try { await ret; } catch (err) {
+            handlersFailed++;
+            bag.handlerErrors.push({ id: h.id, prop: h.prop, message: err && err.message });
+          }
+        }
+        handlersRun++;
+      } catch (err) {
+        handlersFailed++;
+        handlersRun++;
+        bag.handlerErrors.push({ id: h.id, prop: h.prop, message: err && err.message });
+      }
+    }
+
+    for (const h of nonKeyHandlers) {
+      await fireOne(h, swFakeEvent(elements.get(h.id) || el(h.id || 'unknown')));
+    }
+
+    // Nit: fire key listeners with each keymap key + Delete/Backspace/Escape/arrows,
+    // with and without Shift/Ctrl.
+    const keyList = swKeymapKeysFromHtml(html);
+    const modCombos = [
+      { shiftKey: false, ctrlKey: false },
+      { shiftKey: true, ctrlKey: false },
+      { shiftKey: false, ctrlKey: true },
+      { shiftKey: true, ctrlKey: true },
+    ];
+    for (const h of keyHandlers) {
+      for (const key of keyList) {
+        for (const mod of modCombos) {
+          await fireOne(h, swFakeEvent(elements.get(h.id) || el(h.id || 'unknown'), {
+            type: (h.type || (h.prop || '').replace(/^on/, '') || 'keydown'),
+            key,
+            code: key.length === 1 ? 'Key' + key.toUpperCase() : key,
+            ...mod,
+          }));
+        }
+      }
+    }
+
+    await flushAsync();
+
+    for (const [id] of pendingTimers) pendingTimers.delete(id);
+
+    const keys = store.writes.filter(w =>
+      w.op === 'setItem' || w.op === 'removeItem' || w.op === 'prop-set' || w.op === 'clear'
+      || w.op === 'idb-open' || w.op === 'idb-put' || w.op === 'createWritable'
+      || w.op === 'getDirectoryHandle' || w.op === 'getFileHandle' || w.op === 'fs'
+    ).map(w => w.key);
+
+    return {
+      writes: store.writes.slice(),
+      keys,
+      handlersRun,
+      handlersFailed,
+      handlerTotal: allHandlers.length,
+      handlerErrors: bag.handlerErrors.slice(),
+      directCalls,
+      loadThrow: bag.loadThrow.slice(),
+      directErrors: bag.directErrors || [],
+      sspIsMain: typeof sandbox.sspIsMainWindow === 'function' ? sandbox.sspIsMainWindow() : null,
+      hasSaveKeyMap: typeof sandbox.saveKeyMap === 'function',
+      hasSaveItemLS: typeof sandbox.saveItemLS === 'function',
+    };
+  })();
+}
+
+function swAssertCleanHandlers(label, result) {
+  const failAllow = new Set(SW_RUNTIME_ALLOW_HANDLER_FAIL.map(x => x.id + '|' + x.prop));
+  const unexpectedFails = (result.handlerErrors || []).filter(e => !failAllow.has(e.id + '|' + e.prop));
+  const loadAllow = new Set(SW_RUNTIME_ALLOW_LOAD_THROW.map(x => x.script + '|' + x.message));
+  const unexpectedLoad = (result.loadThrow || []).filter(t => !loadAllow.has(t.script + '|' + t.message));
+
+  if (SW_RUNTIME_ALLOW_HANDLER_FAIL.length === 0) {
+    assert.equal(result.handlersFailed, 0,
+      label + ' handlersFailed must be 0; errors=' + JSON.stringify(result.handlerErrors));
+  } else {
+    assert.equal(unexpectedFails.length, 0,
+      label + ' unexpected handler failures: ' + JSON.stringify(unexpectedFails));
+  }
+  if (SW_RUNTIME_ALLOW_LOAD_THROW.length === 0) {
+    assert.deepEqual(result.loadThrow, [],
+      label + ' loadThrow must be empty; got ' + JSON.stringify(result.loadThrow));
+  } else {
+    assert.equal(unexpectedLoad.length, 0,
+      label + ' unexpected loadThrow: ' + JSON.stringify(unexpectedLoad));
+  }
+}
+
+function swInjectRuntimeFixture(html, code) {
+  const tag = '<script>\n' + code + '\n</script>';
+  const body = html.lastIndexOf('</body>');
+  if (body !== -1) return html.slice(0, body) + tag + html.slice(body);
+  return html + tag;
+}
+
+function swInjectAfterSaveMetaIDB(html, code) {
+  const start = html.indexOf('async function saveMetaIDB');
+  assert.ok(start !== -1);
+  const enc = swEnclosingFn(html, start + 10);
+  assert.ok(enc);
+  return html.slice(0, enc.end) + code + html.slice(enc.end);
+}
+
+function swUnguardScreenshotFns(html0) {
+  let html = html0;
+  html = html.replace(
+    /async function getScreenshotDirHandle\(\) \{\s*if \(!sspIsMainWindow\(\)\) return null;/,
+    'async function getScreenshotDirHandle() {'
+  );
+  html = html.replace(
+    /async function saveScreenshotFile\(name, blob\) \{\s*if \(!sspIsMainWindow\(\)\) return false;/,
+    'async function saveScreenshotFile(name, blob) {'
+  );
+  assert.doesNotMatch(
+    html.slice(html.indexOf('async function getScreenshotDirHandle'), html.indexOf('async function getScreenshotDirHandle') + 120),
+    /sspIsMainWindow/
+  );
+  assert.doesNotMatch(
+    html.slice(html.indexOf('async function saveScreenshotFile'), html.indexOf('async function saveScreenshotFile') + 120),
+    /sspIsMainWindow/
+  );
+  return html;
+}
+
+function swInjectFiupdLateWrite(html0) {
+  const needle = "g('fiupd').onchange = function() {\n  if (!this.files[0]) return;\n";
+  assert.ok(html0.includes(needle), 'fiupd onchange shape not found');
+  return html0.replace(
+    needle,
+    needle + "  localStorage.setItem('fixture_fiupd_late', 'v');\n"
+  );
+}
+
+test('runtime: second window records no persisted writes; main records expected keys', async () => {
+  const html = swNoWriteHtml();
+  swSpanCache.clear();
+  swBlankCacheByStr.clear();
+
+  const child = await swRuntimeRun(html, 'playlist');
+  console.log('SW_RUNTIME playlist handlersRun=%d handlersFailed=%d loadThrow=%s',
+    child.handlersRun, child.handlersFailed, JSON.stringify(child.loadThrow));
+  assert.ok(child.hasSaveKeyMap, 'saveKeyMap must exist after script load');
+  assert.ok(child.hasSaveItemLS, 'saveItemLS must exist after script load');
+  assert.equal(child.sspIsMain, false);
+  assert.ok(child.handlersRun >= SW_RUNTIME_HANDLER_FLOOR,
+    `too few handlers ran as playlist (${child.handlersRun} < ${SW_RUNTIME_HANDLER_FLOOR}); stub gaps may be hiding writes`);
+  swAssertCleanHandlers('playlist', child);
+  assert.deepEqual(
+    child.writes,
+    [],
+    'second window wrote: ' + JSON.stringify(child.writes.slice(0, 20))
+  );
+
+  const main = await swRuntimeRun(html, 'main');
+  console.log('SW_RUNTIME main handlersRun=%d handlersFailed=%d loadThrow=%s',
+    main.handlersRun, main.handlersFailed, JSON.stringify(main.loadThrow));
+  assert.equal(main.sspIsMain, true);
+  assert.ok(main.handlersRun >= SW_RUNTIME_HANDLER_FLOOR,
+    `too few handlers ran as main (${main.handlersRun} < ${SW_RUNTIME_HANDLER_FLOOR})`);
+  swAssertCleanHandlers('main', main);
+  const mainKeys = [...new Set(main.writes.filter(w => w.op === 'setItem' || w.op === 'removeItem').map(w => w.key))].sort();
+  for (const key of ['ssp_keymap', 'ssp_video_skip_sec', 'ssp_image_updates', 'sspSoundtrackV1']) {
+    assert.ok(mainKeys.includes(key) || main.writes.some(w => w.key === key), 'main should record ' + key + '; got ' + mainKeys.join(','));
+  }
+  assert.ok(
+    main.writes.some(w => w.key === 'ssp_autosave' || w.key === 'ssp_default_dur' || String(w.key).startsWith('ssp|')),
+    'main should record session/default-dur/item keys'
+  );
+  assert.ok(
+    main.writes.some(w => w.op === 'idb-open' && w.key === 'SSP_v1'),
+    'main control must record IDB SSP_v1 open; writes=' + JSON.stringify(main.writes.filter(w => String(w.op).startsWith('idb')).slice(0, 10))
+  );
+  assert.ok(
+    main.writes.some(w => w.op === 'idb-put' && w.key === 'SSP_v1'),
+    'main control must record IDB SSP_v1 put; writes=' + JSON.stringify(main.writes.filter(w => String(w.op).startsWith('idb')).slice(0, 10))
+  );
+  // createWritable path exercised on main via saveScreenshotFile + wired pickers
+  assert.ok(
+    main.writes.some(w => w.op === 'createWritable'),
+    'main should record createWritable via saveScreenshotFile; ops=' + main.writes.map(w => w.op).filter((v, i, a) => a.indexOf(v) === i).join(',')
+  );
+
+  globalThis.__swRuntimeReport = {
+    childHandlersRun: child.handlersRun,
+    childHandlersFailed: child.handlersFailed,
+    childLoadThrow: child.loadThrow,
+    mainHandlersRun: main.handlersRun,
+    mainHandlersFailed: main.handlersFailed,
+    mainLoadThrow: main.loadThrow,
+    mainKeys,
+    childWrites: child.writes.length,
+    handlerFloor: SW_RUNTIME_HANDLER_FLOOR,
+    allowHandlerFail: SW_RUNTIME_ALLOW_HANDLER_FAIL,
+    allowLoadThrow: SW_RUNTIME_ALLOW_LOAD_THROW,
+  };
+});
+
+test('runtime fixtures: hoisted helper, i++ / 2, fiupd late-write, key write, unguarded screenshot', async () => {
+  const html0 = swNoWriteHtml();
+
+  const hoistedSafe = swInjectRuntimeFixture(html0, `
+document.addEventListener('change', onSkip);
+if (!sspIsMainWindow()) { /* register already happened */ }
+function onSkip(){ localStorage.setItem('fixture_hoisted', 'v'); }
+`);
+  const r1 = await swRuntimeRun(hoistedSafe, 'playlist');
+  assert.ok(
+    r1.writes.some(w => w.key === 'fixture_hoisted'),
+    'hoisted helper fixture must be caught at runtime; writes=' + JSON.stringify(r1.writes)
+  );
+
+  const divslash = swInjectRuntimeFixture(html0, `
+document.addEventListener('change', () => { let i = 0; i++ / 2; localStorage.setItem('fixture_divslash', 'v'); });
+`);
+  const r2 = await swRuntimeRun(divslash, 'playlist');
+  assert.ok(
+    r2.writes.some(w => w.key === 'fixture_divslash'),
+    'i++ / 2 fixture must be caught at runtime; writes=' + JSON.stringify(r2.writes)
+  );
+
+  // fiupd late-write: a write after this.files[0] must be seen when onchange fires.
+  const fiupdHtml = swInjectFiupdLateWrite(html0);
+  const r3 = await swRuntimeRun(fiupdHtml, 'playlist');
+  assert.ok(
+    r3.writes.some(w => w.key === 'fixture_fiupd_late'),
+    'fiupd late-write fixture must be caught; writes=' + JSON.stringify(r3.writes.slice(0, 20))
+  );
+
+  // Key-specific write: keydown listener must fire for keymap keys.
+  const keyHtml = swInjectRuntimeFixture(html0, `
+document.addEventListener('keydown', function onFixtureKey(e) {
+  if (e.key === 'ArrowRight') localStorage.setItem('fixture_key_arrowright', 'v');
+});
+`);
+  const r4 = await swRuntimeRun(keyHtml, 'playlist');
+  assert.ok(
+    r4.writes.some(w => w.key === 'fixture_key_arrowright'),
+    'key-specific fixture must be caught; writes=' + JSON.stringify(r4.writes.slice(0, 20))
+  );
+
+  // Unguarded saveScreenshotFile + getScreenshotDirHandle must record FS writes as playlist.
+  const shotHtml = swUnguardScreenshotFns(html0);
+  const r5 = await swRuntimeRun(shotHtml, 'playlist');
+  assert.ok(
+    r5.writes.some(w => w.op === 'createWritable' || w.op === 'getFileHandle' || w.op === 'getDirectoryHandle'),
+    'unguarded screenshot fixture must record FS writes; writes=' + JSON.stringify(r5.writes.slice(0, 20))
+  );
+});
+
+test('runtime mutation: removing a guard makes the second window record a write; main still writes', async () => {
+  const html0 = swNoWriteHtml();
+  const start = html0.indexOf('function saveKeyMap()');
+  assert.ok(start !== -1);
+  const guardedSnippet = html0.slice(start, start + 320);
+  assert.match(guardedSnippet, /if \(sspIsMainWindow\(\)\)/);
+  const html = html0.slice(0, start) + html0.slice(start).replace(
+    /function saveKeyMap\(\) \{\s*\/\/[^\n]*\n\s*if \(sspIsMainWindow\(\)\) \{\s*try \{ localStorage\.setItem\(KEYMAP_LS, JSON\.stringify\(keyMap\)\); \} catch \(_\) \{\}\s*\}\s*if \(typeof refreshMoreToolsTooltip === 'function'\) refreshMoreToolsTooltip\(\);\s*\}/,
+    `function saveKeyMap() {
+  try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}
+  if (typeof refreshMoreToolsTooltip === 'function') refreshMoreToolsTooltip();
+}`,
+    1
+  );
+  assert.doesNotMatch(html.slice(start, start + 220), /if \(sspIsMainWindow\(\)\)/);
+
+  const child = await swRuntimeRun(html, 'playlist');
+  assert.ok(
+    child.writes.some(w => w.key === 'ssp_keymap'),
+    'unguarded saveKeyMap must write as playlist; writes=' + JSON.stringify(child.writes.slice(0, 15))
+  );
+
+  const main = await swRuntimeRun(html0, 'main');
+  assert.ok(main.writes.some(w => w.key === 'ssp_keymap'), 'main control must still record ssp_keymap');
+  assert.ok(main.handlersRun >= SW_RUNTIME_HANDLER_FLOOR, 'main control handler floor');
+  swAssertCleanHandlers('main-mutation-control', main);
+});
+
+
+
+test('main writes saved settings; the second window does not (KEYMAP, default dur, transition, video skip, image updates, autosave, item keys)', () => {
+  const html = swNoWriteHtml();
+  const isMainSrc = swIsMainSrc(html);
+
+  const run = (isChild, src, invoke) => {
+    const writes = [];
+    const sb = {
+      SSP_IS_PLAYLIST_WINDOW: isChild,
+      refreshWindowRoleFromTauri() {},
+      videoSkipSec: 5,
+      clampVideoSkipSec: (s) => Number(s) || 5,
+      VIDEO_SKIP_LS: 'ssp_video_skip_sec',
+      sharedImageUpdates: null,
+      normalizeImageUpdatesSource: (d) => d,
+      keyMap: { next: 'ArrowRight' },
+      KEYMAP_LS: 'ssp_keymap',
+      refreshMoreToolsTooltip() {},
+      sessionLoaded: true,
+      sessionDirty: true,
+      autoSaveTimer: null,
+      ensureItemId: (it) => { it.id = it.id || 'id1'; },
+      lsKey: (it) => 'ssp|' + (typeof it === 'string' ? it : it.id),
+      g: (id) => {
+        if (id === 'dsel') return { value: '8000' };
+        if (id === 'vskip') return { value: '5' };
+        return null;
+      },
+      transitionType: 'fade',
+      tmr: null,
+      ptmr: null,
+      cur: 0,
+      playing: false,
+      isV: () => false,
+      startKB() {},
+      startProg() {},
+      schedNext() {},
+      clearInterval() {},
+      localStorage: {
+        setItem: (k, v) => writes.push(['set', k]),
+        removeItem: (k) => writes.push(['rm', k]),
+        getItem: () => null,
+      },
+      clearTimeout() {},
+      getPlaylistSnapshot: () => ({ items: [{ id: 'a' }], cur: 0 }),
+      notifyPlaylistSync() {},
+      getMediaItems: () => [],
+      window: { __sspCastActive: false },
+      SlideXCore: null,
+    };
+    sb.window = sb;
+    // Use the real sspIsMainWindow from the page (refreshes role first).
+    vm.runInNewContext(isMainSrc + src + '\n' + invoke, sb);
+    return writes;
+  };
+
+  // saveKeyMap / KEYMAP_LS
+  {
+    const src = swSlice(html, 'function saveKeyMap() {', '\nloadKeyMap();');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'saveKeyMap();'), [['set', 'ssp_keymap']]);
+    assert.deepEqual(run(true, src, 'saveKeyMap();'), []);
+  }
+
+  // persistVideoSkipSec / VIDEO_SKIP_LS
+  {
+    const src = swSlice(html, 'function persistVideoSkipSec(sec) {', '\nlet videoNavLast');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'persistVideoSkipSec(7);').filter(w => w[0] === 'set'), [['set', 'ssp_video_skip_sec']]);
+    assert.deepEqual(run(true, src, 'persistVideoSkipSec(7);').filter(w => w[0] === 'set'), []);
+  }
+
+  // persistImageUpdatesSource / ssp_image_updates
+  {
+    const src = swSlice(html, 'function persistImageUpdatesSource(data) {', '\nfunction applySharedImageUpdates');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'persistImageUpdatesSource({v:1});'), [['set', 'ssp_image_updates']]);
+    assert.deepEqual(run(true, src, 'persistImageUpdatesSource({v:1});'), []);
+  }
+
+  // forgetEmptiedSession / ssp_autosave remove
+  {
+    const src = swSlice(html, 'function forgetEmptiedSession() {', '\nfunction removeItem');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    assert.deepEqual(run(false, src, 'forgetEmptiedSession();'), [['rm', 'ssp_autosave']]);
+    assert.deepEqual(run(true, src, 'forgetEmptiedSession();'), []);
+  }
+
+  // saveSessionBeforeExit / ssp_default_dur + ssp_autosave set
+  {
+    const src = swSlice(html, 'function saveSessionBeforeExit(ack) {', '\nfunction autoSave()');
+    assert.match(src, /if \(!sspIsMainWindow\(\)\) return;/);
+    const main = run(false, src, 'saveSessionBeforeExit(null);');
+    assert.ok(main.some(w => w[0] === 'set' && w[1] === 'ssp_default_dur'), 'main sets default dur');
+    assert.ok(main.some(w => w[0] === 'set' && w[1] === 'ssp_autosave'), 'main sets autosave');
+    assert.deepEqual(run(true, src, 'saveSessionBeforeExit(null);'), []);
+  }
+
+  // dsel.onchange / ssp_default_dur (second place)
+  {
+    const src = swSlice(html, "g('dsel').onchange = () => {", '\n(function initDefaultImageDuration');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    const body = src.replace(/^g\('dsel'\)\.onchange = /, 'const __dsel = ').replace(/;\s*$/, '');
+    assert.deepEqual(
+      run(false, body + '\n', '__dsel();').filter(w => w[1] === 'ssp_default_dur'),
+      [['set', 'ssp_default_dur']]
+    );
+    assert.deepEqual(
+      run(true, body + '\n', '__dsel();').filter(w => w[1] === 'ssp_default_dur'),
+      []
+    );
+  }
+
+  // tsel.onchange / ssp_transition
+  {
+    const src = swSlice(html, "g('tsel').onchange = function() {", '\n(function initVideoSkipControl');
+    assert.match(src, /sspIsMainWindow\(\)/);
+    const body = src.replace(/^g\('tsel'\)\.onchange = /, 'const __tsel = ').replace(/;\s*$/, '');
+    assert.deepEqual(
+      run(false, body + '\n', '__tsel.call({ value: "cut" });').filter(w => w[1] === 'ssp_transition'),
+      [['set', 'ssp_transition']]
+    );
+    assert.deepEqual(
+      run(true, body + '\n', '__tsel.call({ value: "cut" });').filter(w => w[1] === 'ssp_transition'),
+      []
+    );
+  }
+
+  // removePlaylistFiles item-key removals
+  {
+    const src = swSlice(html, 'function removePlaylistFiles(files, clearLS, byPath) {', '\nasync function otherPlaylistNames');
+    assert.match(src, /clearLS && sspIsMainWindow\(\)/);
+    const harness = `
+      ${src}
+      window.SlideXCore = {
+        removePlaylistMatches: () => ({
+          removed: true,
+          matched: [{ id: 'a', name: 'a.jpg' }],
+          items: [],
+          cur: 0
+        })
+      };
+      items = [{ id: 'a', name: 'a.jpg', type: 'image' }];
+      cur = 0;
+      selectedItems = { clear() {} };
+      getMediaItems = () => [];
+      forgetEmptiedSession = () => {};
+      rebuildSlides = () => {};
+      autoSave = () => {};
+      g = () => ({ click() {} });
+    `;
+    const main = run(false, harness, 'removePlaylistFiles(["a.jpg"], true, false);');
+    assert.ok(main.some(w => w[0] === 'rm' && w[1] === 'ssp|a'), 'main removes item key by id');
+    assert.ok(main.some(w => w[0] === 'rm' && w[1] === 'ssp|a.jpg'), 'main removes item key by name');
+    assert.deepEqual(run(true, harness, 'removePlaylistFiles(["a.jpg"], true, false);'), []);
+  }
+
+  // saveItemLS
+  {
+    const src = swSlice(html, 'function saveItemLS(item) {', '\nfunction applyImageUpdates');
+    assert.match(src, /^function saveItemLS\(item\) \{\n\s*\/\/[^\n]*\n\s*if \(!sspIsMainWindow\(\)\) return;/);
+    assert.deepEqual(run(false, src, 'saveItemLS({ id: "x", customDur: 1 });'), [['set', 'ssp|x']]);
+    assert.deepEqual(run(true, src, 'saveItemLS({ id: "x", customDur: 1 });'), []);
+  }
+
+  // saveMetaIDB / saveScreenshotFile guards
+  {
+    assert.match(html, /async function saveMetaIDB\([^)]*\) \{\n\s*if \(!sspIsMainWindow\(\)\) return;/);
+    assert.match(html, /async function saveScreenshotFile\([^)]*\) \{\n\s*if \(!sspIsMainWindow\(\)\) return false;/);
+  }
+});
+
+test('removing the sspIsMainWindow guard from a saved-settings write makes the behaviour test fail', () => {
+  const html = swNoWriteHtml();
+  const isMainSrc = swIsMainSrc(html);
+  let src = swSlice(html, 'function saveKeyMap() {', '\nloadKeyMap();');
+  src = src.replace(/\n\s*\/\/[^\n]*\n\s*if \(sspIsMainWindow\(\)\) \{\n\s*try \{ localStorage\.setItem\(KEYMAP_LS, JSON\.stringify\(keyMap\)\); \} catch \(_\) \{\}\n\s*\}/,
+    '\n  try { localStorage.setItem(KEYMAP_LS, JSON.stringify(keyMap)); } catch (_) {}');
+  assert.doesNotMatch(src, /sspIsMainWindow/);
+  const writes = [];
+  const sb = {
+    SSP_IS_PLAYLIST_WINDOW: true,
+    refreshWindowRoleFromTauri() {},
+    keyMap: { next: 'ArrowRight' },
+    KEYMAP_LS: 'ssp_keymap',
+    refreshMoreToolsTooltip() {},
+    localStorage: { setItem: (k) => writes.push(k) },
+  };
+  vm.runInNewContext(isMainSrc + src + '\nsaveKeyMap();', sb);
+  assert.deepEqual(writes, ['ssp_keymap'], 'without the guard the second window would write');
+});
+
+// ---- 0.2.0 undock hardening (#55 follow-ups) ----
+
+function undockHtml() {
+  return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+}
+function sliceFrom(src, startMarker, endMarker) {
+  const start = src.indexOf(startMarker);
+  assert.ok(start !== -1, 'found ' + startMarker);
+  const end = src.indexOf(endMarker, start + startMarker.length);
+  assert.ok(end > start, 'found end ' + endMarker);
+  return src.slice(start, end);
+}
+
+test('saveItemLS never writes localStorage in the second window, including after the role late-binds', () => {
+  const html = undockHtml();
+  const isMainSrc = sliceFrom(html, 'function sspIsMainWindow()', '\n}\n') + '\n}\n';
+  const saveSrc = sliceFrom(html, 'function saveItemLS(item) {', '\nfunction applyImageUpdates');
+  assert.match(saveSrc, /^function saveItemLS\(item\) \{\n\s*\/\/[^\n]*\n\s*if \(!sspIsMainWindow\(\)\) return;/, 'the guard is the first statement');
+  assert.match(isMainSrc, /^function sspIsMainWindow\(\) \{\n\s*try \{ refreshWindowRoleFromTauri\(\); \} catch \(_\) \{\}\n\s*return !SSP_IS_PLAYLIST_WINDOW;/, 'role is refreshed first');
+  // tauriLabel: what refreshWindowRoleFromTauri would find (null = not bound yet).
+  const run = (isChild, tauriLabel, flipLater) => {
+    const writes = [];
+    const sb = {
+      SSP_IS_PLAYLIST_WINDOW: isChild,
+      refreshWindowRoleFromTauri() {
+        if (sb.tauriLabel === 'playlist' || /^playlist-[2-9]$/.test(sb.tauriLabel || '')) sb.SSP_IS_PLAYLIST_WINDOW = true;
+        return sb.SSP_IS_PLAYLIST_WINDOW;
+      },
+      tauriLabel,
+      ensureItemId: (it) => { it.id = it.id || 'id1'; },
+      lsKey: (it) => 'ssp_item_' + it.id,
+      localStorage: { setItem: (k, v) => writes.push(k), removeItem: () => {} },
+    };
+    vm.runInNewContext(isMainSrc + saveSrc, sb);
+    if (flipLater) sb.SSP_IS_PLAYLIST_WINDOW = true;
+    vm.runInNewContext('saveItemLS({ id: "a", customDur: 6000 });', sb);
+    return writes;
+  };
+  assert.deepEqual(run(false, 'main', false), ['ssp_item_a'], 'main still saves');
+  assert.deepEqual(run(true, null, false), [], 'second window writes nothing');
+  assert.deepEqual(run(false, null, true), [], 'the guard reads the role live');
+  assert.deepEqual(run(false, 'playlist-2', false), [], 'the role late-binds from the Tauri label before the first write');
+});
+
+test('the soundtrack save() is guarded to the main window, not only hidden by CSS', () => {
+  const html = undockHtml();
+  const isMainSrc = sliceFrom(html, 'function sspIsMainWindow()', '\n}\n') + '\n}\n';
+  const block = html.slice(html.indexOf("var LS_KEY = 'sspSoundtrackV1';"));
+  const saveSrc = sliceFrom(block, '  function save() {', '\n  function toast(');
+  assert.match(saveSrc, /sspIsMainWindow\(\)/);
+  const run = (isChild) => {
+    const writes = [];
+    const sb = {
+      SSP_IS_PLAYLIST_WINDOW: isChild,
+      refreshWindowRoleFromTauri: () => {},
+      isMain: !isChild,
+      LS_KEY: 'sspSoundtrackV1',
+      q: { tracks: [] },
+      C: { serializeAudioQueue: () => '{}' },
+      sspIsTauri: () => true,
+      localStorage: { setItem: (k) => writes.push(k) },
+    };
+    vm.runInNewContext(isMainSrc + saveSrc + '\nsave();', sb);
+    return writes;
+  };
+  assert.deepEqual(run(false), ['sspSoundtrackV1']);
+  assert.deepEqual(run(true), [], 'the second window never writes the soundtrack');
+});
+
+test('a reopen after a slow destroy rebuilds the Media Manager instead of focusing the dying window', () => {
+  const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
+  const sw = fs.readFileSync(new URL('./src-tauri/src/second_window.rs', import.meta.url), 'utf8');
+  assert.match(lib, /^mod second_window;$/m);
+  assert.match(lib, /\.manage\(SecondWindowState::default\(\)\)/);
+  // No command looks the window up by the fixed label any more: the slot decides.
+  assert.doesNotMatch(lib, /get_webview_window\("playlist"\)/);
+  const open = sliceFrom(lib, 'async fn open_playlist_window', 'fn close_playlist_window');
+  assert.match(open, /slot\.on_open\(/);
+  assert.match(open, /OpenAction::Build\(label\)[\s\S]*build_playlist_window\(&handle, &built\)/);
+  assert.match(open, /async fn open_playlist_window\(app: AppHandle, window: tauri::WebviewWindow\) -> Result<String, String>/);
+  assert.match(open, /second_window::require_main\(window\.label\(\), "open"\)\?/, 'main only (logic unit-tested in second_window.rs)');
+  assert.match(open, /Ok\(label\)[\s\S]*Ok\(label\)/, 'returns the label it focused or built');
+  const close = sliceFrom(lib, 'fn close_playlist_window', 'fn focus_playlist_window');
+  // The close flow (caller check, emit, destroy) is second_window::handle_close, tested in Rust with a fake host.
+  assert.match(close, /window: tauri::WebviewWindow/);
+  assert.match(close, /second_window::handle_close\(&state, window\.label\(\), &TauriWindowHost\(&app\)\)/);
+  assert.match(sw, /fn close_flow_emits_and_destroys_from_the_right_callers/);
+  const focus = sliceFrom(lib, 'fn focus_playlist_window', '\n}\n');
+  assert.match(focus, /second_window::require_main\(window\.label\(\), "focus"\)\?/, 'main only');
+  assert.match(focus, /slot\.focus_target\(/);
+  assert.match(focus, /FocusTarget::Pending => Ok\(\(\)\)/, 'a pending build is open: main does not re-dock');
+  assert.match(sw, /fn a_pending_build_counts_as_open_for_focus_and_reopen/);
+  assert.match(sw, /fn callers_are_main_a_media_manager_label_or_refused/);
+  assert.doesNotMatch(lib, /fn require_main_caller/, 'one caller check, in the pure module');
+  const build = sliceFrom(lib, 'fn build_playlist_window', '\n}\n');
+  assert.match(build, /slot\.on_built\(label, true\)[\s\S]{0,200}if !keep \{\s*let _ = w\.destroy\(\);/, 'a stray window from a dock race is destroyed');
+  assert.match(build, /Err\(e\) => \{[\s\S]{0,200}slot\.on_built\(label, false\)/, 'a failed build is no longer pending');
+  assert.match(lib, /slot\.on_destroyed\(window\.label\(\)\)[\s\S]{0,300}if report/);
+  assert.match(lib, /poisoned lock[\s\S]{0,700}\.map\(\|mut slot\| slot\.on_destroyed\(window\.label\(\)\)\)\s*\.unwrap_or\(true\)/, 'the poisoned-lock fallback is explained');
+  assert.match(sw, /fn a_late_close_from_the_closing_window_leaves_playlist_2_open/);
+  assert.match(sw, /fn labels_are_capped_at_playlist_9/);
+  assert.match(sw, /fn failed_builds_leave_no_phantom_closing_labels/);
+  assert.doesNotMatch(sw, /^use tauri|tauri::/m, 'the slot stays pure so it can be tested without a Tauri build');
+  // Capabilities list the exact labels, no wildcard, and they match second_window::LABELS.
+  const caps = JSON.parse(fs.readFileSync(new URL('./src-tauri/capabilities/default.json', import.meta.url), 'utf8'));
+  const labels = [...sw.match(/pub const LABELS: \[&str; 9\] = \[([\s\S]*?)\];/)[1].matchAll(/"([^"]+)"/g)].map(m => m[1]);
+  assert.deepEqual(labels, ['playlist', ...[2, 3, 4, 5, 6, 7, 8, 9].map(n => 'playlist-' + n)]);
+  assert.deepEqual(caps.windows, ['main', ...labels]);
+  assert.ok(!caps.windows.some(w => w.includes('*')), 'no wildcard window rule');
+  // The Media Manager windows cannot create windows outside the Rust bookkeeping.
+  assert.ok(!caps.permissions.includes('core:webview:allow-create-webview-window'));
+  assert.ok(!caps.permissions.some(p => typeof p === 'string' && /create-webview/.test(p)));
+  // ...and no page code needs it: nothing constructs a WebviewWindow or calls a create command.
+  for (const f of ['./SlideShowPro.html', './slidex-core.js', './index.html']) {
+    const src = fs.readFileSync(new URL(f, import.meta.url), 'utf8');
+    assert.doesNotMatch(src, /new\s+(WW\.)?WebviewWindow\b|plugin:webview\|create|create_webview/, f);
+  }
+  const html = undockHtml();
+  assert.match(html, /\/\^playlist\(-\[2-9\]\)\?\$\/\.test\(cur\.label/);
+  // Main keeps the label Rust returned and gives it to the hub; the child sends its own.
+  const undock = sliceFrom(html, 'async function undockPlaylistWindow', 'function swRedockMain');
+  assert.match(undock, /label = await tauriInvoke\('open_playlist_window'\);/);
+  assert.match(undock, /swHub\.open\(label\)/);
+  assert.match(html, /SlideXCore\.createSwChild\(\{ send: swEmit, from: swOwnLabel\(\) \}\)/);
+  // Main still waits up to 2 s for sw://closed before it reopens.
+  assert.match(undock, /await swWaitChildClosed\(2000\)/);
+});
+
+test('second_window.rs unit tests pass (rustc --test; fails in CI, skips locally, when rustc is missing)', async (t) => {
+  const { spawnSync } = await import('node:child_process');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  if (spawnSync('rustc', ['--version']).status !== 0) {
+    // In CI these tests must run, so a missing rustc is a failure, not a skip.
+    if (process.env.CI === 'true') assert.fail('rustc is required in CI to run second_window.rs tests');
+    t.skip('rustc not installed');
+    return;
+  }
+  const src = new URL('./src-tauri/src/second_window.rs', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+  const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sw-')), process.platform === 'win32' ? 'sw.exe' : 'sw');
+  const build = spawnSync('rustc', ['--edition', '2021', '--test', src, '-o', out], { encoding: 'utf8' });
+  assert.equal(build.status, 0, build.stderr);
+  const run = spawnSync(out, [], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.match(run.stdout, /test result: ok\. 12 passed; 0 failed/);
+});
+
+test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and bad payloads', () => {
+  const html = undockHtml();
+  const helpers = sliceFrom(html, 'function swMediaIds()', '\n\n/** Main: the state the second window renders. */');
+  const applySrc = sliceFrom(html, 'function swApplyIntent(intent) {', '\nfunction swEnsureHub()');
+  const core = fs.readFileSync(new URL('./slidex-core.js', import.meta.url), 'utf8');
+  const normSrc = sliceFrom(core, 'function swNormalizeIntent(msg) {', '\n  /*');
+  const opsIn = (src) => new Set([...src.matchAll(/case '([A-Za-z]+)':/g)].map(m => m[1]));
+  const allowed = opsIn(normSrc);
+  assert.deepEqual([...opsIn(applySrc)].sort(), [...allowed].sort(), 'main handles exactly the allowed ops');
+
+  function makeMain(over = {}) {
+    const calls = [];
+    const spy = (name) => (...a) => { calls.push([name, ...a]); };
+    const buttons = {
+      plshuffle: { hidden: false, disabled: false, click: () => calls.push(['click', 'plshuffle']) },
+      plsave: { hidden: true, disabled: false, click: () => calls.push(['click', 'plsave']) },
+    };
+    const sb = {
+      SlideXCore: C,
+      items: [
+        { id: 'a', type: 'image', name: 'a.jpg' },
+        { id: 'b', type: 'image', name: 'b.jpg' },
+        { id: 'f', type: 'folder', name: 'Trip', open: true },
+        { id: 'v', type: 'video', name: 'v.mp4' },
+        { id: 'c', type: 'image', name: 'c.jpg' },
+      ],
+      selectedItems: new Set([1]),
+      lastClickedMI: 1,
+      cur: 1,
+      g: (id) => buttons[id] || null,
+      goTo: spy('goTo'),
+      togglePlay: spy('togglePlay'),
+      updSelBadge: spy('updSelBadge'),
+      renderPlaylist: spy('renderPlaylist'),
+      buildPlRows: spy('buildPlRows'),
+      playlistChromeOpen: () => false,
+      autoSave: spy('autoSave'),
+      schedAutoSave: spy('schedAutoSave'),
+      saveItemLS: (it) => calls.push(['saveItemLS', it.id]),
+      applyKBNow: spy('applyKBNow'),
+      dockPlaylistWindow: spy('dockPlaylistWindow'),
+      removeItem: (idx) => { calls.push(['removeItem', sb.items[idx].id]); sb.items.splice(idx, 1); },
+      applyReorderResult: (r) => { calls.push(['applyReorderResult']); sb.items = r.items; },
+      getMediaItems: () => sb.items.filter(it => it.type !== 'folder'),
+      ...over,
+    };
+    vm.runInNewContext(helpers + '\n' + applySrc, sb);
+    const sent = [];
+    const hub = C.createSwHub({ send: (ev, p) => sent.push(ev), snapshot: () => ({ n: sb.items.length }), apply: (i) => sb.swApplyIntent(i) });
+    hub.open('playlist');
+    return { sb, calls, hub, sent };
+  }
+  const ids = (sb) => Array.from(sb.items, it => it.id);
+  const named = (calls, name) => calls.filter(c => c[0] === name).map(c => c.slice(1));
+
+  // [label, message, expected { ok, reason }, check(state)]
+  const rows = [
+    ['goTo', { op: 'goTo', id: 'c' }, true, ({ sb, calls }) => {
+      assert.deepEqual(named(calls, 'goTo'), [[3, 'user']]);
+      assert.equal(sb.selectedItems.size, 1, 'selection kept without clearSelection');
+    }],
+    ['goTo clearSelection', { op: 'goTo', id: 'b', clearSelection: true }, true, ({ sb, calls }) => {
+      assert.equal(sb.selectedItems.size, 0);
+      assert.equal(sb.lastClickedMI, 1);
+      assert.deepEqual(named(calls, 'goTo'), [[1, 'user']]);
+    }],
+    ['goTo folder id', { op: 'goTo', id: 'f' }, 'refused', ({ calls }) => assert.equal(named(calls, 'goTo').length, 0)],
+    ['goTo unknown id', { op: 'goTo', id: 'zz' }, 'refused'],
+    ['goTo numeric id', { op: 'goTo', id: 3 }, 'invalid'],
+    ['select', { op: 'select', ids: ['a', 'c'], lastId: 'c' }, true, ({ sb }) => {
+      assert.deepEqual([...sb.selectedItems].sort(), [0, 3]);
+      assert.equal(sb.lastClickedMI, 3);
+    }],
+    ['select none', { op: 'select', ids: [], lastId: null }, true, ({ sb }) => {
+      assert.equal(sb.selectedItems.size, 0);
+      assert.equal(sb.lastClickedMI, -1);
+    }],
+    ['select ids not a list', { op: 'select', ids: 'a' }, 'invalid'],
+    ['select bad lastId', { op: 'select', ids: ['a'], lastId: 7 }, 'invalid'],
+    ['step +1', { op: 'step', dir: 1 }, true, ({ calls }) => assert.deepEqual(named(calls, 'goTo'), [[2, 'user']])],
+    ['step -1', { op: 'step', dir: -1 }, true, ({ calls }) => assert.deepEqual(named(calls, 'goTo'), [[0, 'user']])],
+    ['step 5', { op: 'step', dir: 5 }, 'invalid'],
+    ['step "1"', { op: 'step', dir: '1' }, 'invalid'],
+    ['togglePlay', { op: 'togglePlay' }, true, ({ calls }) => assert.equal(named(calls, 'togglePlay').length, 1)],
+    ['reorder', { op: 'reorder', order: ['c', 'f', 'v', 'b', 'a'] }, true, ({ sb }) => {
+      assert.deepEqual(ids(sb), ['c', 'f', 'v', 'b', 'a']);
+      assert.deepEqual([...sb.selectedItems], [2], 'selection follows the item (b)');
+    }],
+    ['reorder partial', { op: 'reorder', order: ['a', 'b'] }, 'refused', ({ sb }) => assert.deepEqual(ids(sb), ['a', 'b', 'f', 'v', 'c'])],
+    ['reorder duplicates', { op: 'reorder', order: ['a', 'a', 'f', 'v', 'c'] }, 'invalid'],
+    ['reorder not a list', { op: 'reorder', order: 'abc' }, 'invalid'],
+    ['remove', { op: 'remove', ids: ['b', 'f'] }, true, ({ sb, calls }) => {
+      assert.deepEqual(ids(sb), ['a', 'v', 'c']);
+      assert.deepEqual(named(calls, 'removeItem'), [['b']], 'folders are spliced, media go through removeItem');
+      assert.equal(named(calls, 'autoSave').length, 1);
+    }],
+    ['remove unknown', { op: 'remove', ids: ['zz'] }, 'refused', ({ sb }) => assert.equal(sb.items.length, 5)],
+    ['remove not a list', { op: 'remove', ids: 'b' }, 'invalid'],
+    ['toggleFolder', { op: 'toggleFolder', id: 'f' }, true, ({ sb }) => assert.equal(sb.items[2].open, false)],
+    ['toggleFolder on an image', { op: 'toggleFolder', id: 'a' }, 'refused'],
+    ['renameFolder', { op: 'renameFolder', id: 'f', name: '  Beach  ' }, true, ({ sb }) => assert.equal(sb.items[2].name, 'Beach')],
+    ['renameFolder on an image', { op: 'renameFolder', id: 'a', name: 'x' }, 'refused', ({ sb }) => assert.equal(sb.items[0].name, 'a.jpg')],
+    ['renameFolder blank', { op: 'renameFolder', id: 'f', name: '   ' }, 'invalid'],
+    ['renameFolder too long', { op: 'renameFolder', id: 'f', name: 'x'.repeat(201) }, 'invalid'],
+    ['setDuration', { op: 'setDuration', id: 'a', ms: 6000 }, true, ({ sb, calls }) => {
+      assert.equal(sb.items[0].customDur, 6000);
+      assert.deepEqual(named(calls, 'saveItemLS'), [['a']]);
+    }],
+    ['setDuration on a video', { op: 'setDuration', id: 'v', ms: 6000 }, 'refused', ({ calls }) => assert.equal(named(calls, 'saveItemLS').length, 0)],
+    ['setDuration odd ms', { op: 'setDuration', id: 'a', ms: 1234 }, 'invalid'],
+    ['setKenBurns on current', { op: 'setKenBurns', id: 'b', preset: 3 }, true, ({ sb, calls }) => {
+      assert.equal(sb.items[1].kbPreset, 3);
+      assert.equal(named(calls, 'applyKBNow').length, 1, 'current slide updates now');
+    }],
+    ['setKenBurns auto', { op: 'setKenBurns', id: 'a', preset: 'auto' }, true, ({ sb, calls }) => {
+      assert.equal(sb.items[0].kbPreset, undefined);
+      assert.equal(named(calls, 'applyKBNow').length, 0, 'not the current slide');
+    }],
+    ['setKenBurns on a folder', { op: 'setKenBurns', id: 'f', preset: 2 }, 'refused'],
+    ['setKenBurns 64', { op: 'setKenBurns', id: 'a', preset: 64 }, 'invalid'],
+    ['setKenBurns 1.5', { op: 'setKenBurns', id: 'a', preset: 1.5 }, 'invalid'],
+    ['tool', { op: 'tool', id: 'plshuffle' }, true, ({ calls }) => assert.deepEqual(named(calls, 'click'), [['plshuffle']])],
+    ['tool hidden', { op: 'tool', id: 'plsave' }, 'refused', ({ calls }) => assert.equal(named(calls, 'click').length, 0)],
+    ['tool missing button', { op: 'tool', id: 'pllocate' }, 'refused'],
+    ['tool not allowed', { op: 'tool', id: 'bdel' }, 'invalid'],
+    ['dock', { op: 'dock' }, true, ({ calls }) => assert.equal(named(calls, 'dockPlaylistWindow').length, 1)],
+    // Unknown ops and non-intents never reach swApplyIntent.
+    ['unknown op eval', { op: 'eval', code: 'x' }, 'invalid'],
+    ['unknown op setItems', { op: 'setItems', items: [] }, 'invalid'],
+    ['unknown op __proto__', { op: '__proto__' }, 'invalid'],
+    ['unknown op constructor', { op: 'constructor' }, 'invalid'],
+    ['no op', {}, 'invalid'],
+    ['op not a string', { op: 1 }, 'invalid'],
+  ];
+  const covered = new Set();
+  for (const [label, msg, expect, check] of rows) {
+    const m = makeMain();
+    const applied = [];
+    const realApply = m.sb.swApplyIntent;
+    m.sb.swApplyIntent = (i) => { applied.push(i.op); return realApply(i); };
+    const res = m.hub.onIntent({ ...msg, origin: 'playlist', from: 'playlist' });
+    if (expect === true) {
+      assert.equal(res.ok, true, label);
+      covered.add(msg.op);
+    } else {
+      assert.equal(res.ok, false, label);
+      assert.equal(res.reason, expect, label);
+    }
+    if (expect === 'invalid') assert.deepEqual(applied, [], label + ': main state is never touched');
+    assert.ok(m.sent.length >= 1, label + ': main answers with a snapshot');
+    if (check) check(m);
+  }
+  assert.deepEqual([...covered].sort(), [...allowed].sort(), 'every allowed op has a passing row');
+
+  // Empty playlist: step and togglePlay are refused.
+  for (const op of [{ op: 'step', dir: 1 }, { op: 'togglePlay' }]) {
+    const m = makeMain({ items: [] });
+    assert.deepEqual({ ...m.hub.onIntent({ ...op, origin: 'playlist', from: 'playlist' }) }, { ok: false, reason: 'refused', op: op.op });
+    assert.equal(m.calls.length, 0);
+  }
+  // Non-objects and wrong origin.
+  const m = makeMain();
+  for (const bad of [null, undefined, 'goTo', 42, []]) assert.equal(m.hub.onIntent(bad).ok, false);
+  assert.equal(m.hub.onIntent({ op: 'dock', from: 'playlist' }).reason, 'origin');
+  assert.equal(m.hub.onIntent({ op: 'dock', origin: 'main' }).reason, 'origin');
+  assert.equal(m.calls.length, 0);
+  // Called directly, swApplyIntent still refuses an op it does not know.
+  assert.equal(m.sb.swApplyIntent({ op: 'eval' }), false);
+  // A throwing handler is reported as refused, not a crash.
+  const t = makeMain({ goTo: () => { throw new Error('boom'); } });
+  assert.equal(t.hub.onIntent({ op: 'goTo', id: 'a', origin: 'playlist', from: 'playlist' }).reason, 'refused');
+});
+
+test('the hub only listens to the window Rust built: other labels are refused as stale', () => {
+  const sent = [];
+  let applied = 0;
+  const hub = C.createSwHub({ send: (ev, p) => sent.push([ev, p]), snapshot: () => ({ n: 1 }), apply: () => { applied += 1; return true; } });
+  hub.open('playlist-2');
+  assert.equal(hub.label, 'playlist-2');
+  const before = sent.length;
+  // The old window (still closing) and an unlabeled sender get nothing.
+  for (const from of ['playlist', undefined, '', 'main', 'playlist-3']) {
+    const res = hub.onIntent({ op: 'dock', origin: 'playlist', from });
+    assert.deepEqual({ ...res }, { ok: false, reason: 'stale' }, String(from));
+    assert.equal(hub.onHello({ origin: 'playlist', v: 0, from }), null, 'no snapshot for a stale hello');
+  }
+  assert.equal(applied, 0, 'main state untouched');
+  assert.equal(sent.length, before, 'stale windows get no reply');
+  // The live window works.
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist-2' }).ok, true);
+  assert.ok(hub.onHello({ origin: 'playlist', v: 0, from: 'playlist-2' }));
+  assert.equal(applied, 1);
+  // Reopening under another label moves the hub with it.
+  hub.close();
+  hub.open('playlist-3');
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist-2' }).reason, 'stale');
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist-3' }).ok, true);
+  // The child stamps its own label on hello and every intent.
+  const out = [];
+  const child = C.createSwChild({ send: (ev, p) => out.push(p), from: 'playlist-3', now: () => 1000 });
+  assert.equal(child.hello().from, 'playlist-3');
+  child.onSnapshot({ origin: 'main', v: 1, state: { items: [] } });
+  assert.equal(child.intent('togglePlay'), true);
+  assert.equal(out.at(-1).from, 'playlist-3');
+  assert.equal(child.intent('dock', { from: 'playlist-2' }), true);
+  assert.equal(out.at(-1).from, 'playlist-3', 'args cannot override the label');
+  assert.equal(hub.onIntent(out.at(-1)).ok, true, 'round trip through the hub');
+});
+
+test('the hub fails closed: opened without a label it accepts no window', () => {
+  let applied = 0;
+  const sent = [];
+  const hub = C.createSwHub({ send: (ev, p) => sent.push(ev), snapshot: () => ({}), apply: () => { applied += 1; return true; } });
+  for (const label of [undefined, null, '', 42]) {
+    hub.open(label);
+    assert.equal(hub.label, null);
+    const before = sent.length;
+    for (const from of [undefined, null, '', 'playlist', 'playlist-2']) {
+      assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from }).reason, 'stale', String(label) + '/' + String(from));
+      assert.equal(hub.onHello({ origin: 'playlist', v: 0, from }), null);
+    }
+    assert.equal(sent.length, before, 'no reply');
+  }
+  assert.equal(applied, 0);
+  hub.open('playlist');
+  assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, true);
 });
