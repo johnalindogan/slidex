@@ -125,8 +125,29 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 .crst:hover{color:#fff;border-color:rgba(255,255,255,.5);}
 #ctrls{display:flex;flex-direction:column;gap:0;padding:0;background:rgba(8,8,8,.99);flex-shrink:0;border-top:.5px solid rgba(255,255,255,.08);}
 #ctrls-primary{display:flex;align-items:center;gap:6px;padding:8px 12px;flex-wrap:nowrap;width:100%;min-height:44px;box-sizing:border-box;}
-#ctrls-overflow{display:none;align-items:center;gap:5px;padding:8px 12px 10px;flex-wrap:wrap;width:100%;box-sizing:border-box;border-top:.5px solid rgba(255,255,255,.06);background:rgba(0,0,0,.28);}
-#ctrls-overflow.open{display:flex;}
+#ctrls-overflow{display:none;padding:12px 16px 12px;width:100%;box-sizing:border-box;border-top:.5px solid rgba(255,255,255,.06);background:rgba(0,0,0,.28);font-family:var(--font-main);max-height:46vh;overflow-y:auto;}
+#ctrls-overflow.open{display:block;}
+/* Tools panel (P1-1): four labelled groups, type-to-find, and each row shows its key. */
+#tools-head{display:flex;align-items:center;gap:12px;margin-bottom:10px;}
+#tools-title{font-size:15px;font-weight:700;color:#fff;margin:0;}
+#toolsFind{width:280px;max-width:40vw;height:28px;background:#0b0b0b;border:.5px solid rgba(255,255,255,.22);border-radius:6px;color:#fff;font:13px var(--font-main);padding:0 10px;}
+#toolsFind::placeholder{color:rgba(255,255,255,.6);}
+#tools-hint{margin-left:auto;font-size:12px;color:rgba(255,255,255,.6);}
+#tools-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;border-top:1px solid rgba(255,255,255,.08);padding-top:10px;}
+.tgroup{display:flex;flex-direction:column;gap:2px;min-width:0;}
+.tgroup[hidden]{display:none;}
+.tglbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:rgba(255,255,255,.6);font-weight:600;padding:0 8px 4px;}
+#ctrls-overflow .tool{display:flex;align-items:center;gap:8px;width:100%;min-height:32px;padding:4px 8px;border:0;border-radius:6px;background:transparent;color:rgba(255,255,255,.85);font:13px var(--font-main);text-align:left;cursor:pointer;line-height:1.2;}
+#ctrls-overflow .tool[hidden]{display:none;}
+#ctrls-overflow .tool:hover{background:rgba(255,255,255,.08);}
+#ctrls-overflow .tool.on{color:#fff;font-weight:600;}
+#ctrls-overflow .tool svg{width:16px;height:16px;flex-shrink:0;}
+#ctrls-overflow .trow{cursor:default;flex-wrap:wrap;}
+#ctrls-overflow .trow .cb,#ctrls-overflow .trow .cs,#ctrls-overflow .trow .pg{margin-left:0;}
+.tlbl{flex:1;min-width:0;}
+#ctrls-overflow .kbd{font-family:var(--font-mono);font-size:11px;padding:1px 5px;border:.5px solid rgba(255,255,255,.3);border-radius:4px;color:rgba(255,255,255,.75);white-space:nowrap;}
+#ctrls-overflow .kbd:empty{display:none;}
+#tools-empty{font-size:12px;color:rgba(255,255,255,.6);padding:8px;}
 .ctrls-cluster{display:flex;align-items:center;gap:4px;flex-shrink:0;}
 .cb{background:transparent;border:.5px solid rgba(255,255,255,.18);cursor:pointer;color:#fff;padding:6px 7px;border-radius:6px;display:flex;align-items:center;font-size:18px;transition:background .15s,border-color .15s;flex-shrink:0;line-height:1;}
 .cb:hover:not(:disabled){background:rgba(255,255,255,.1);}
@@ -135,7 +156,7 @@ html,body{background:#000;height:100%;overflow:hidden;font-family: var(--font-ma
 #bcast{gap:4px;padding:6px 8px;font-size:12px;font-family:var(--font-main);}
 .cb.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);}
 .cb svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
-#bmore{margin-left:auto;}
+#bmore{margin-left:auto;font-size:12px;font-family:var(--font-main);padding:6px 10px;}
 .cs{font-size:12px;background:#111;border:.5px solid rgba(255,255,255,.22);border-radius:4px;color:#fff;padding:3px 5px;cursor:pointer;flex-shrink:0;font-family:var(--font-main);}
 #pbw{flex:1;min-width:48px;max-width:160px;height:3px;background:rgba(255,255,255,.12);border-radius:2px;overflow:hidden;flex-shrink:1;cursor:default;position:relative;display:none;align-items:center;}
 #pbw.slide-prog{display:flex;cursor:default;overflow:hidden;}
@@ -1101,32 +1122,104 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
       </div>
-      <button class="cb" id="bmore" title="More tools" aria-expanded="false" aria-controls="ctrls-overflow">
-        <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg>
-      </button>
+      <button class="cb" id="bmore" title="Tools" aria-expanded="false" aria-controls="ctrls-overflow">Tools</button>
     </div>
-    <div id="ctrls-overflow" role="region" aria-label="More tools">
-      <button class="cb" id="bru" title="Load new files">
-        <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-      </button>
-      <button class="cb" id="brev" title="Reverse Playback">
+    <div id="ctrls-overflow" role="region" aria-label="Tools">
+      <div id="tools-head">
+        <h2 id="tools-title">Tools</h2>
+        <input type="search" id="toolsFind" placeholder="Type to find a tool…" autocomplete="off" aria-label="Find a tool">
+        <span id="tools-hint">Keys are shown on each row · <span class="kbd">Esc</span> closes</span>
+      </div>
+      <div id="tools-grid">
+      <div class="tgroup" role="group" aria-labelledby="tg-play">
+        <div class="tglbl" id="tg-play">Playback</div>
+        <button class="cb tool" id="brev" title="Reverse Playback">
         <svg viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
-      </button>
-      <div class="sp"></div>
-      <button class="cb" id="bmu" title="Mute">
+          <span class="tlbl">Reverse play</span><span class="kbd" data-cmd="reverse"></span>
+        </button>
+        <div class="tool trow"><span class="tlbl">Speed</span><span class="kbd" data-cmd="speedDown"></span><span class="kbd" data-cmd="speedUp"></span>
+          <button class="cb" id="bsd" title="Slower (−5%) — ↓ or ,">
+        <svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          </button>
+          <span class="lb" id="slb" title="Playback speed (click to reset)" style="cursor:pointer;min-width:42px;">100%</span>
+          <button class="cb" id="bsu" title="Faster (+5%) — ↑ or .">
+        <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          </button>
+        </div>
+        <div class="tool trow"><span class="tlbl">Volume</span><span class="kbd" data-cmd="mute"></span>
+          <button class="cb" id="bmu" title="Mute">
         <svg id="ivol" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
       </button>
-      <input type="range" id="vsl" min="0" max="1" step="0.05" value="1" title="Volume">
-      <div class="sp"></div>
-      <button class="cb" id="bsd" title="Slower (−5%) — ↓ or ,">
-        <svg viewBox="0 0 24 24"><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      </button>
-      <span class="lb" id="slb" title="Playback speed (click to reset)" style="cursor:pointer;min-width:42px;">100%</span>
-      <button class="cb" id="bsu" title="Faster (+5%) — ↑ or .">
-        <svg viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      </button>
-      <div class="sp"></div>
-      <div class="pg">
+          <input type="range" id="vsl" min="0" max="1" step="0.05" value="1" title="Volume">
+        </div>
+        <label class="tool trow"><span class="tlbl">Photo duration</span><select class="cs" id="dsel" title="Default photo duration">
+        <option value="3000">3s</option>
+        <option value="4000">4s</option>
+        <option value="6000">6s</option>
+        <option value="8000">8s</option>
+        <option value="10000" selected>10s</option>
+        <option value="12000">12s</option>
+        <option value="20000">20s</option>
+      </select></label>
+        <label class="tool trow"><span class="tlbl">Transition</span><select class="cs" id="tsel" title="Transition effect">
+        <option value="fade" selected>Fade</option>
+        <option value="slide">Slide</option>
+        <option value="zoom">Zoom</option>
+        <option value="none">None</option>
+      </select></label>
+        <label class="tool trow" for="vskip" title="Video ←/→ skip seconds"><span class="tlbl">Video skip (s)</span><input type="number" class="cs" id="vskip" min="1" max="30" step="1" value="5" title="Video ←/→ skip seconds (1–30)" style="width:52px" aria-label="Video skip seconds"></label>
+        <button class="cb tool" id="bru" title="Load new files">
+        <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          <span class="tlbl">Load new files…</span>
+        </button>
+      </div>
+      <div class="tgroup" role="group" aria-labelledby="tg-image">
+        <div class="tglbl" id="tg-image">Image</div>
+        <button class="cb tool" id="bcol" title="Color controls">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+          <span class="tlbl">Colour…</span>
+        </button>
+        <button class="cb tool" id="bcrop" title="Crop (non-destructive)">
+        <svg viewBox="0 0 24 24"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+          <span class="tlbl">Crop…</span>
+        </button>
+        <button class="cb tool" id="bmh" title="Mirror Horizontal">
+        <svg viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="21"/><path d="M16 7l4 5-4 5M8 7l-4 5 4 5"/></svg>
+          <span class="tlbl">Mirror horizontal</span><span class="kbd" data-cmd="mirrorH"></span>
+        </button>
+        <button class="cb tool" id="bmv" title="Mirror Vertical">
+        <svg viewBox="0 0 24 24"><line x1="3" y1="12" x2="21" y2="12"/><path d="M7 16l5 4 5-4M7 8l5-4 5 4"/></svg>
+          <span class="tlbl">Mirror vertical</span><span class="kbd" data-cmd="mirrorV"></span>
+        </button>
+        <button class="cb tool" id="brcw" title="Rotate CW">
+        <svg viewBox="0 0 24 24"><path d="M21 2v6h-6"/><path d="M21 13a9 9 0 1 1-3-7.7L21 8"/></svg>
+          <span class="tlbl">Rotate clockwise</span><span class="kbd" data-cmd="rotCW"></span>
+        </button>
+        <button class="cb tool" id="brccw" title="Rotate CCW">
+        <svg viewBox="0 0 24 24"><path d="M3 2v6h6"/><path d="M3 13a9 9 0 1 0 3-7.7L3 8"/></svg>
+          <span class="tlbl">Rotate anticlockwise</span><span class="kbd" data-cmd="rotCCW"></span>
+        </button>
+      </div>
+      <div class="tgroup" role="group" aria-labelledby="tg-view">
+        <div class="tglbl" id="tg-view">Motion &amp; view</div>
+        <button class="cb tool" id="btheme" title="Themes (T) — cycle 10 color presets; Shift=random; Alt=all">
+        <svg viewBox="0 0 24 24"><path d="M12 2l1.6 4.9H19l-4 2.9 1.5 4.8-4.5-3.2-4.5 3.2L9 9.8 5 6.9h5.4L12 2z"/></svg>
+          <span class="tlbl">Themes…</span><span class="kbd" data-cmd="theme"></span>
+        </button>
+        <button class="cb tool" id="bhmax" title="Horizontal Max Mode (2 images side by side for portrait media on landscape screen)">
+        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="9" height="18" rx="1.5"/><rect x="13" y="3" width="9" height="18" rx="1.5"/></svg>
+          <span class="tlbl">Side by side (portrait)</span><span class="kbd" data-cmd="maxMode"></span>
+        </button>
+        <button class="cb tool" id="bvmax" title="Vertical Max Mode (2 images top/bottom for landscape media on portrait screen)">
+        <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="9" rx="1.5"/><rect x="2" y="13" width="20" height="9" rx="1.5"/></svg>
+          <span class="tlbl">Top and bottom (landscape)</span><span class="kbd" data-cmd="maxMode"></span>
+        </button>
+        <button class="cb tool on" id="bfname" title="Toggle Filename">
+        <svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+          <span class="tlbl">Show file name</span><span class="kbd" data-cmd="fname"></span>
+        </button>
+        <div class="tool trow"><span class="tlbl">Pan · reset</span><span class="kbd" data-cmd="panRst"></span>
+          <div class="pg">
         <button class="cb" onclick="doPan(-1,-1)">&#8598;</button>
         <button class="cb" onclick="doPan(0,-1)">&#8593;</button>
         <button class="cb" onclick="doPan(1,-1)">&#8599;</button>
@@ -1137,65 +1230,25 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
         <button class="cb" onclick="doPan(0,1)">&#8595;</button>
         <button class="cb" onclick="doPan(1,1)">&#8600;</button>
       </div>
-      <div class="sp"></div>
-      <button class="cb" id="bmh" title="Mirror Horizontal">
-        <svg viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="21"/><path d="M16 7l4 5-4 5M8 7l-4 5 4 5"/></svg>
-      </button>
-      <button class="cb" id="bmv" title="Mirror Vertical">
-        <svg viewBox="0 0 24 24"><line x1="3" y1="12" x2="21" y2="12"/><path d="M7 16l5 4 5-4M7 8l5-4 5 4"/></svg>
-      </button>
-      <button class="cb" id="brcw" title="Rotate CW">
-        <svg viewBox="0 0 24 24"><path d="M21 2v6h-6"/><path d="M21 13a9 9 0 1 1-3-7.7L21 8"/></svg>
-      </button>
-      <button class="cb" id="brccw" title="Rotate CCW">
-        <svg viewBox="0 0 24 24"><path d="M3 2v6h6"/><path d="M3 13a9 9 0 1 0 3-7.7L3 8"/></svg>
-      </button>
-      <div class="sp"></div>
-      <select class="cs" id="dsel" title="Default photo duration">
-        <option value="3000">3s</option>
-        <option value="4000">4s</option>
-        <option value="6000">6s</option>
-        <option value="8000">8s</option>
-        <option value="10000" selected>10s</option>
-        <option value="12000">12s</option>
-        <option value="20000">20s</option>
-      </select>
-      <select class="cs" id="tsel" title="Transition effect">
-        <option value="fade" selected>Fade</option>
-        <option value="slide">Slide</option>
-        <option value="zoom">Zoom</option>
-        <option value="none">None</option>
-      </select>
-      <label class="lb" for="vskip" title="Video ←/→ skip seconds" style="min-width:auto;margin-left:2px;">Skip</label>
-      <input type="number" class="cs" id="vskip" min="1" max="30" step="1" value="5" title="Video ←/→ skip seconds (1–30)" style="width:52px" aria-label="Video skip seconds">
-      <div class="sp"></div>
-      <button class="cb" id="bcol" title="Color controls">
-        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
-      </button>
-      <button class="cb" id="bss" title="Save screenshot">
+        </div>
+      </div>
+      <div class="tgroup" role="group" aria-labelledby="tg-export">
+        <div class="tglbl" id="tg-export">Export &amp; create</div>
+        <button class="cb tool" id="bss" title="Save screenshot">
         <svg viewBox="0 0 24 24"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-      </button>
-      <button class="cb" id="bexport" title="Export graded image / video (E)">
+          <span class="tlbl">Screenshot</span><span class="kbd" data-cmd="screenshot"></span>
+        </button>
+        <button class="cb tool" id="bexport" title="Export graded image / video (E)">
         <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      </button>
-      <button class="cb" id="bcrop" title="Crop (non-destructive)">
-        <svg viewBox="0 0 24 24"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
-      </button>
-      <button class="cb" id="bexportcrop" title="Export cropped still">
+          <span class="tlbl">Export graded</span><span class="kbd" data-cmd="exportGraded"></span>
+        </button>
+        <button class="cb tool" id="bexportcrop" title="Export cropped still">
         <svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 13h7v7h-7z"/><path d="M14 4h6v6"/><path d="M4 14v6h6"/></svg>
-      </button>
-      <button class="cb" id="btheme" title="Themes (T) — cycle 10 color presets; Shift=random; Alt=all">
-        <svg viewBox="0 0 24 24"><path d="M12 2l1.6 4.9H19l-4 2.9 1.5 4.8-4.5-3.2-4.5 3.2L9 9.8 5 6.9h5.4L12 2z"/></svg>
-      </button>
-      <button class="cb" id="bhmax" title="Horizontal Max Mode (2 images side by side for portrait media on landscape screen)">
-        <svg viewBox="0 0 24 24"><rect x="2" y="3" width="9" height="18" rx="1.5"/><rect x="13" y="3" width="9" height="18" rx="1.5"/></svg>
-      </button>
-      <button class="cb" id="bvmax" title="Vertical Max Mode (2 images top/bottom for landscape media on portrait screen)">
-        <svg viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="9" rx="1.5"/><rect x="2" y="13" width="20" height="9" rx="1.5"/></svg>
-      </button>
-      <button class="cb on" id="bfname" title="Toggle Filename">
-        <svg viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-      </button>
+          <span class="tlbl">Export cropped still</span>
+        </button>
+      </div>
+      </div>
+      <p id="tools-empty" hidden>No tool matches.</p>
     </div>
   </div>
 
@@ -2942,7 +2995,7 @@ const FNS = [
   {id:'mirrorV',   label:'Mirror V',          def:'v',          group:'View'},
   {id:'hidectl',   label:'Hide Controls',     def:'c',          group:'View'},
   {id:'playlist',  label:'Playlist',          def:'l',          group:'View'},
-  {id:'moreTools', label:'More tools',         def:'d',          group:'View'},
+  {id:'moreTools', label:'Tools',              def:'d',          group:'View'},
   {id:'rotCW',     label:'Rotate CW',         def:'r',          group:'View'},
   {id:'rotCCW',    label:'Rotate CCW',        def:'R',          group:'View'},
   {id:'fname',     label:'Toggle Filename',   def:'n',          group:'View'},
@@ -2971,7 +3024,12 @@ function refreshMoreToolsTooltip() {
   const btn = g('bmore');
   if (!btn) return;
   const k = keyMap.moreTools;
-  btn.title = k ? ('More tools (' + keyLabel(k) + ')') : 'More tools';
+  btn.title = k ? ('Tools (' + keyLabel(k) + ')') : 'Tools';
+  /* Each Tools row shows its current key (empty when unbound). */
+  document.querySelectorAll('#ctrls-overflow .kbd[data-cmd]').forEach(el => {
+    const key = keyMap[el.dataset.cmd];
+    el.textContent = key ? keyLabel(key) : '';
+  });
 }
 function loadKeyMap() {
   let saved = null;
@@ -3841,13 +3899,34 @@ function toggleControls() {
 g('bhide').onclick = toggleControls;
 g('showctrl').onclick = () => { if (!ctrlsVisible) toggleControls(); };
 
-/* ── More tools overflow drawer ── */
-function setOverflowOpen(open) {
+/* ── Tools panel (was More tools) ── */
+function filterTools(query) {
+  let any = false;
+  document.querySelectorAll('#tools-grid .tgroup').forEach(grp => {
+    let shown = 0;
+    grp.querySelectorAll(':scope > .tool').forEach(row => {
+      const text = row.textContent + ' ' + (row.title || '');
+      const hit = window.SlideXCore && SlideXCore.toolMatches ? SlideXCore.toolMatches(text, query) : true;
+      row.hidden = !hit;
+      if (hit) shown++;
+    });
+    grp.hidden = !shown;
+    if (shown) any = true;
+  });
+  g('tools-empty').hidden = any;
+}
+g('toolsFind').addEventListener('input', () => filterTools(g('toolsFind').value));
+function setOverflowOpen(open, focusFind) {
   const o = g('ctrls-overflow'), btn = g('bmore');
   if (!o || !btn) return;
   o.classList.toggle('open', open);
   btn.classList.toggle('on', open);
   btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open && focusFind) setTimeout(() => g('toolsFind').focus(), 0);
+  if (!open) {
+    if (o.contains(document.activeElement)) btn.focus();
+    if (g('toolsFind').value) { g('toolsFind').value = ''; filterTools(''); }
+  }
 }
 g('bmore').onclick = (e) => {
   e.stopPropagation();
@@ -6753,7 +6832,7 @@ function runMappedKey(e) {
       if (window.SlideXCore && !SlideXCore.moreToolsKeyFires(e, keyMap.moreTools)) return false;
       if (e.ctrlKey || e.altKey || e.metaKey) return false;
       e.preventDefault();
-      setOverflowOpen(window.SlideXCore ? SlideXCore.nextMoreToolsOpen(g('ctrls-overflow').classList.contains('open')) : !g('ctrls-overflow').classList.contains('open'));
+      setOverflowOpen(window.SlideXCore ? SlideXCore.nextMoreToolsOpen(g('ctrls-overflow').classList.contains('open')) : !g('ctrls-overflow').classList.contains('open'), true);
       break;
     case 'rotCW': rotateClockwise(); break;
     case 'rotCCW': rotateCounter(); break;
@@ -6850,7 +6929,7 @@ document.addEventListener('keydown', e => {
     if (keysEqual(keyMap.watch, e.key)) return;
     if (window.SlideXCore && SlideXCore.moreToolsKeyFires(e, keyMap.moreTools)) {
       e.preventDefault();
-      setOverflowOpen(SlideXCore.nextMoreToolsOpen(!!g('ctrls-overflow')?.classList.contains('open')));
+      setOverflowOpen(SlideXCore.nextMoreToolsOpen(!!g('ctrls-overflow')?.classList.contains('open')), true);
       return;
     }
     // Media Manager open in its own window: still allow Add / playlist focus with an empty list.

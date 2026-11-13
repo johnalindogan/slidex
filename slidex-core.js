@@ -1180,6 +1180,14 @@
 
   function nextMoreToolsOpen(open) { return !open; }
 
+  /** Tools panel type-to-find: every word of the query must appear in the row's label, key or tooltip. */
+  function toolMatches(text, query) {
+    var words = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return true;
+    var hay = String(text || '').toLowerCase();
+    return words.every(function (w) { return hay.indexOf(w) >= 0; });
+  }
+
   /*
    * Overlay saved keys on defaults. If More tools would share its key with
    * another action, leave More tools unbound. An explicit saved '' stays unbound.
@@ -2468,6 +2476,7 @@
     zoomAtPointer: zoomAtPointer,
     isTextEditingTarget: isTextEditingTarget,
     moreToolsKeyFires: moreToolsKeyFires,
+    toolMatches: toolMatches,
     nextMoreToolsOpen: nextMoreToolsOpen,
     resolveKeyMap: resolveKeyMap,
     sessionItemCount: sessionItemCount,
