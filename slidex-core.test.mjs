@@ -1928,8 +1928,9 @@ test('playlist undo keys are Ctrl+Z, Ctrl+Y and Ctrl+Shift+Z, and every playlist
   /* New session, a loaded playlist, and a restored list start with empty history. */
   assert.match(body('build'), /clearPlaylistUndo\(\)/);
   /* The key check sits after the text-field guard, so fields keep their own Ctrl+Z. */
-  const guard = html.indexOf('  if (editing) return;\n\n  /* Ctrl+Z');
-  assert.ok(guard > 0, 'undo keys run after the text-editing guard');
+  /* After the merge with Undock (#55), the second-window key guard sits between them: the second window never runs undo. */
+  const guard = html.indexOf('  if (editing) return;\n\n  /* Second window: keys become intents for main; stage keys do nothing here. */\n  if (SSP_IS_PLAYLIST_WINDOW) { swChildKey(e); return; }\n\n  /* Ctrl+Z');
+  assert.ok(guard > 0, 'undo keys run after the text-editing guard and the second-window key guard');
   assert.match(html, /data-pl-undo/);
 });
 
@@ -1946,6 +1947,8 @@ test('removing the last item can be undone: the toast shows Undo and Ctrl+Z brin
   const view = { dz: 'none', viewer: 'flex' };
   const sb = {
     SlideXCore: C, console, Math,
+    /* Main window (Undock #55): removeItem's second-window early return is not taken. */
+    SSP_IS_PLAYLIST_WINDOW: false, sspIsMainWindow: () => true, swChildIntent() { throw new Error('main window must not send intents'); },
     items: [], cur: 0, sessionLoaded: true, lastClickedMI: -1, selectedItems: new Set(),
     plUndo: { past: [], future: [] },
     localStorage: { removeItem() {} }, lsKey: k => k,
@@ -4629,7 +4632,7 @@ test('main writes saved settings; the second window does not (KEYMAP, default du
 
   // forgetEmptiedSession / ssp_autosave remove
   {
-    const src = swSlice(html, 'function forgetEmptiedSession() {', '\nfunction removeItem');
+    const src = swSlice(html, 'function forgetEmptiedSession() {', '\n/* ── Playlist undo');
     assert.match(src, /sspIsMainWindow\(\)/);
     assert.deepEqual(run(false, src, 'forgetEmptiedSession();'), [['rm', 'ssp_autosave']]);
     assert.deepEqual(run(true, src, 'forgetEmptiedSession();'), []);
@@ -4694,6 +4697,9 @@ test('main writes saved settings; the second window does not (KEYMAP, default du
       selectedItems = { clear() {} };
       getMediaItems = () => [];
       forgetEmptiedSession = () => {};
+      clearPlaylistUndo = () => {};
+      recordPlaylistEdit = () => {};
+      emptyPlaylistKeepUndo = () => {};
       rebuildSlides = () => {};
       autoSave = () => {};
       g = () => ({ click() {} });
