@@ -5119,3 +5119,44 @@ test('the hub fails closed: opened without a label it accepts no window', () => 
   hub.open('playlist');
   assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, true);
 });
+
+test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, and block the WebView\'s own undo', () => {
+  const html = swNoWriteHtml();
+  /* The page routes every non-text-field key in the second window to swChildKey, before main's undo block. */
+  const editingAt = html.indexOf('  if (editing) return;\n\n  /* Second window: keys become intents for main');
+  const undoAt = html.indexOf('  /* Ctrl+Z / Ctrl+Y (Ctrl+Shift+Z) undo and redo playlist edits.');
+  assert.ok(editingAt > 0 && undoAt > editingAt, 'second-window key guard runs before the undo block');
+  const src = swSlice(html, 'function swChildKey(e) {', '\nfunction enterPlaylistWindowShell');
+  const calls = [];
+  const items = [{ id: 'a', type: 'image' }, { id: 'b', type: 'image' }];
+  const sb = {
+    SlideXCore: C,
+    SSP_IS_PLAYLIST_WINDOW: true,
+    cur: 1,
+    items,
+    selectedItems: new Set([0]),
+    getMediaItems: () => sb.items,
+    findMappedId: () => null,
+    swChildIntent: (op, args) => calls.push(['intent', op, args]),
+    togglePL: () => calls.push(['togglePL']),
+    undoPlaylistEdit: () => { throw new Error('the second window must not run undo'); },
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(src + '\nglobalThis.swChildKey = swChildKey;', sb);
+  const before = JSON.stringify({ items: sb.items, cur: sb.cur, sel: [...sb.selectedItems] });
+  const chords = [
+    { key: 'z', ctrlKey: true }, { key: 'y', ctrlKey: true }, { key: 'Z', ctrlKey: true, shiftKey: true },
+    { key: 'z', metaKey: true }, { key: 'y', metaKey: true }, { key: 'Z', metaKey: true, shiftKey: true },
+  ];
+  for (const chord of chords) {
+    assert.ok(C.undoKeyAction(chord), 'test chord is an undo key: ' + JSON.stringify(chord));
+    let prevented = 0;
+    const ev = { shiftKey: false, altKey: false, ctrlKey: false, metaKey: false, ...chord, target: {}, preventDefault() { prevented++; } };
+    assert.doesNotThrow(() => sb.swChildKey(ev), JSON.stringify(chord));
+    assert.ok(prevented >= 1, 'preventDefault for ' + JSON.stringify(chord));
+  }
+  assert.deepEqual(calls, [], 'no intents, no panel toggles');
+  assert.strictEqual(sb.items, items);
+  assert.equal(JSON.stringify({ items: sb.items, cur: sb.cur, sel: [...sb.selectedItems] }), before, 'state unchanged');
+});
