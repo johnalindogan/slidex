@@ -5386,3 +5386,303 @@ test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, bloc
   assert.strictEqual(sb.items, items);
   assert.equal(JSON.stringify({ items: sb.items, cur: sb.cur, sel: [...sb.selectedItems] }), before, 'state unchanged');
 });
+
+// ---- 0.1.20 batch: k / q follow-ups, undo from the undocked window, version ----
+
+function batchHtml() {
+  return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+}
+function batchSlice(html, start, end) {
+  const at = html.indexOf(start);
+  assert.ok(at !== -1, start);
+  const to = html.indexOf(end, at + start.length);
+  assert.ok(to !== -1, end);
+  return html.slice(at, to);
+}
+
+/* Runs the real page keydown handler, runMappedKey, findMappedId, keysEqual, toggleKBModal and swChildKey. */
+function pageKeyHarness(over = {}) {
+  const html = batchHtml();
+  const { fns } = pageKeyDefaults();
+  const runStart = html.indexOf('function mainWindowHasFocus()');
+  const kdStart = html.indexOf("document.addEventListener('keydown', e => {", runStart);
+  const src = [
+    batchSlice(html, 'function keysEqual(bound, pressed) {', '\nconst RESERVED_KEYS'),
+    batchSlice(html, 'function findMappedId(k) {', '\n/* Video seek'),
+    html.slice(runStart, kdStart),
+    batchSlice(html, 'function toggleKBModal() {', '\n'),
+    batchSlice(html, 'function swChildKey(e) {', '\nfunction enterPlaylistWindowShell'),
+    html.slice(kdStart, html.indexOf('\nupdLandingInfo();', kdStart)),
+  ].join('\n');
+  const calls = [];
+  const spy = (name) => (...a) => { calls.push([name, ...a]); };
+  const els = {};
+  const el = (id) => (els[id] = els[id] || {
+    id, title: '', hidden: false, disabled: false,
+    classList: { contains: () => false, toggle() {}, add() {}, remove() {} },
+    click: () => calls.push(['click', id]),
+  });
+  const keyMap = {};
+  fns.forEach(f => { keyMap[f.id] = f.def; });
+  let handler = null;
+  const sb = {
+    SlideXCore: C, console, Math, Array, Set,
+    FNS: fns, keyMap,
+    SSP_IS_PLAYLIST_WINDOW: false, SSP_UNDOCK_ENABLED: true, playlistUndocked: false,
+    focused: true,
+    document: {
+      addEventListener: (type, fn) => { if (type === 'keydown') handler = fn; },
+      hasFocus: () => sb.focused,
+    },
+    settings: { open: false, pane: 'kb' },
+    settingsOpen: () => sb.settings.open,
+    get settingsPane() { return sb.settings.pane; },
+    openSettings: (pane) => { calls.push(['openSettings', pane]); sb.settings.open = true; if (pane) sb.settings.pane = pane; },
+    closeSettings: () => { calls.push(['closeSettings']); sb.settings.open = false; },
+    delConfirmIsOpen: () => false,
+    listeningEl: null, listeningId: null,
+    watchMode: false,
+    selectedItems: new Set(),
+    items: [{ id: 'a', type: 'image' }, { id: 'b', type: 'image' }],
+    cur: 0,
+    getMediaItems: () => sb.items.filter(it => it.type !== 'folder'),
+    playlistUndoPending: () => false,
+    undoPlaylistEdit: spy('undoPlaylistEdit'),
+    g: el,
+    goTo: spy('goTo'), togglePlay: spy('togglePlay'), togglePL: spy('togglePL'),
+    seekCurVideo: () => false,
+    swChildIntent: (op, args) => { calls.push(['intent', op, args]); return true; },
+    dockPlaylistWindow: spy('dockPlaylistWindow'), undockPlaylistWindow: spy('undockPlaylistWindow'),
+    setOverflowOpen: spy('setOverflowOpen'),
+    applyThemeToCurrent: spy('theme'), applyThemeToAll: spy('themeAll'),
+    toggleControls: spy('toggleControls'), toggleMirrorH: spy('mirrorH'), toggleMirrorV: spy('mirrorV'),
+    openRecycleConfirm: spy('openRecycleConfirm'), removeItem: spy('removeItem'),
+    resetPan: spy('resetPan'), doPan: spy('doPan'),
+    ...over,
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(src, sb);
+  assert.equal(typeof handler, 'function', 'keydown handler bound');
+  const press = (key, mods = {}) => {
+    let prevented = 0;
+    const ev = { key, shiftKey: false, altKey: false, ctrlKey: false, metaKey: false, repeat: false, target: { tagName: 'BODY' }, ...mods, preventDefault() { prevented++; } };
+    handler(ev);
+    return prevented;
+  };
+  const named = (name) => calls.filter(c => c[0] === name).map(c => c.slice(1));
+  return { sb, calls, press, named, html };
+}
+
+test('0.1.20 n5: k runs openSettings(\'kb\') at runtime, k again closes it, and q clicks Colour', () => {
+  const h = pageKeyHarness();
+  assert.ok(h.press('k') >= 1, 'k calls preventDefault');
+  assert.deepEqual(h.named('openSettings'), [['kb']]);
+  h.press('k');
+  assert.equal(h.named('closeSettings').length, 1, 'k again closes Settings > Ken Burns');
+  h.press('q');
+  assert.deepEqual(h.named('click'), [['bcol']]);
+});
+
+test('0.1.20 n5: the key-collision toast fires once and not on the next load, and it offers Rebind', () => {
+  const html = batchHtml();
+  const { fns } = pageKeyDefaults();
+  const src = [
+    batchSlice(html, 'function loadKeyMap() {', '\nloadKeyMap();'),
+    batchSlice(html, 'function keyLabel(k) {', '\n/** Default badge text'),
+  ].join('\n');
+  const store = { ssp_keymap: JSON.stringify({ theme: 'q' }) };
+  const toasts = [];
+  const sb = {
+    SlideXCore: C, FNS: fns, KEYMAP_LS: 'ssp_keymap', keyMap: {}, JSON, String,
+    localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+    sspIsMainWindow: () => true,
+    refreshMoreToolsTooltip() {},
+    showToast: (html) => toasts.push(html),
+    setTimeout: (fn) => fn(),
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(src, sb);
+  vm.runInContext('loadKeyMap();', sb);
+  assert.equal(toasts.length, 1, 'one toast on the first load');
+  assert.match(toasts[0], /^Colour has no key: you use q for Themes\. Set one in Keyboard shortcuts\./);
+  assert.match(toasts[0], /<button type="button" class="toast-undo" data-rebind="colour"[^>]*>Rebind<\/button>$/, 'q2: Rebind action for the Colour row');
+  assert.equal(sb.keyMap.theme, 'q', 'the saved key keeps its command');
+  assert.equal(sb.keyMap.colour, '', 'Colour is left unbound');
+  assert.equal(JSON.parse(store.ssp_keymap).colour, '', 'the resolved map is saved once');
+  vm.runInContext('loadKeyMap();', sb);
+  assert.equal(toasts.length, 1, 'no toast on the next load');
+  /* The second window never saves the map, so it must not toast either once main has saved it. */
+  sb.sspIsMainWindow = () => false;
+  vm.runInContext('loadKeyMap();', sb);
+  assert.equal(toasts.length, 1);
+});
+
+test('0.1.20 q2: Rebind opens Settings > Keyboard shortcuts at that key row and focuses its key', () => {
+  const html = batchHtml();
+  const { fns } = pageKeyDefaults();
+  const src = batchSlice(html, '/* Rebind (key-collision toast)', '\nfunction removeItem(itemsIdx, clearLS)');
+  const calls = [];
+  let click = null;
+  const toast = { classList: { remove: (c) => calls.push(['toastHide', c]) } };
+  const search = { value: 'mirror' };
+  const keyBtn = { focus: () => calls.push(['focus', 'colour']) };
+  const row = { scrollIntoView: () => calls.push(['scroll']), querySelector: (q) => (q === '.kekey' ? keyBtn : null) };
+  const sb = {
+    FNS: fns, kedFilter: 'mirror',
+    g: (id) => (id === 'kedsearch' ? search : id === 'toast' ? toast : null),
+    openSettings: (pane) => calls.push(['openSettings', pane, search.value, sb.kedFilter]),
+    setTimeout: (fn) => fn(),
+    document: {
+      addEventListener: (type, fn) => { if (type === 'click') click = fn; },
+      querySelector: (q) => (q === '#kedlist .kerow[data-id="colour"]' ? row : null),
+    },
+  };
+  vm.createContext(sb);
+  vm.runInContext(src, sb);
+  const btn = { dataset: { rebind: 'colour' } };
+  click({ target: { closest: (sel) => (sel === '[data-rebind]' ? btn : null) } });
+  assert.deepEqual(calls, [['toastHide', 'show'], ['openSettings', 'keys', '', ''], ['scroll'], ['focus', 'colour']],
+    'filter cleared, keys pane opened, the Colour row scrolled into view and its key focused');
+  calls.length = 0;
+  assert.equal(vm.runInContext("openShortcutRow('nope')", sb), false, 'unknown ids open nothing');
+  click({ target: { closest: () => null } });
+  assert.deepEqual(calls, [], 'other clicks are ignored');
+});
+
+test('0.1.20 n2: with an empty playlist k opens Settings > Ken Burns; q, Shift+K and other keys do nothing', () => {
+  const h = pageKeyHarness({ items: [] });
+  h.press('q');
+  h.press('K', { shiftKey: true });
+  h.press('ArrowRight');
+  assert.deepEqual(h.calls, [], 'q waits for media; Shift+K is not k');
+  h.press('k');
+  assert.deepEqual(h.named('openSettings'), [['kb']]);
+  h.press('k');
+  assert.equal(h.named('closeSettings').length, 1);
+  /* Ctrl+K is not Ken Burns. */
+  const h2 = pageKeyHarness({ items: [] });
+  h2.press('k', { ctrlKey: true });
+  assert.deepEqual(h2.named('openSettings'), []);
+});
+
+test('0.1.20 n3: single keys do not act behind an open Settings; k switches to or closes its own pane', () => {
+  const h = pageKeyHarness();
+  h.sb.settings.open = true;
+  h.sb.settings.pane = 'keys';
+  for (const key of ['q', 'ArrowRight', 'ArrowLeft', ' ', 't', 'h', 'c', 'Delete', 'Backspace']) h.press(key);
+  assert.deepEqual(h.calls, [], 'nothing runs behind the modal');
+  h.press('k');
+  assert.deepEqual(h.named('openSettings'), [['kb']], 'k switches to the Ken Burns pane');
+  h.press('k');
+  assert.equal(h.named('closeSettings').length, 1, 'k on its own pane closes Settings');
+  /* Esc and Ctrl+, still work. */
+  h.sb.settings.open = true;
+  h.press('Escape');
+  assert.equal(h.named('closeSettings').length, 2);
+  h.press(',', { ctrlKey: true });
+  assert.equal(h.named('openSettings').length, 2);
+  h.press(',', { ctrlKey: true });
+  assert.equal(h.named('closeSettings').length, 3);
+  /* With Settings closed, the same keys act again. */
+  h.press('q');
+  assert.deepEqual(h.named('click'), [['bcol']]);
+});
+
+test('0.1.20 q1: Shift+K and Shift+Q do not fire, and the key map text says so', () => {
+  const h = pageKeyHarness();
+  h.press('K', { shiftKey: true });
+  h.press('Q', { shiftKey: true });
+  assert.deepEqual(h.calls, []);
+  assert.equal(vm.runInContext("findMappedId('K')", h.sb), null);
+  assert.equal(vm.runInContext("findMappedId('Q')", h.sb), null);
+  const editor = batchSlice(h.html, 'function renderKeyEditor() {', '\n  updateConflictBanner();');
+  assert.match(editor, /Letter keys match exactly: Shift\+K and Shift\+Q do nothing \(k is Ken Burns, q is Colour\)\./);
+});
+
+test('0.1.20 q3: main runs k and q only while it has focus, also while the playlist is undocked', () => {
+  const h = pageKeyHarness({ playlistUndocked: true });
+  h.press('k');
+  h.sb.settings.open = false; // close Settings again so q is not behind it (n3)
+  h.press('q');
+  assert.deepEqual(h.named('openSettings'), [['kb']], 'main has focus: k works while undocked');
+  assert.deepEqual(h.named('click'), [['bcol']], 'main has focus: q works while undocked');
+  h.calls.length = 0;
+  h.sb.settings.open = false;
+  h.sb.focused = false;
+  assert.equal(h.press('k'), 0, 'no preventDefault without focus');
+  h.press('q');
+  assert.deepEqual(h.calls, [], 'main without focus: k and q do nothing');
+  /* The second window: k and q are not mapped there and never reach main. */
+  const c = pageKeyHarness({ SSP_IS_PLAYLIST_WINDOW: true });
+  c.press('k');
+  c.press('q');
+  assert.deepEqual(c.calls, [], 'the undocked window sends nothing for k or q');
+  assert.equal(vm.runInContext('mainWindowHasFocus()', c.sb), false);
+});
+
+test('0.1.20 a: Ctrl+Z in the undocked window reaches main as one intent and main undoes; the child never runs undo', () => {
+  const c = pageKeyHarness({ SSP_IS_PLAYLIST_WINDOW: true, undoPlaylistEdit: () => { throw new Error('the child must not undo'); } });
+  assert.ok(c.press('z', { ctrlKey: true }) >= 1);
+  assert.ok(c.press('y', { ctrlKey: true }) >= 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(c.calls)), [['intent', 'undo', { redo: false }], ['intent', 'undo', { redo: true }]]);
+  /* The intent passes main's validator; anything but redo === true is an undo. */
+  assert.deepEqual({ ...C.swNormalizeIntent({ op: 'undo', redo: true, extra: 1 }) }, { op: 'undo', redo: true });
+  assert.deepEqual({ ...C.swNormalizeIntent({ op: 'undo' }) }, { op: 'undo', redo: false });
+  /* A text field in the child keeps its own Ctrl+Z (the editing guard runs first). */
+  const t = pageKeyHarness({ SSP_IS_PLAYLIST_WINDOW: true });
+  t.press('z', { ctrlKey: true, target: { tagName: 'INPUT' } });
+  assert.deepEqual(t.calls, []);
+});
+
+test('0.1.20 c and n1: a docked folder-row remove records a step; removePlaylistFiles does nothing in the second window', () => {
+  const html = batchHtml();
+  const del = batchSlice(html, "const del = document.createElement('button'); del.className = 'pf-del';", '\n  div.onclick');
+  assert.match(del, /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('remove', \{ ids: \[item\.id\] \}\); return; \}\n    \/\*[^\n]*\*\/\n    recordPlaylistEdit\('Remove'\);\n    items\.splice\(itemsIdx, 1\); renderPlaylist\(\); autoSave\(\);\n    toastPlaylistEdit\('Remove'\);/);
+  const rp = batchSlice(html, 'function removePlaylistFiles(files, clearLS, byPath) {', '\nasync function otherPlaylistNames');
+  const startItems = [{ id: 'a', type: 'image', name: 'a.jpg', path: 'C:\\p\\a.jpg' }];
+  const sb = {
+    SSP_IS_PLAYLIST_WINDOW: true, SlideXCore: C, items: startItems.slice(), cur: 0,
+    sspIsMainWindow: () => false,
+    recordPlaylistEdit() { throw new Error('no child history'); },
+    clearPlaylistUndo() { throw new Error('no child history'); },
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(rp, sb);
+  assert.doesNotThrow(() => vm.runInContext("removePlaylistFiles([{ path: 'C:\\\\p\\\\a.jpg', name: 'a.jpg' }], false, true)", sb));
+  assert.doesNotThrow(() => vm.runInContext("removePlaylistFiles([{ path: 'C:\\\\p\\\\a.jpg', name: 'a.jpg' }], true, true)", sb));
+  assert.equal(sb.items.length, 1, 'items untouched in the second window');
+  assert.ok(rp.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < rp.indexOf('removePlaylistMatches'), 'the second-window guard runs first');
+  const orc = batchSlice(html, 'async function openRecycleConfirm(contextMi) {', '\nasync function commitRecycle');
+  assert.ok(orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') !== -1 && orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < orc.indexOf('await'), 'Recycle confirm returns first in the second window');
+});
+
+test('0.1.20 version: every version file says 0.1.20, none says 0.1.19, and the installer name follows', () => {
+  const read = (p) => fs.readFileSync(new URL(p, import.meta.url), 'utf8');
+  const lock = JSON.parse(read('./package-lock.json'));
+  assert.equal(lock.version, '0.1.20');
+  assert.equal(lock.packages[''].version, '0.1.20');
+  const tauri = JSON.parse(read('./src-tauri/tauri.conf.json'));
+  assert.equal('SlideX_' + tauri.version + '_x64-setup.exe', 'SlideX_0.1.20_x64-setup.exe', 'CI names the installer from productName and version');
+  assert.equal(tauri.productName, 'SlideX');
+  for (const p of ['./package.json', './package-lock.json', './src-tauri/tauri.conf.json', './src-tauri/Cargo.toml']) {
+    assert.doesNotMatch(read(p), /0\.1\.19/, p);
+  }
+  assert.doesNotMatch(read('./src-tauri/Cargo.lock'), /name = "slideshowpro"\nversion = "0\.1\.19"/);
+});
+
+test('0.1.20 n4 and n6: the Colour tooltip matches its label, and no #kbclose CSS is left', () => {
+  const html = batchHtml();
+  assert.match(html, /<button class="cb tool" id="bcol" title="Colour">/);
+  assert.doesNotMatch(html, /Color controls/);
+  assert.doesNotMatch(html, /#kbclose/);
+});
+
+test('0.1.20 t1: .gitattributes keeps text files LF', () => {
+  const ga = fs.readFileSync(new URL('./.gitattributes', import.meta.url), 'utf8');
+  assert.match(ga, /^\* text=auto eol=lf$/m);
+  assert.match(ga, /^\*\.png binary$/m);
+  assert.match(ga, /^\*\.exe binary$/m);
+});
