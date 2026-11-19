@@ -1,0 +1,24 @@
+# t1: keep text files LF on every checkout (Windows core.autocrlf=true made 13 source-scan tests fail on AX03).
+* text=auto eol=lf
+
+# Binary files: never convert.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
+*.zip binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.mp3 binary
+*.mp4 binary
+*.wav binary
+*.jar binary
+*.keystore binary
+*.der binary

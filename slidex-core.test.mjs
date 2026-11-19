@@ -481,6 +481,54 @@ test('default image duration is 10 seconds and a saved per-item duration wins', 
   assert.match(html, /\[10000,'10s'\]/);
 });
 
+test('readable text in the main UI is at least 60% white and meets WCAG AA', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  /* Decoration only (P1-8 keeps 30% for these): glyph icons that carry no state. */
+  const decor = new Set(['.pc', '.pldrag']);
+  const styles = [];
+  html.replace(/<style[^>]*>([\s\S]*?)<\/style>/g, (m, body, at) => { styles.push([at, at + m.length]); return m; });
+  const inStyle = i => styles.some(([a, b]) => i >= a && i < b);
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const lum = rgb => 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+  const ratio = (a, bg) => { const fg = bg.map(v => a * 255 + (1 - a) * v); const x = lum(fg), y = lum(bg); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const re = /(?<![-a-z])color:\s*rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*([0-9.]+)\s*\)/g;
+  const low = [];
+  let m;
+  while ((m = re.exec(html))) {
+    const a = Number(m[1]);
+    if (a >= 0.6) continue;
+    let sel = '(inline)';
+    if (inStyle(m.index)) {
+      const open = html.lastIndexOf('{', m.index);
+      const prevClose = html.lastIndexOf('}', open);
+      sel = html.slice(prevClose + 1, open).trim();
+    }
+    if (decor.has(sel)) continue;
+    low.push(sel + ' @' + html.slice(0, m.index).split('\n').length + ' = ' + a);
+  }
+  assert.deepEqual(low, [], 'text below 60% white:\n' + low.join('\n'));
+  /* 60% white passes AA (4.5:1) on the lightest main-UI panel (#1a1a1a) and on the Cast panel (#1a2230). */
+  assert.ok(ratio(0.6, [26, 26, 26]) >= 4.5);
+  assert.ok(ratio(0.6, [26, 34, 48]) >= 4.5);
+  assert.ok(ratio(0.45, [26, 26, 26]) < 4.5, 'the old 45% text failed AA');
+  /* Meaningful glyphs (folder open arrow, modified-key marker) reach 3:1 as graphics, even on a hovered row. */
+  const rule = sel => { const i = html.indexOf(sel + '{') >= 0 ? html.indexOf(sel + '{') : html.indexOf(sel + ' {'); assert.ok(i >= 0, sel); return html.slice(i, html.indexOf('}', i)); };
+  const alpha = (sel, prop) => Number((rule(sel).match(new RegExp('(?<![-a-z])' + prop + ':\\s*rgba\\([^)]*,\\s*([0-9.]+)\\s*\\)')) || [])[1]);
+  for (const sel of ['.pf-arr', '.kerow.modified .kelbl::after']) {
+    const a = alpha(sel, 'color');
+    assert.ok(ratio(a, [26, 26, 26]) >= 3 && ratio(a, [44, 44, 44]) >= 3, sel + ' reaches 3:1');
+  }
+  /* Text overlays on the slide (#fnov file name, #watchbadge) stay readable over a pure white slide. */
+  for (const sel of ['#fnov', '#watchbadge']) {
+    const bgA = alpha(sel, 'background'), fgA = alpha(sel, 'color');
+    assert.ok(bgA >= 0.75, sel + ' backing is at least 75% black');
+    const backing = [255, 255, 255].map(v => v * (1 - bgA));
+    const r = ratio(fgA, backing);
+    assert.ok(r >= 4.5, sel + ' over #fff is ' + r.toFixed(2) + ':1');
+  }
+  assert.ok(ratio(0.75, [255 * 0.45, 255 * 0.45, 255 * 0.45]) < 4.5, 'the old .55 backing failed over white');
+});
+
 test('a saved duration off the list falls back to the closest choice', () => {
   const lines = [];
   const orig = console.log;
@@ -747,19 +795,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.19 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.20 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.19');
-  assert.equal(tauri.version, '0.1.19');
+  assert.equal(pkg.version, '0.1.20');
+  assert.equal(tauri.version, '0.1.20');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.19"/m);
-  assert.match(lock, /"version": "0\.1\.19"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.19"/);
+  assert.match(cargo, /^version = "0\.1\.20"/m);
+  assert.match(lock, /"version": "0\.1\.20"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.20"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -906,6 +954,34 @@ test('pan delta keeps the content under the pointer for every flip and rotation'
     close(after.x, before.x + dx);
     close(after.y, before.y + dy);
   });
+});
+
+test('keyboard focus shows a 2px white ring that outline:none cannot hide', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const css = (html.match(/<style[^>]*>([\s\S]*?)<\/style>/) || [])[1] || '';
+  const ring = css.match(/(^|[}\s]):focus-visible\s*\{([^}]*)\}/);
+  assert.ok(ring, 'a global :focus-visible rule exists');
+  assert.match(ring[2], /outline:\s*2px solid #fff\s*!important/);
+  /* No rule hides the ring for keyboard users. */
+  assert.doesNotMatch(css, /:focus-visible[^{]*\{[^}]*outline:\s*(none|0)/);
+  assert.doesNotMatch(css, /(^|[,}\s])\*?:focus\s*\{[^}]*outline:\s*(none|0)/);
+  /* Fields that set outline:none still get the ring, because the global rule is !important. */
+  assert.match(css, /#kedsearch\{[^}]*outline:none/);
+
+  /* Dark halo: a black box-shadow wider than offset + outline, so black shows inside and outside the ring. */
+  const offset = Number((ring[2].match(/outline-offset:\s*(\d+)px/) || [])[1]);
+  const width = Number((ring[2].match(/outline:\s*(\d+)px/) || [])[1]);
+  const halo = ring[2].match(/box-shadow:\s*0 0 0 (\d+)px #000\s*!important/);
+  assert.ok(halo, 'black halo box-shadow');
+  assert.ok(Number(halo[1]) >= offset + width + 2, 'halo shows at least 2px outside the ring');
+  assert.ok(offset >= 2, 'halo shows at least 2px inside the ring');
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const lum = v => lin(v);
+  const cr = (a, b) => (Math.max(lum(a), lum(b)) + 0.05) / (Math.min(lum(a), lum(b)) + 0.05);
+  /* Ring against its halo, and the outer edge against the page: on a white slide the halo meets white,
+     on the black UI the white ring meets black. Both are 21:1, so at least 3:1 everywhere. */
+  assert.ok(cr(255, 0) >= 3, 'white ring on black halo');
+  for (const page of [255, 0]) assert.ok(Math.max(cr(0, page), cr(255, page)) >= 3, 'ring set reads on ' + page);
 });
 
 test('zoom focus maps back to the content point on a mirrored rotated pane', () => {
@@ -3003,7 +3079,7 @@ test('k opens Ken Burns, q opens Colour, and the Tools panel and buttons show th
   vm.runInNewContext(src + '\nrefreshMoreToolsTooltip();', sandbox);
   assert.equal(kbds[0].textContent, 'w', 'Colour row follows the remap');
   assert.equal(kbds[1].textContent, '', 'unbound Ken Burns shows no key');
-  assert.equal(el('bcol').title, 'Color controls (w)');
+  assert.equal(el('bcol').title, 'Colour (w)');
   assert.equal(el('bkb').title, 'Ken Burns settings');
   sandbox.keyMap.kenBurns = 'k';
   vm.runInNewContext('refreshMoreToolsTooltip();', sandbox);
@@ -4186,7 +4262,7 @@ function swRuntimeRun(html, role, opts = {}) {
           label: role === 'playlist' ? 'playlist-2' : 'main',
         }),
       },
-      app: { getVersion: async () => '0.1.19' },
+      app: { getVersion: async () => '0.1.20' },
       dialog: {
         open: async () => null,
         save: async () => null,
@@ -5042,9 +5118,15 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
       saveItemLS: (it) => calls.push(['saveItemLS', it.id]),
       applyKBNow: spy('applyKBNow'),
       dockPlaylistWindow: spy('dockPlaylistWindow'),
-      removeItem: (idx) => { calls.push(['removeItem', sb.items[idx].id]); sb.items.splice(idx, 1); },
+      removeItem: (idx, clearLS, batch) => { calls.push(['removeItem', sb.items[idx].id]); if (batch === true) calls.push(['removeItemBatch']); sb.items.splice(idx, 1); },
       applyReorderResult: (r) => { calls.push(['applyReorderResult']); sb.items = r.items; },
       getMediaItems: () => sb.items.filter(it => it.type !== 'folder'),
+      recordPlaylistEdit: spy('recordPlaylistEdit'),
+      toastPlaylistEdit: spy('toastPlaylistEdit'),
+      rebuildSlides: spy('rebuildSlides'),
+      emptyPlaylistKeepUndo: spy('emptyPlaylistKeepUndo'),
+      playlistUndoPending: () => true,
+      undoPlaylistEdit: (redo) => { calls.push(['undoPlaylistEdit', redo]); return true; },
       ...over,
     };
     vm.runInNewContext(helpers + '\n' + applySrc, sb);
@@ -5096,6 +5178,27 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
       assert.deepEqual(ids(sb), ['a', 'v', 'c']);
       assert.deepEqual(named(calls, 'removeItem'), [['b']], 'folders are spliced, media go through removeItem');
       assert.equal(named(calls, 'autoSave').length, 1);
+      // 0.1.20 (b, c): one undo step and one toast for the whole remove, folder row included.
+      assert.deepEqual(named(calls, 'recordPlaylistEdit'), [['Remove']]);
+      assert.deepEqual(named(calls, 'toastPlaylistEdit'), [['Remove']]);
+      assert.equal(named(calls, 'removeItemBatch').length, 1, 'removeItem is told not to record or toast again');
+      assert.ok(calls.findIndex(c => c[0] === 'recordPlaylistEdit') < calls.findIndex(c => c[0] === 'removeItem'), 'the step is recorded before anything is removed');
+    }],
+    ['remove several (b)', { op: 'remove', ids: ['a', 'b', 'v', 'c'] }, true, ({ sb, calls }) => {
+      assert.deepEqual(ids(sb), ['f']);
+      assert.equal(named(calls, 'removeItem').length, 4);
+      assert.equal(named(calls, 'removeItemBatch').length, 4);
+      assert.deepEqual(named(calls, 'recordPlaylistEdit'), [['Remove']], 'one undo step');
+      assert.deepEqual(named(calls, 'toastPlaylistEdit'), [['Remove']], 'one toast');
+      assert.equal(named(calls, 'emptyPlaylistKeepUndo').length, 1, 'the last media item gone: landing screen, history kept');
+      assert.equal(named(calls, 'autoSave').length, 1);
+    }],
+    ['remove a folder row only (c)', { op: 'remove', ids: ['f'] }, true, ({ sb, calls }) => {
+      assert.deepEqual(ids(sb), ['a', 'b', 'v', 'c']);
+      assert.deepEqual(named(calls, 'recordPlaylistEdit'), [['Remove']], 'a folder-row remove records an undo step');
+      assert.deepEqual(named(calls, 'toastPlaylistEdit'), [['Remove']]);
+      assert.equal(named(calls, 'removeItem').length, 0);
+      assert.equal(named(calls, 'emptyPlaylistKeepUndo').length, 0);
     }],
     ['remove unknown', { op: 'remove', ids: ['zz'] }, 'refused', ({ sb }) => assert.equal(sb.items.length, 5)],
     ['remove not a list', { op: 'remove', ids: 'b' }, 'invalid'],
@@ -5127,6 +5230,10 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
     ['tool missing button', { op: 'tool', id: 'pllocate' }, 'refused'],
     ['tool not allowed', { op: 'tool', id: 'bdel' }, 'invalid'],
     ['dock', { op: 'dock' }, true, ({ calls }) => assert.equal(named(calls, 'dockPlaylistWindow').length, 1)],
+    // 0.1.20 (a): Ctrl+Z / Ctrl+Y from the second window run main's own history.
+    ['undo', { op: 'undo' }, true, ({ calls }) => assert.deepEqual(named(calls, 'undoPlaylistEdit'), [[false]])],
+    ['redo', { op: 'undo', redo: true }, true, ({ calls }) => assert.deepEqual(named(calls, 'undoPlaylistEdit'), [[true]])],
+    ['undo redo not a strict boolean', { op: 'undo', redo: 'yes' }, true, ({ calls }) => assert.deepEqual(named(calls, 'undoPlaylistEdit'), [[false]])],
     // Unknown ops and non-intents never reach swApplyIntent.
     ['unknown op eval', { op: 'eval', code: 'x' }, 'invalid'],
     ['unknown op setItems', { op: 'setItems', items: [] }, 'invalid'],
@@ -5155,6 +5262,12 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
   }
   assert.deepEqual([...covered].sort(), [...allowed].sort(), 'every allowed op has a passing row');
 
+  // Nothing to undo: refused, and main's history is not touched.
+  {
+    const m = makeMain({ playlistUndoPending: () => false });
+    assert.equal(m.hub.onIntent({ op: 'undo', origin: 'playlist', from: 'playlist' }).reason, 'refused');
+    assert.equal(named(m.calls, 'undoPlaylistEdit').length, 0);
+  }
   // Empty playlist: step and togglePlay are refused.
   for (const op of [{ op: 'step', dir: 1 }, { op: 'togglePlay' }]) {
     const m = makeMain({ items: [] });
@@ -5229,7 +5342,7 @@ test('the hub fails closed: opened without a label it accepts no window', () => 
   assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, true);
 });
 
-test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, and block the WebView\'s own undo', () => {
+test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, block the WebView\'s own undo, and forward to main', () => {
   const html = swNoWriteHtml();
   /* The page routes every non-text-field key in the second window to swChildKey, before main's undo block. */
   const editingAt = html.indexOf('  if (editing) return;\n\n  /* Second window: keys become intents for main');
@@ -5265,7 +5378,311 @@ test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, and 
     assert.doesNotThrow(() => sb.swChildKey(ev), JSON.stringify(chord));
     assert.ok(prevented >= 1, 'preventDefault for ' + JSON.stringify(chord));
   }
-  assert.deepEqual(calls, [], 'no intents, no panel toggles');
+  /* 0.1.20 (a): each chord becomes exactly one 'undo' intent for main; nothing else is sent or toggled. */
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ['intent', 'undo', { redo: false }], ['intent', 'undo', { redo: true }], ['intent', 'undo', { redo: true }],
+    ['intent', 'undo', { redo: false }], ['intent', 'undo', { redo: true }], ['intent', 'undo', { redo: true }],
+  ], 'one undo intent per chord, no panel toggles');
   assert.strictEqual(sb.items, items);
   assert.equal(JSON.stringify({ items: sb.items, cur: sb.cur, sel: [...sb.selectedItems] }), before, 'state unchanged');
+});
+
+// ---- 0.1.20 batch: k / q follow-ups, undo from the undocked window, version ----
+
+function batchHtml() {
+  return fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+}
+function batchSlice(html, start, end) {
+  const at = html.indexOf(start);
+  assert.ok(at !== -1, start);
+  const to = html.indexOf(end, at + start.length);
+  assert.ok(to !== -1, end);
+  return html.slice(at, to);
+}
+
+/* Runs the real page keydown handler, runMappedKey, findMappedId, keysEqual, toggleKBModal and swChildKey. */
+function pageKeyHarness(over = {}) {
+  const html = batchHtml();
+  const { fns } = pageKeyDefaults();
+  const runStart = html.indexOf('function mainWindowHasFocus()');
+  const kdStart = html.indexOf("document.addEventListener('keydown', e => {", runStart);
+  const src = [
+    batchSlice(html, 'function keysEqual(bound, pressed) {', '\nconst RESERVED_KEYS'),
+    batchSlice(html, 'function findMappedId(k) {', '\n/* Video seek'),
+    html.slice(runStart, kdStart),
+    batchSlice(html, 'function toggleKBModal() {', '\n'),
+    batchSlice(html, 'function swChildKey(e) {', '\nfunction enterPlaylistWindowShell'),
+    html.slice(kdStart, html.indexOf('\nupdLandingInfo();', kdStart)),
+  ].join('\n');
+  const calls = [];
+  const spy = (name) => (...a) => { calls.push([name, ...a]); };
+  const els = {};
+  const el = (id) => (els[id] = els[id] || {
+    id, title: '', hidden: false, disabled: false,
+    classList: { contains: () => false, toggle() {}, add() {}, remove() {} },
+    click: () => calls.push(['click', id]),
+  });
+  const keyMap = {};
+  fns.forEach(f => { keyMap[f.id] = f.def; });
+  let handler = null;
+  const sb = {
+    SlideXCore: C, console, Math, Array, Set,
+    FNS: fns, keyMap,
+    SSP_IS_PLAYLIST_WINDOW: false, SSP_UNDOCK_ENABLED: true, playlistUndocked: false,
+    focused: true,
+    document: {
+      addEventListener: (type, fn) => { if (type === 'keydown') handler = fn; },
+      hasFocus: () => sb.focused,
+    },
+    settings: { open: false, pane: 'kb' },
+    settingsOpen: () => sb.settings.open,
+    get settingsPane() { return sb.settings.pane; },
+    openSettings: (pane) => { calls.push(['openSettings', pane]); sb.settings.open = true; if (pane) sb.settings.pane = pane; },
+    closeSettings: () => { calls.push(['closeSettings']); sb.settings.open = false; },
+    delConfirmIsOpen: () => false,
+    listeningEl: null, listeningId: null,
+    watchMode: false,
+    selectedItems: new Set(),
+    items: [{ id: 'a', type: 'image' }, { id: 'b', type: 'image' }],
+    cur: 0,
+    getMediaItems: () => sb.items.filter(it => it.type !== 'folder'),
+    playlistUndoPending: () => false,
+    undoPlaylistEdit: spy('undoPlaylistEdit'),
+    g: el,
+    goTo: spy('goTo'), togglePlay: spy('togglePlay'), togglePL: spy('togglePL'),
+    seekCurVideo: () => false,
+    swChildIntent: (op, args) => { calls.push(['intent', op, args]); return true; },
+    dockPlaylistWindow: spy('dockPlaylistWindow'), undockPlaylistWindow: spy('undockPlaylistWindow'),
+    setOverflowOpen: spy('setOverflowOpen'),
+    applyThemeToCurrent: spy('theme'), applyThemeToAll: spy('themeAll'),
+    toggleControls: spy('toggleControls'), toggleMirrorH: spy('mirrorH'), toggleMirrorV: spy('mirrorV'),
+    openRecycleConfirm: spy('openRecycleConfirm'), removeItem: spy('removeItem'),
+    resetPan: spy('resetPan'), doPan: spy('doPan'),
+    ...over,
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(src, sb);
+  assert.equal(typeof handler, 'function', 'keydown handler bound');
+  const press = (key, mods = {}) => {
+    let prevented = 0;
+    const ev = { key, shiftKey: false, altKey: false, ctrlKey: false, metaKey: false, repeat: false, target: { tagName: 'BODY' }, ...mods, preventDefault() { prevented++; } };
+    handler(ev);
+    return prevented;
+  };
+  const named = (name) => calls.filter(c => c[0] === name).map(c => c.slice(1));
+  return { sb, calls, press, named, html };
+}
+
+test('0.1.20 n5: k runs openSettings(\'kb\') at runtime, k again closes it, and q clicks Colour', () => {
+  const h = pageKeyHarness();
+  assert.ok(h.press('k') >= 1, 'k calls preventDefault');
+  assert.deepEqual(h.named('openSettings'), [['kb']]);
+  h.press('k');
+  assert.equal(h.named('closeSettings').length, 1, 'k again closes Settings > Ken Burns');
+  h.press('q');
+  assert.deepEqual(h.named('click'), [['bcol']]);
+});
+
+test('0.1.20 n5: the key-collision toast fires once and not on the next load, and it offers Rebind', () => {
+  const html = batchHtml();
+  const { fns } = pageKeyDefaults();
+  const src = [
+    batchSlice(html, 'function loadKeyMap() {', '\nloadKeyMap();'),
+    batchSlice(html, 'function keyLabel(k) {', '\n/** Default badge text'),
+  ].join('\n');
+  const store = { ssp_keymap: JSON.stringify({ theme: 'q' }) };
+  const toasts = [];
+  const sb = {
+    SlideXCore: C, FNS: fns, KEYMAP_LS: 'ssp_keymap', keyMap: {}, JSON, String,
+    localStorage: { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+    sspIsMainWindow: () => true,
+    refreshMoreToolsTooltip() {},
+    showToast: (html) => toasts.push(html),
+    setTimeout: (fn) => fn(),
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(src, sb);
+  vm.runInContext('loadKeyMap();', sb);
+  assert.equal(toasts.length, 1, 'one toast on the first load');
+  assert.match(toasts[0], /^Colour has no key: you use q for Themes\. Set one in Keyboard shortcuts\./);
+  assert.match(toasts[0], /<button type="button" class="toast-undo" data-rebind="colour"[^>]*>Rebind<\/button>$/, 'q2: Rebind action for the Colour row');
+  assert.equal(sb.keyMap.theme, 'q', 'the saved key keeps its command');
+  assert.equal(sb.keyMap.colour, '', 'Colour is left unbound');
+  assert.equal(JSON.parse(store.ssp_keymap).colour, '', 'the resolved map is saved once');
+  vm.runInContext('loadKeyMap();', sb);
+  assert.equal(toasts.length, 1, 'no toast on the next load');
+  /* The second window never saves the map, so it must not toast either once main has saved it. */
+  sb.sspIsMainWindow = () => false;
+  vm.runInContext('loadKeyMap();', sb);
+  assert.equal(toasts.length, 1);
+});
+
+test('0.1.20 q2: Rebind opens Settings > Keyboard shortcuts at that key row and focuses its key', () => {
+  const html = batchHtml();
+  const { fns } = pageKeyDefaults();
+  const src = batchSlice(html, '/* Rebind (key-collision toast)', '\nfunction removeItem(itemsIdx, clearLS)');
+  const calls = [];
+  let click = null;
+  const toast = { classList: { remove: (c) => calls.push(['toastHide', c]) } };
+  const search = { value: 'mirror' };
+  const keyBtn = { focus: () => calls.push(['focus', 'colour']) };
+  const row = { scrollIntoView: () => calls.push(['scroll']), querySelector: (q) => (q === '.kekey' ? keyBtn : null) };
+  const sb = {
+    FNS: fns, kedFilter: 'mirror',
+    g: (id) => (id === 'kedsearch' ? search : id === 'toast' ? toast : null),
+    openSettings: (pane) => calls.push(['openSettings', pane, search.value, sb.kedFilter]),
+    setTimeout: (fn) => fn(),
+    document: {
+      addEventListener: (type, fn) => { if (type === 'click') click = fn; },
+      querySelector: (q) => (q === '#kedlist .kerow[data-id="colour"]' ? row : null),
+    },
+  };
+  vm.createContext(sb);
+  vm.runInContext(src, sb);
+  const btn = { dataset: { rebind: 'colour' } };
+  click({ target: { closest: (sel) => (sel === '[data-rebind]' ? btn : null) } });
+  assert.deepEqual(calls, [['toastHide', 'show'], ['openSettings', 'keys', '', ''], ['scroll'], ['focus', 'colour']],
+    'filter cleared, keys pane opened, the Colour row scrolled into view and its key focused');
+  calls.length = 0;
+  assert.equal(vm.runInContext("openShortcutRow('nope')", sb), false, 'unknown ids open nothing');
+  click({ target: { closest: () => null } });
+  assert.deepEqual(calls, [], 'other clicks are ignored');
+});
+
+test('0.1.20 n2: with an empty playlist k opens Settings > Ken Burns; q, Shift+K and other keys do nothing', () => {
+  const h = pageKeyHarness({ items: [] });
+  h.press('q');
+  h.press('K', { shiftKey: true });
+  h.press('ArrowRight');
+  assert.deepEqual(h.calls, [], 'q waits for media; Shift+K is not k');
+  h.press('k');
+  assert.deepEqual(h.named('openSettings'), [['kb']]);
+  h.press('k');
+  assert.equal(h.named('closeSettings').length, 1);
+  /* Ctrl+K is not Ken Burns. */
+  const h2 = pageKeyHarness({ items: [] });
+  h2.press('k', { ctrlKey: true });
+  assert.deepEqual(h2.named('openSettings'), []);
+});
+
+test('0.1.20 n3: single keys do not act behind an open Settings; k switches to or closes its own pane', () => {
+  const h = pageKeyHarness();
+  h.sb.settings.open = true;
+  h.sb.settings.pane = 'keys';
+  for (const key of ['q', 'ArrowRight', 'ArrowLeft', ' ', 't', 'h', 'c', 'Delete', 'Backspace']) h.press(key);
+  assert.deepEqual(h.calls, [], 'nothing runs behind the modal');
+  h.press('k');
+  assert.deepEqual(h.named('openSettings'), [['kb']], 'k switches to the Ken Burns pane');
+  h.press('k');
+  assert.equal(h.named('closeSettings').length, 1, 'k on its own pane closes Settings');
+  /* Esc and Ctrl+, still work. */
+  h.sb.settings.open = true;
+  h.press('Escape');
+  assert.equal(h.named('closeSettings').length, 2);
+  h.press(',', { ctrlKey: true });
+  assert.equal(h.named('openSettings').length, 2);
+  h.press(',', { ctrlKey: true });
+  assert.equal(h.named('closeSettings').length, 3);
+  /* With Settings closed, the same keys act again. */
+  h.press('q');
+  assert.deepEqual(h.named('click'), [['bcol']]);
+});
+
+test('0.1.20 q1: Shift+K and Shift+Q do not fire, and the key map text says so', () => {
+  const h = pageKeyHarness();
+  h.press('K', { shiftKey: true });
+  h.press('Q', { shiftKey: true });
+  assert.deepEqual(h.calls, []);
+  assert.equal(vm.runInContext("findMappedId('K')", h.sb), null);
+  assert.equal(vm.runInContext("findMappedId('Q')", h.sb), null);
+  const editor = batchSlice(h.html, 'function renderKeyEditor() {', '\n  updateConflictBanner();');
+  assert.match(editor, /Letter keys match exactly: Shift\+K and Shift\+Q do nothing \(k is Ken Burns, q is Colour\)\./);
+});
+
+test('0.1.20 q3: main runs k and q only while it has focus, also while the playlist is undocked', () => {
+  const h = pageKeyHarness({ playlistUndocked: true });
+  h.press('k');
+  h.sb.settings.open = false; // close Settings again so q is not behind it (n3)
+  h.press('q');
+  assert.deepEqual(h.named('openSettings'), [['kb']], 'main has focus: k works while undocked');
+  assert.deepEqual(h.named('click'), [['bcol']], 'main has focus: q works while undocked');
+  h.calls.length = 0;
+  h.sb.settings.open = false;
+  h.sb.focused = false;
+  assert.equal(h.press('k'), 0, 'no preventDefault without focus');
+  h.press('q');
+  assert.deepEqual(h.calls, [], 'main without focus: k and q do nothing');
+  /* The second window: k and q are not mapped there and never reach main. */
+  const c = pageKeyHarness({ SSP_IS_PLAYLIST_WINDOW: true });
+  c.press('k');
+  c.press('q');
+  assert.deepEqual(c.calls, [], 'the undocked window sends nothing for k or q');
+  assert.equal(vm.runInContext('mainWindowHasFocus()', c.sb), false);
+});
+
+test('0.1.20 a: Ctrl+Z in the undocked window reaches main as one intent and main undoes; the child never runs undo', () => {
+  const c = pageKeyHarness({ SSP_IS_PLAYLIST_WINDOW: true, undoPlaylistEdit: () => { throw new Error('the child must not undo'); } });
+  assert.ok(c.press('z', { ctrlKey: true }) >= 1);
+  assert.ok(c.press('y', { ctrlKey: true }) >= 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(c.calls)), [['intent', 'undo', { redo: false }], ['intent', 'undo', { redo: true }]]);
+  /* The intent passes main's validator; anything but redo === true is an undo. */
+  assert.deepEqual({ ...C.swNormalizeIntent({ op: 'undo', redo: true, extra: 1 }) }, { op: 'undo', redo: true });
+  assert.deepEqual({ ...C.swNormalizeIntent({ op: 'undo' }) }, { op: 'undo', redo: false });
+  /* A text field in the child keeps its own Ctrl+Z (the editing guard runs first). */
+  const t = pageKeyHarness({ SSP_IS_PLAYLIST_WINDOW: true });
+  t.press('z', { ctrlKey: true, target: { tagName: 'INPUT' } });
+  assert.deepEqual(t.calls, []);
+});
+
+test('0.1.20 c and n1: a docked folder-row remove records a step; removePlaylistFiles does nothing in the second window', () => {
+  const html = batchHtml();
+  const del = batchSlice(html, "const del = document.createElement('button'); del.className = 'pf-del';", '\n  div.onclick');
+  assert.match(del, /if \(SSP_IS_PLAYLIST_WINDOW\) \{ swChildIntent\('remove', \{ ids: \[item\.id\] \}\); return; \}\n    \/\*[^\n]*\*\/\n    recordPlaylistEdit\('Remove'\);\n    items\.splice\(itemsIdx, 1\); renderPlaylist\(\); autoSave\(\);\n    toastPlaylistEdit\('Remove'\);/);
+  const rp = batchSlice(html, 'function removePlaylistFiles(files, clearLS, byPath) {', '\nasync function otherPlaylistNames');
+  const startItems = [{ id: 'a', type: 'image', name: 'a.jpg', path: 'C:\\p\\a.jpg' }];
+  const sb = {
+    SSP_IS_PLAYLIST_WINDOW: true, SlideXCore: C, items: startItems.slice(), cur: 0,
+    sspIsMainWindow: () => false,
+    recordPlaylistEdit() { throw new Error('no child history'); },
+    clearPlaylistUndo() { throw new Error('no child history'); },
+  };
+  sb.window = sb;
+  vm.createContext(sb);
+  vm.runInContext(rp, sb);
+  assert.doesNotThrow(() => vm.runInContext("removePlaylistFiles([{ path: 'C:\\\\p\\\\a.jpg', name: 'a.jpg' }], false, true)", sb));
+  assert.doesNotThrow(() => vm.runInContext("removePlaylistFiles([{ path: 'C:\\\\p\\\\a.jpg', name: 'a.jpg' }], true, true)", sb));
+  assert.equal(sb.items.length, 1, 'items untouched in the second window');
+  assert.ok(rp.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < rp.indexOf('removePlaylistMatches'), 'the second-window guard runs first');
+  const orc = batchSlice(html, 'async function openRecycleConfirm(contextMi) {', '\nasync function commitRecycle');
+  assert.ok(orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') !== -1 && orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < orc.indexOf('await'), 'Recycle confirm returns first in the second window');
+});
+
+test('0.1.20 version: every version file says 0.1.20, none says 0.1.19, and the installer name follows', () => {
+  const read = (p) => fs.readFileSync(new URL(p, import.meta.url), 'utf8');
+  const lock = JSON.parse(read('./package-lock.json'));
+  assert.equal(lock.version, '0.1.20');
+  assert.equal(lock.packages[''].version, '0.1.20');
+  const tauri = JSON.parse(read('./src-tauri/tauri.conf.json'));
+  assert.equal('SlideX_' + tauri.version + '_x64-setup.exe', 'SlideX_0.1.20_x64-setup.exe', 'CI names the installer from productName and version');
+  assert.equal(tauri.productName, 'SlideX');
+  for (const p of ['./package.json', './package-lock.json', './src-tauri/tauri.conf.json', './src-tauri/Cargo.toml']) {
+    assert.doesNotMatch(read(p), /0\.1\.19/, p);
+  }
+  assert.doesNotMatch(read('./src-tauri/Cargo.lock'), /name = "slideshowpro"\nversion = "0\.1\.19"/);
+});
+
+test('0.1.20 n4 and n6: the Colour tooltip matches its label, and no #kbclose CSS is left', () => {
+  const html = batchHtml();
+  assert.match(html, /<button class="cb tool" id="bcol" title="Colour">/);
+  assert.doesNotMatch(html, /Color controls/);
+  assert.doesNotMatch(html, /#kbclose/);
+});
+
+test('0.1.20 t1: .gitattributes keeps text files LF', () => {
+  const ga = fs.readFileSync(new URL('./.gitattributes', import.meta.url), 'utf8');
+  assert.match(ga, /^\* text=auto eol=lf$/m);
+  assert.match(ga, /^\*\.png binary$/m);
+  assert.match(ga, /^\*\.exe binary$/m);
 });
