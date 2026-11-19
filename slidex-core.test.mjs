@@ -5118,9 +5118,15 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
       saveItemLS: (it) => calls.push(['saveItemLS', it.id]),
       applyKBNow: spy('applyKBNow'),
       dockPlaylistWindow: spy('dockPlaylistWindow'),
-      removeItem: (idx) => { calls.push(['removeItem', sb.items[idx].id]); sb.items.splice(idx, 1); },
+      removeItem: (idx, clearLS, batch) => { calls.push(['removeItem', sb.items[idx].id]); if (batch === true) calls.push(['removeItemBatch']); sb.items.splice(idx, 1); },
       applyReorderResult: (r) => { calls.push(['applyReorderResult']); sb.items = r.items; },
       getMediaItems: () => sb.items.filter(it => it.type !== 'folder'),
+      recordPlaylistEdit: spy('recordPlaylistEdit'),
+      toastPlaylistEdit: spy('toastPlaylistEdit'),
+      rebuildSlides: spy('rebuildSlides'),
+      emptyPlaylistKeepUndo: spy('emptyPlaylistKeepUndo'),
+      playlistUndoPending: () => true,
+      undoPlaylistEdit: (redo) => { calls.push(['undoPlaylistEdit', redo]); return true; },
       ...over,
     };
     vm.runInNewContext(helpers + '\n' + applySrc, sb);
@@ -5172,6 +5178,27 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
       assert.deepEqual(ids(sb), ['a', 'v', 'c']);
       assert.deepEqual(named(calls, 'removeItem'), [['b']], 'folders are spliced, media go through removeItem');
       assert.equal(named(calls, 'autoSave').length, 1);
+      // 0.1.20 (b, c): one undo step and one toast for the whole remove, folder row included.
+      assert.deepEqual(named(calls, 'recordPlaylistEdit'), [['Remove']]);
+      assert.deepEqual(named(calls, 'toastPlaylistEdit'), [['Remove']]);
+      assert.equal(named(calls, 'removeItemBatch').length, 1, 'removeItem is told not to record or toast again');
+      assert.ok(calls.findIndex(c => c[0] === 'recordPlaylistEdit') < calls.findIndex(c => c[0] === 'removeItem'), 'the step is recorded before anything is removed');
+    }],
+    ['remove several (b)', { op: 'remove', ids: ['a', 'b', 'v', 'c'] }, true, ({ sb, calls }) => {
+      assert.deepEqual(ids(sb), ['f']);
+      assert.equal(named(calls, 'removeItem').length, 4);
+      assert.equal(named(calls, 'removeItemBatch').length, 4);
+      assert.deepEqual(named(calls, 'recordPlaylistEdit'), [['Remove']], 'one undo step');
+      assert.deepEqual(named(calls, 'toastPlaylistEdit'), [['Remove']], 'one toast');
+      assert.equal(named(calls, 'emptyPlaylistKeepUndo').length, 1, 'the last media item gone: landing screen, history kept');
+      assert.equal(named(calls, 'autoSave').length, 1);
+    }],
+    ['remove a folder row only (c)', { op: 'remove', ids: ['f'] }, true, ({ sb, calls }) => {
+      assert.deepEqual(ids(sb), ['a', 'b', 'v', 'c']);
+      assert.deepEqual(named(calls, 'recordPlaylistEdit'), [['Remove']], 'a folder-row remove records an undo step');
+      assert.deepEqual(named(calls, 'toastPlaylistEdit'), [['Remove']]);
+      assert.equal(named(calls, 'removeItem').length, 0);
+      assert.equal(named(calls, 'emptyPlaylistKeepUndo').length, 0);
     }],
     ['remove unknown', { op: 'remove', ids: ['zz'] }, 'refused', ({ sb }) => assert.equal(sb.items.length, 5)],
     ['remove not a list', { op: 'remove', ids: 'b' }, 'invalid'],
@@ -5203,6 +5230,10 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
     ['tool missing button', { op: 'tool', id: 'pllocate' }, 'refused'],
     ['tool not allowed', { op: 'tool', id: 'bdel' }, 'invalid'],
     ['dock', { op: 'dock' }, true, ({ calls }) => assert.equal(named(calls, 'dockPlaylistWindow').length, 1)],
+    // 0.1.20 (a): Ctrl+Z / Ctrl+Y from the second window run main's own history.
+    ['undo', { op: 'undo' }, true, ({ calls }) => assert.deepEqual(named(calls, 'undoPlaylistEdit'), [[false]])],
+    ['redo', { op: 'undo', redo: true }, true, ({ calls }) => assert.deepEqual(named(calls, 'undoPlaylistEdit'), [[true]])],
+    ['undo redo not a strict boolean', { op: 'undo', redo: 'yes' }, true, ({ calls }) => assert.deepEqual(named(calls, 'undoPlaylistEdit'), [[false]])],
     // Unknown ops and non-intents never reach swApplyIntent.
     ['unknown op eval', { op: 'eval', code: 'x' }, 'invalid'],
     ['unknown op setItems', { op: 'setItems', items: [] }, 'invalid'],
@@ -5231,6 +5262,12 @@ test('swApplyIntent: per-op table for every allowed intent, plus unknown ops and
   }
   assert.deepEqual([...covered].sort(), [...allowed].sort(), 'every allowed op has a passing row');
 
+  // Nothing to undo: refused, and main's history is not touched.
+  {
+    const m = makeMain({ playlistUndoPending: () => false });
+    assert.equal(m.hub.onIntent({ op: 'undo', origin: 'playlist', from: 'playlist' }).reason, 'refused');
+    assert.equal(named(m.calls, 'undoPlaylistEdit').length, 0);
+  }
   // Empty playlist: step and togglePlay are refused.
   for (const op of [{ op: 'step', dir: 1 }, { op: 'togglePlay' }]) {
     const m = makeMain({ items: [] });
@@ -5305,7 +5342,7 @@ test('the hub fails closed: opened without a label it accepts no window', () => 
   assert.equal(hub.onIntent({ op: 'togglePlay', origin: 'playlist', from: 'playlist' }).ok, true);
 });
 
-test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, and block the WebView\'s own undo', () => {
+test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, block the WebView\'s own undo, and forward to main', () => {
   const html = swNoWriteHtml();
   /* The page routes every non-text-field key in the second window to swChildKey, before main's undo block. */
   const editingAt = html.indexOf('  if (editing) return;\n\n  /* Second window: keys become intents for main');
@@ -5341,7 +5378,11 @@ test('undocked window: Ctrl+Z and Ctrl+Y do not throw, do not change state, and 
     assert.doesNotThrow(() => sb.swChildKey(ev), JSON.stringify(chord));
     assert.ok(prevented >= 1, 'preventDefault for ' + JSON.stringify(chord));
   }
-  assert.deepEqual(calls, [], 'no intents, no panel toggles');
+  /* 0.1.20 (a): each chord becomes exactly one 'undo' intent for main; nothing else is sent or toggled. */
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ['intent', 'undo', { redo: false }], ['intent', 'undo', { redo: true }], ['intent', 'undo', { redo: true }],
+    ['intent', 'undo', { redo: false }], ['intent', 'undo', { redo: true }], ['intent', 'undo', { redo: true }],
+  ], 'one undo intent per chord, no panel toggles');
   assert.strictEqual(sb.items, items);
   assert.equal(JSON.stringify({ items: sb.items, cur: sb.cur, sel: [...sb.selectedItems] }), before, 'state unchanged');
 });

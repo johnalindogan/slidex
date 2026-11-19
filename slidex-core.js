@@ -1863,6 +1863,10 @@
         if (SW_TOOL_IDS.indexOf(msg.id) === -1) return null;
         out.id = msg.id;
         return out;
+      case 'undo':
+        // Ctrl+Z / Ctrl+Y in the second window. Main runs its own history.
+        out.redo = msg.redo === true;
+        return out;
       case 'togglePlay':
       case 'dock':
         return out;

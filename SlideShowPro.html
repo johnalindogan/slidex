@@ -1811,12 +1811,20 @@ function swApplyIntent(intent) {
     case 'remove': {
       const idxs = intent.ids.map(swItemIndexById).filter(i => i >= 0).sort((a, b) => b - a);
       if (!idxs.length) return false;
+      /* One undo step and one toast for the whole remove, folder rows included. Main records it; the second window never does. */
+      const hadMedia = getMediaItems().length;
+      recordPlaylistEdit('Remove');
       idxs.forEach(idx => {
         const it = items[idx];
         if (!it) return;
         if (it.type === 'folder') items.splice(idx, 1);
-        else removeItem(idx, false);
+        else removeItem(idx, false, true);
       });
+      selectedItems.clear();
+      const left = getMediaItems().length;
+      if (!left) { if (hadMedia) emptyPlaylistKeepUndo(); }
+      else rebuildSlides(Math.min(cur, left - 1));
+      toastPlaylistEdit('Remove');
       if (playlistChromeOpen()) renderPlaylist(); else { try { buildPlRows(); } catch (_) {} }
       autoSave();
       return true;
@@ -1860,6 +1868,10 @@ function swApplyIntent(intent) {
       b.click();
       return true;
     }
+    case 'undo':
+      /* Ctrl+Z / Ctrl+Y from the second window: main runs its own history. */
+      if (!playlistUndoPending()) return false;
+      return undoPlaylistEdit(intent.redo === true);
     case 'dock':
       dockPlaylistWindow();
       return true;
@@ -2181,8 +2193,10 @@ async function swChildApply() {
 
 /** Second window: keys become intents. Stage keys (mirror, zoom, colour…) do nothing here. */
 function swChildKey(e) {
-  /* Ctrl+Z / Ctrl+Y: playlist undo lives in the main window. Swallow them here so the WebView's own undo never runs. */
-  if (window.SlideXCore && SlideXCore.undoKeyAction && SlideXCore.undoKeyAction(e)) { e.preventDefault(); return; }
+  /* Ctrl+Z / Ctrl+Y: playlist undo lives in the main window. Block the WebView's own undo and forward the key to main
+     as an intent. This window keeps no history and changes no state; main undoes, saves and sends a new snapshot. */
+  const undoAct = window.SlideXCore && SlideXCore.undoKeyAction ? SlideXCore.undoKeyAction(e) : null;
+  if (undoAct) { e.preventDefault(); swChildIntent('undo', { redo: undoAct === 'redo' }); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.key === 'Delete' || e.key === 'Backspace') {
     if (e.shiftKey) return; // Recycle Bin stays in the main window
@@ -4192,10 +4206,12 @@ function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
   if (!item) return;
   if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
-  recordPlaylistEdit('Remove');
+  const batch = arguments[2] === true; // 3rd arg: swApplyIntent records one step and one toast
+  if (!batch) recordPlaylistEdit('Remove');
   // The sspIsMainWindow() guard is redundant on purpose (playlist early-return already covers it); the source-scan requires a call-time guard on this write.
   if (clearLS && sspIsMainWindow()) [item.id, item.name].filter(Boolean).forEach(key => localStorage.removeItem(lsKey(key)));
   items.splice(itemsIdx, 1);
+  if (batch) return;
   selectedItems.clear();
   const cnt = getMediaItems().length;
   if (!cnt) emptyPlaylistKeepUndo(); else rebuildSlides(Math.min(cur, cnt - 1));
@@ -5675,7 +5691,10 @@ function createPlFolderRow(row) {
   del.onclick = e => {
     e.stopPropagation();
     if (SSP_IS_PLAYLIST_WINDOW) { swChildIntent('remove', { ids: [item.id] }); return; }
+    /* A folder-row remove is one undo step, like a media remove. */
+    recordPlaylistEdit('Remove');
     items.splice(itemsIdx, 1); renderPlaylist(); autoSave();
+    toastPlaylistEdit('Remove');
   };
   div.onclick = (e) => {
     if (e.target.closest && e.target.closest('button,input,.pl-rename')) return;
@@ -7117,6 +7136,8 @@ function renderDelConfirm(model) {
   g('delCancel').focus();
 }
 function removePlaylistFiles(files, clearLS, byPath) {
+  /* Second window: no history and no state of its own. Remove and Recycle Bin run in main only. */
+  if (SSP_IS_PLAYLIST_WINDOW) return;
   if (!window.SlideXCore || !SlideXCore.removePlaylistMatches) return;
   const plan = SlideXCore.removePlaylistMatches(items, files, cur, !!byPath);
   if (!plan.removed) return;
@@ -7156,6 +7177,7 @@ async function otherPlaylistNames(files) {
 }
 async function openRecycleConfirm(contextMi) {
   ctxmenu.style.display = 'none';
+  if (SSP_IS_PLAYLIST_WINDOW) return; // the Recycle Bin stays in the main window
   if (!window.SlideXCore) return;
   const mi = getMediaItems();
   const idx = (contextMi == null || contextMi !== contextMi) ? cur : contextMi;
