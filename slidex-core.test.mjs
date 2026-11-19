@@ -3079,7 +3079,7 @@ test('k opens Ken Burns, q opens Colour, and the Tools panel and buttons show th
   vm.runInNewContext(src + '\nrefreshMoreToolsTooltip();', sandbox);
   assert.equal(kbds[0].textContent, 'w', 'Colour row follows the remap');
   assert.equal(kbds[1].textContent, '', 'unbound Ken Burns shows no key');
-  assert.equal(el('bcol').title, 'Color controls (w)');
+  assert.equal(el('bcol').title, 'Colour (w)');
   assert.equal(el('bkb').title, 'Ken Burns settings');
   sandbox.keyMap.kenBurns = 'k';
   vm.runInNewContext('refreshMoreToolsTooltip();', sandbox);

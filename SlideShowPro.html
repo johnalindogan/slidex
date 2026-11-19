@@ -936,8 +936,6 @@ body.ssp-playlist-window #dock-toggle-btn {
 .kbsli-name{flex:1;font-size:11px;color:rgba(255,255,255,.6);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .kbsli-sel{font-size:11px;background:#1a1a1a;border:.5px solid rgba(255,255,255,.18);border-radius:4px;color:rgba(255,255,255,.75);padding:3px 5px;cursor:pointer;font-family:system-ui,sans-serif;flex-shrink:0;}
 .kbempty{font-size:11px;color:rgba(255,255,255,.6);padding:12px 0;text-align:center;}
-#kbclose{margin-top:16px;padding:7px 22px;background:rgba(255,255,255,.09);border:.5px solid rgba(255,255,255,.22);border-radius:5px;color:#fff;cursor:pointer;font-size:12px;font-family:system-ui,sans-serif;}
-#kbclose:hover{background:rgba(255,255,255,.18);}
 </style>
 <style>
 /* 0.2.0 soundtrack (local files only). Main window owns the queue. */
@@ -1182,7 +1180,7 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
       </div>
       <div class="tgroup" role="group" aria-labelledby="tg-image">
         <div class="tglbl" id="tg-image">Image</div>
-        <button class="cb tool" id="bcol" title="Color controls">
+        <button class="cb tool" id="bcol" title="Colour">
         <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
           <span class="tlbl">Colour…</span><span class="kbd" data-cmd="colour"></span>
         </button>
@@ -3061,7 +3059,7 @@ function refreshMoreToolsTooltip() {
     el.textContent = key ? keyLabel(key) : '';
   });
   /* Buttons outside the panel name their key too, and follow remaps. */
-  [['bkb', 'Ken Burns settings', 'kenBurns'], ['toolKb', 'Ken Burns settings', 'kenBurns'], ['bcol', 'Color controls', 'colour']].forEach(([id, text, cmd]) => {
+  [['bkb', 'Ken Burns settings', 'kenBurns'], ['toolKb', 'Ken Burns settings', 'kenBurns'], ['bcol', 'Colour', 'colour']].forEach(([id, text, cmd]) => {
     const el = g(id);
     if (!el) return;
     const key = keyMap[cmd];
@@ -3088,7 +3086,10 @@ function loadKeyMap() {
         return (f ? f.label : u.id) + ' has no key: you use ' + keyLabel(u.key) + ' for ' + (o ? o.label : u.keptBy);
       }).join('. ') + '. Set one in Keyboard shortcuts.';
       const safe = msg.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      setTimeout(() => { try { showToast(safe, 7000); } catch (_) {} }, 1200);
+      /* Rebind opens Settings > Keyboard shortcuts at the first unbound row. The id is a FNS id, never user text. */
+      const rebindId = String(report.unbound[0].id).replace(/[^A-Za-z0-9_]/g, '');
+      const rebind = ' <button type="button" class="toast-undo" data-rebind="' + rebindId + '" title="Pick a new key">Rebind</button>';
+      setTimeout(() => { try { showToast(safe + rebind, 9000); } catch (_) {} }, 1200);
     }
   } else {
     keyMap = {};
@@ -3272,7 +3273,7 @@ function renderKeyEditor() {
   }
   const note = document.createElement('p');
   note.className = 'kednote';
-  note.textContent = 'Fixed (not remappable): Delete / Backspace remove items; Alt+Backspace resets the view and does not remove the item; Alt+Arrows pan; Esc exits watch mode / cancels remap / closes this editor. Speed − / + default to , / . Zoom + / = and − stop at the whole image. 0 stays Hue +.';
+  note.textContent = 'Fixed (not remappable): Delete / Backspace remove items; Alt+Backspace resets the view and does not remove the item; Alt+Arrows pan; Esc exits watch mode / cancels remap / closes this editor. Speed − / + default to , / . Zoom + / = and − stop at the whole image. 0 stays Hue +. Letter keys match exactly: Shift+K and Shift+Q do nothing (k is Ken Burns, q is Colour).';
   list.appendChild(note);
   updateConflictBanner();
 }
@@ -4201,6 +4202,28 @@ document.addEventListener('click', e => {
   if (!btn || !g('toast').classList.contains('show')) return;
   g('toast').classList.remove('show');
   undoPlaylistEdit(false);
+});
+/* Rebind (key-collision toast): open Settings > Keyboard shortcuts at that command's row, ready for a new key. */
+function openShortcutRow(id) {
+  if (!FNS.some(f => f.id === id)) return false;
+  const search = g('kedsearch');
+  if (search) search.value = '';
+  kedFilter = '';
+  openSettings('keys');
+  setTimeout(() => {
+    const row = document.querySelector('#kedlist .kerow[data-id="' + id + '"]');
+    if (!row) return;
+    try { row.scrollIntoView({ block: 'center' }); } catch (_) {}
+    const key = row.querySelector('.kekey');
+    if (key) key.focus();
+  }, 30);
+  return true;
+}
+document.addEventListener('click', e => {
+  const btn = e.target && e.target.closest ? e.target.closest('[data-rebind]') : null;
+  if (!btn) return;
+  g('toast').classList.remove('show');
+  openShortcutRow(btn.dataset.rebind);
 });
 function removeItem(itemsIdx, clearLS) {
   const mi = getMediaItems(), item = items[itemsIdx];
@@ -6892,6 +6915,10 @@ function seekCurVideo(dir, opts) {
   g('pb').style.width = Math.min((next / dur) * 100, 100).toFixed(1) + '%';
   return true;
 }
+function mainWindowHasFocus() {
+  if (SSP_IS_PLAYLIST_WINDOW) return false;
+  try { return typeof document.hasFocus !== 'function' || document.hasFocus(); } catch (_) { return true; }
+}
 function runMappedKey(e) {
   const k = e.key;
   let id = findMappedId(k);
@@ -6905,6 +6932,8 @@ function runMappedKey(e) {
     }
   }
   if (!id) return false;
+  /* k and q act in main only while main has focus, also while the playlist is undocked. The second window never maps them. */
+  if ((id === 'kenBurns' || id === 'colour') && !mainWindowHasFocus()) return false;
   switch (id) {
     case 'next':
       e.preventDefault();
@@ -7048,7 +7077,16 @@ document.addEventListener('keydown', e => {
   const undoAct = window.SlideXCore && SlideXCore.undoKeyAction ? SlideXCore.undoKeyAction(e) : null;
   if (undoAct && (getMediaItems().length || playlistUndoPending())) { e.preventDefault(); undoPlaylistEdit(undoAct === 'redo'); return; }
 
+  /* Settings is modal: single keys do not act behind it (Esc and Ctrl+, are handled above).
+     Only the Ken Burns key acts, on Settings itself: it switches to or closes the Ken Burns pane. */
+  if (settingsOpen()) {
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && findMappedId(e.key) === 'kenBurns') { e.preventDefault(); toggleKBModal(); }
+    return;
+  }
+
   if (!getMediaItems().length) {
+    /* Ken Burns opens Settings, so it works with an empty playlist too (like its button). Colour edits the current item, so q waits for media. */
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && findMappedId(e.key) === 'kenBurns') { runMappedKey(e); return; }
     if (keysEqual(keyMap.watch, e.key)) return;
     if (window.SlideXCore && SlideXCore.moreToolsKeyFires(e, keyMap.moreTools)) {
       e.preventDefault();
