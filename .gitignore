@@ -3,6 +3,7 @@ node_modules/
 dist/
 ui/index.html
 ui/slidex-core.js
+ui/fonts/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/resources/ffmpeg/
@@ -15,4 +16,5 @@ android/.idea/
 android/captures/
 android/app/src/main/assets/SlideShowPro.html
 android/app/src/main/assets/slidex-core.js
+android/app/src/main/assets/fonts/
 *.iml
