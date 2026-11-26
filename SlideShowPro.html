@@ -7341,16 +7341,18 @@ if (g('delRecycle')) g('delRecycle').onclick = () => { commitRecycle(); };
     return filterMediaPaths(paths);
   }
   let ingesting = false;
-  let ingested = false;
+  let lastIngestKey = '';
   async function ingest() {
-    if (ingested || ingesting) return;
+    if (ingesting) return;
     if (!(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke)) return;
     ingesting = true;
     try {
       const paths = await fetchLaunchPaths();
       if (!paths.length) return;
+      const key = paths.join('\0');
+      if (key === lastIngestKey) return;
       const ok = await openLaunchPaths(paths);
-      if (ok) ingested = true;
+      if (ok) lastIngestKey = key;
     } finally {
       ingesting = false;
     }
@@ -7359,7 +7361,7 @@ if (g('delRecycle')) g('delRecycle').onclick = () => { commitRecycle(); };
     const delays = [0, 100, 250, 500, 1000, 1500];
     delays.forEach(function (ms) {
       setTimeout(function () {
-        if (!ingested) ingest();
+        if (!lastIngestKey) ingest();
       }, ms);
     });
   }
