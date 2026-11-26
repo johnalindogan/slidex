@@ -8896,7 +8896,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   try { var bm = localStorage.getItem(BEAT_KEY); if (C.BEAT_SYNC_MODES.indexOf(bm) >= 0) beatMode = bm; } catch (_) {}
   var beats = Object.create(null); // track path -> { state: 'analyzing'|'ok'|'unclear'|'failed', grid }
   var BEAT_CACHE_KEY = 'sspBeatCacheV2';
-  try { localStorage.removeItem('sspBeatCacheV1'); } catch (_) {} // v1 keys had no mtime
+  if (sspIsMainWindow()) {
+    try { localStorage.removeItem('sspBeatCacheV1'); } catch (_) {} // v1 keys had no mtime
+  }
   var OFFSET_KEY = 'sspBeatOffsetV1';
   var syncOffsetMs = 0, savedOffsetMs = null;
   try {
@@ -8910,7 +8912,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   function readBeatCache() { try { return C.parseBeatCache(localStorage.getItem(BEAT_CACHE_KEY)); } catch (_) { return {}; } }
   function writeBeatCache(key, res) {
     if (!key) return;
-    try { localStorage.setItem(BEAT_CACHE_KEY, JSON.stringify(C.beatCacheWrite(readBeatCache(), key, C.beatCacheEntry(res)))); } catch (_) {}
+    if (sspIsMainWindow()) {
+      try { localStorage.setItem(BEAT_CACHE_KEY, JSON.stringify(C.beatCacheWrite(readBeatCache(), key, C.beatCacheEntry(res)))); } catch (_) {}
+    }
   }
 
   function el(id) { return document.getElementById(id); }
@@ -9266,7 +9270,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   el('musicNext').onclick = blurAfter(function () { step(1, false); });
   el('musicBeat').onclick = blurAfter(function () {
     beatMode = C.nextBeatSyncMode(beatMode);
-    try { localStorage.setItem(BEAT_KEY, beatMode); } catch (_) {}
+    if (sspIsMainWindow()) {
+      try { localStorage.setItem(BEAT_KEY, beatMode); } catch (_) {}
+    }
     sync();
     pumpAnalysis();
   });
@@ -9276,7 +9282,9 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
   };
   el('musicOffset').onchange = function () {
     syncOffsetMs = C.clampSyncOffsetMs(this.value);
-    try { localStorage.setItem(OFFSET_KEY, String(syncOffsetMs)); savedOffsetMs = syncOffsetMs; } catch (_) {}
+    if (sspIsMainWindow()) {
+      try { localStorage.setItem(OFFSET_KEY, String(syncOffsetMs)); savedOffsetMs = syncOffsetMs; } catch (_) {}
+    }
     el('musicOffsetLbl').textContent = offsetLabel();
   };
   el('musicRepeat').onclick = blurAfter(function () { setQueue(Object.assign({}, q, { repeat: C.nextRepeatMode(q.repeat) })); });

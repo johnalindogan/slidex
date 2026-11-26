@@ -1278,6 +1278,20 @@ test('HTML and JS have no bare confirm() and the four prompts await a dialog', (
   assert.match(html, /toggleTimer/);
 });
 
+test('launch paths: a later Open-with with new paths is ingested again; the same path set is ingested once (#7)', () => {
+  const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
+  const bridge = html.match(/SSP Tauri bridge \(launch-path ingest \+ native drag-drop\)[\s\S]*?(?=<\/script>)/)?.[0];
+  assert.ok(bridge, 'expected the Tauri launch-path bridge');
+  assert.doesNotMatch(bridge, /\bingested\b/, 'the bridge must allow more than one ingest');
+  assert.equal((bridge.match(/\blastIngestKey\s*=(?!=)/g) || []).length, 2,
+    'the key should only be assigned at initialization and after opening');
+  assert.match(bridge, /let lastIngestKey = '';/);
+  const ingest = bridge.match(/async function ingest\(\) \{[\s\S]*?(?=\n  \})/)?.[0];
+  assert.ok(ingest, 'expected the ingest function');
+  assert.match(ingest, /const paths = await fetchLaunchPaths\(\);\s+if \(!paths\.length\) return;\s+const key = paths\.join\('\\0'\);\s+if \(key === lastIngestKey\) return;\s+const ok = await openLaunchPaths\(paths\);\s+if \(ok\) lastIngestKey = key;/);
+  assert.match(bridge, /event\.listen\('ssp-launch-paths', function \(\) \{ ingest\(\); \}\);/);
+});
+
 test('the Cast panel can copy the Cast log path', () => {
   const html = fs.readFileSync(new URL('./SlideShowPro.html', import.meta.url), 'utf8');
   assert.match(html, /id="castLog"/);
