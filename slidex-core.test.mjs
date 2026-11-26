@@ -799,19 +799,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.20 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.21 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.20');
-  assert.equal(tauri.version, '0.1.20');
+  assert.equal(pkg.version, '0.1.21');
+  assert.equal(tauri.version, '0.1.21');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.20"/m);
-  assert.match(lock, /"version": "0\.1\.20"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.20"/);
+  assert.match(cargo, /^version = "0\.1\.21"/m);
+  assert.match(lock, /"version": "0\.1\.21"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.21"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -5677,18 +5677,18 @@ test('0.1.20 c and n1: a docked folder-row remove records a step; removePlaylist
   assert.ok(orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') !== -1 && orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < orc.indexOf('await'), 'Recycle confirm returns first in the second window');
 });
 
-test('0.1.20 version: every version file says 0.1.20, none says 0.1.19, and the installer name follows', () => {
+test('0.1.21 version: every version file says 0.1.21, none says 0.1.20, and the installer name follows', () => {
   const read = (p) => fs.readFileSync(new URL(p, import.meta.url), 'utf8');
   const lock = JSON.parse(read('./package-lock.json'));
-  assert.equal(lock.version, '0.1.20');
-  assert.equal(lock.packages[''].version, '0.1.20');
+  assert.equal(lock.version, '0.1.21');
+  assert.equal(lock.packages[''].version, '0.1.21');
   const tauri = JSON.parse(read('./src-tauri/tauri.conf.json'));
-  assert.equal('SlideX_' + tauri.version + '_x64-setup.exe', 'SlideX_0.1.20_x64-setup.exe', 'CI names the installer from productName and version');
+  assert.equal('SlideX_' + tauri.version + '_x64-setup.exe', 'SlideX_0.1.21_x64-setup.exe', 'CI names the installer from productName and version');
   assert.equal(tauri.productName, 'SlideX');
   for (const p of ['./package.json', './package-lock.json', './src-tauri/tauri.conf.json', './src-tauri/Cargo.toml']) {
-    assert.doesNotMatch(read(p), /0\.1\.19/, p);
+    assert.doesNotMatch(read(p), /0\.1\.20/, p);
   }
-  assert.doesNotMatch(read('./src-tauri/Cargo.lock'), /name = "slideshowpro"\nversion = "0\.1\.19"/);
+  assert.doesNotMatch(read('./src-tauri/Cargo.lock'), /name = "slideshowpro"\nversion = "0\.1\.20"/);
 });
 
 test('0.1.20 n4 and n6: the Colour tooltip matches its label, and no #kbclose CSS is left', () => {
