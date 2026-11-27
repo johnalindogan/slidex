@@ -799,19 +799,19 @@ test('a 20s cast photo uses that duration, and a change waits for the next photo
   assert.equal(timers[0].ms, 6000, 'off cast, the photo timer restarts at the new duration');
 });
 
-test('0.1.21 versions match and the welcome screen reads getVersion()', () => {
+test('0.1.22 versions match and the welcome screen reads getVersion()', () => {
   const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
   const tauri = JSON.parse(fs.readFileSync(new URL('./src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   const cargo = fs.readFileSync(new URL('./src-tauri/Cargo.toml', import.meta.url), 'utf8');
   const lock = fs.readFileSync(new URL('./package-lock.json', import.meta.url), 'utf8');
   const cargoLock = fs.readFileSync(new URL('./src-tauri/Cargo.lock', import.meta.url), 'utf8');
   const lib = fs.readFileSync(new URL('./src-tauri/src/lib.rs', import.meta.url), 'utf8');
-  assert.equal(pkg.version, '0.1.21');
-  assert.equal(tauri.version, '0.1.21');
+  assert.equal(pkg.version, '0.1.22');
+  assert.equal(tauri.version, '0.1.22');
   assert.equal(tauri.identifier, 'com.johnalindogan.slideshowpro');
-  assert.match(cargo, /^version = "0\.1\.21"/m);
-  assert.match(lock, /"version": "0\.1\.21"/);
-  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.21"/);
+  assert.match(cargo, /^version = "0\.1\.22"/m);
+  assert.match(lock, /"version": "0\.1\.22"/);
+  assert.match(cargoLock, /name = "slideshowpro"\nversion = "0\.1\.22"/);
   assert.equal(
     tauri.app.windows[0].additionalBrowserArgs,
     '--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force_high_performance_gpu'
@@ -5677,18 +5677,41 @@ test('0.1.20 c and n1: a docked folder-row remove records a step; removePlaylist
   assert.ok(orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') !== -1 && orc.indexOf('if (SSP_IS_PLAYLIST_WINDOW) return;') < orc.indexOf('await'), 'Recycle confirm returns first in the second window');
 });
 
-test('0.1.21 version: every version file says 0.1.21, none says 0.1.20, and the installer name follows', () => {
+test('0.1.22 version: every version file says 0.1.22, none says 0.1.21, and the installer name follows', () => {
   const read = (p) => fs.readFileSync(new URL(p, import.meta.url), 'utf8');
   const lock = JSON.parse(read('./package-lock.json'));
-  assert.equal(lock.version, '0.1.21');
-  assert.equal(lock.packages[''].version, '0.1.21');
+  assert.equal(lock.version, '0.1.22');
+  assert.equal(lock.packages[''].version, '0.1.22');
   const tauri = JSON.parse(read('./src-tauri/tauri.conf.json'));
-  assert.equal('SlideX_' + tauri.version + '_x64-setup.exe', 'SlideX_0.1.21_x64-setup.exe', 'CI names the installer from productName and version');
+  assert.equal('SlideX_' + tauri.version + '_x64-setup.exe', 'SlideX_0.1.22_x64-setup.exe', 'CI names the installer from productName and version');
   assert.equal(tauri.productName, 'SlideX');
   for (const p of ['./package.json', './package-lock.json', './src-tauri/tauri.conf.json', './src-tauri/Cargo.toml']) {
-    assert.doesNotMatch(read(p), /0\.1\.20/, p);
+    assert.doesNotMatch(read(p), /0\.1\.21/, p);
   }
-  assert.doesNotMatch(read('./src-tauri/Cargo.lock'), /name = "slideshowpro"\nversion = "0\.1\.20"/);
+  assert.doesNotMatch(read('./src-tauri/Cargo.lock'), /name = "slideshowpro"\nversion = "0\.1\.21"/);
+});
+
+test('0.1.22 music pane: transport row wraps, labels stay on one line, volume slider can shrink', () => {
+  const html = batchHtml();
+  assert.match(html, /#musicCtlRow\{[^}]*flex-wrap:wrap;[^}]*row-gap:6px;/);
+  assert.match(html, /#musicPane button\{[^}]*white-space:nowrap;/);
+  assert.match(html, /#musicVol\{[^}]*flex:1 1 120px;[^}]*min-width:0;/);
+  assert.match(html, /#musicOffset\{[^}]*min-width:0;/);
+  assert.match(html, /<div class="mrow" id="musicCtlRow">\s*<button[^>]*id="musicPrev"[^]*?<input[^>]*id="musicVol"[^>]*>\s*<\/div>/);
+});
+
+test('0.1.22 cast panel uses the bundled font', () => {
+  const html = batchHtml();
+  assert.match(html, /#castPanel\{[^}]*font:13px\/1\.4 var\(--font-main\),system-ui,sans-serif;/);
+  assert.match(html, /#castPanel select,#castPanel input\{[^}]*font:12px var\(--font-main\),system-ui,sans-serif;/);
+  assert.match(html, /#castPanel button\{[^}]*font-family:inherit;/);
+  assert.match(html, /#castDetails\{[^}]*font-family:var\(--font-mono\),ui-monospace,Consolas,monospace;/);
+  assert.doesNotMatch(html, /#castPanel[^{}\n]*\{[^}]*font(?:-family)?:\s*(?:\d+px(?:\/[\d.]+)?\s+)?system-ui,sans-serif/);
+});
+
+test('0.1.22 Esc closes the Cast panel', () => {
+  const html = batchHtml();
+  assert.match(html, /if \(e\.key === 'Escape'\) \{\s*if \(settingsOpen\(\)\) \{ closeSettings\(\); return; \}\s*const castPanel = g\('castPanel'\);\s*if \(castPanel\?\.classList\.contains\('open'\)\) \{\s*castPanel\.classList\.remove\('open'\);[^}]*\breturn;\s*\}\s*if \(watchMode\) \{ toggleWatchMode\(\); return; \}/);
 });
 
 test('0.1.20 n4 and n6: the Colour tooltip matches its label, and no #kbclose CSS is left', () => {
