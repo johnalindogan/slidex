@@ -1481,6 +1481,7 @@ impl Drop for ScopePermit {
 
 pub(crate) struct TestScope {
     cache: PathBuf,
+    set_encoder_file: bool,
     _permit: ScopePermit,
 }
 
@@ -1490,8 +1491,17 @@ impl TestScope {
         let _ = fs::create_dir_all(&cache);
         TEST_CACHE.with(|slot| *slot.borrow_mut() = Some(cache.clone()));
         TEST_ENCODER.with(|slot| *slot.borrow_mut() = Some(encoder));
+        let set_encoder_file = TEST_ENCODER_FILE.with(|slot| {
+            let mut path = slot.borrow_mut();
+            if path.is_some() {
+                return false;
+            }
+            *path = Some(cache.join("tv-encoder"));
+            true
+        });
         Self {
             cache,
+            set_encoder_file,
             _permit: permit,
         }
     }
@@ -1502,6 +1512,9 @@ impl Drop for TestScope {
         TEST_CACHE.with(|slot| *slot.borrow_mut() = None);
         TEST_ENCODER.with(|slot| *slot.borrow_mut() = None);
         TEST_BACKOFF.with(|slot| *slot.borrow_mut() = None);
+        if self.set_encoder_file {
+            set_test_encoder_file(None);
+        }
         let mut hub = hub();
         hub.queue.retain(|spec| spec.cache_dir != self.cache);
         hub.jobs.retain(|_, job| job.cache_dir != self.cache);
@@ -2115,6 +2128,17 @@ mod tests {
         );
         assert!(has_pair(&mf, "-b:v", "18M"));
         assert!(has_pair(&mf, "-maxrate", "19M"));
+    }
+
+    #[test]
+    fn test_scope_uses_a_cache_local_encoder_file() {
+        let cache = std::env::temp_dir().join(format!("slidex-tv-encoder-{}", uuid_tail()));
+        {
+            let _scope = TestScope::new(cache.clone(), TestEncoder::Missing);
+            assert_eq!(encoder_file(), cache.join("tv-encoder"));
+            assert_eq!(configured_encoder(), TvEncoder::Libx264);
+        }
+        fs::remove_dir_all(cache).unwrap();
     }
 
     #[test]

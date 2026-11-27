@@ -957,9 +957,10 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 #musicPane{display:none;position:fixed;right:16px;bottom:64px;z-index:9998;width:360px;max-width:calc(100vw - 32px);max-height:min(70vh,520px);flex-direction:column;gap:8px;background:rgba(10,10,10,.94);border:1px solid rgba(255,255,255,.12);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5);padding:12px;color:rgba(255,255,255,.85);font:13px/1.4 var(--font-main),system-ui,sans-serif;}
 #musicPane.open{display:flex;}
 #musicPane .mrow{display:flex;align-items:center;gap:6px;}
+#musicCtlRow{flex-wrap:wrap;row-gap:6px;}
 #musicPane .msp{flex:1;}
 #musicPane h3{margin:0;font-size:13px;font-weight:700;color:#fff;}
-#musicPane button{font:inherit;font-size:12px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;height:28px;padding:0 9px;cursor:pointer;}
+#musicPane button{white-space:nowrap;font:inherit;font-size:12px;color:rgba(255,255,255,.85);background:transparent;border:.5px solid rgba(255,255,255,.18);border-radius:6px;height:28px;padding:0 9px;cursor:pointer;}
 #musicPane button:hover{background:rgba(255,255,255,.08);}
 #musicPane button.on{background:rgba(255,255,255,.15);border-color:rgba(255,255,255,.55);color:#fff;}
 #musicPane button:focus-visible{outline:2px solid #fff;outline-offset:1px;}
@@ -974,21 +975,21 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 #musicList .mtrack button{width:26px;padding:0;height:24px;}
 #musicEmpty{font-size:12px;color:rgba(255,255,255,.6);padding:8px 2px;}
 #musicEmpty b{color:#fff;display:block;margin-bottom:2px;}
-#musicVol{flex:1;accent-color:#fff;}
-#musicOffset{flex:1;accent-color:#fff;}
+#musicVol{flex:1 1 120px;min-width:0;accent-color:#fff;}
+#musicOffset{flex:1;min-width:0;accent-color:#fff;}
 #musicOffsetLbl{font-size:11px;color:rgba(255,255,255,.75);white-space:nowrap;min-width:150px;}
 #musicBpm{font-size:11px;padding:2px 8px;border-radius:999px;border:.5px solid rgba(255,255,255,.28);color:rgba(255,255,255,.85);white-space:nowrap;}
 #musicBpm.live{border-color:rgba(159,208,255,.6);color:#cfe7ff;}
 #musicBpm.warn{border-color:rgba(232,179,90,.6);color:#f3d29b;}
 #fimusic{display:none;}
-#castPanel{display:none;position:fixed;right:16px;bottom:16px;z-index:9999;width:320px;max-width:calc(100vw - 32px);background:#1a2230;border:1px solid rgba(90,180,255,.35);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.45);padding:14px 14px 12px;color:#e8eef7;font:13px/1.4 system-ui,sans-serif;}
+#castPanel{display:none;position:fixed;right:16px;bottom:16px;z-index:9999;width:320px;max-width:calc(100vw - 32px);background:#1a2230;border:1px solid rgba(90,180,255,.35);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.45);padding:14px 14px 12px;color:#e8eef7;font:13px/1.4 var(--font-main),system-ui,sans-serif;}
 #castPanel.open{display:block;}
 #castPanel h3{margin:0 0 8px;font-size:14px;font-weight:600;color:#9fd0ff;}
 #castPanel .row{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0;}
-#castPanel button{background:#243247;border:1px solid rgba(255,255,255,.12);color:#e8eef7;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:12px;}
+#castPanel button{font-family:inherit;background:#243247;border:1px solid rgba(255,255,255,.12);color:#e8eef7;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:12px;}
 #castPanel button:hover{border-color:rgba(90,180,255,.5);}
 #castPanel button:disabled{opacity:.45;cursor:default;}
-#castPanel select,#castPanel input{flex:1;min-width:90px;background:#0f1622;color:#e8eef7;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:6px 8px;font:12px system-ui,sans-serif;}
+#castPanel select,#castPanel input{flex:1;min-width:90px;background:#0f1622;color:#e8eef7;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:6px 8px;font:12px var(--font-main),system-ui,sans-serif;}
 #castPanel input[type="number"]{flex:0 0 84px;min-width:72px;}
 #castPanel .hint{margin:0 0 6px;font-size:11px;color:#8ea0b8;}
 #castStatus{margin-top:8px;font-size:11px;color:#9aa8bc;min-height:2.6em;white-space:pre-wrap;}
@@ -997,7 +998,7 @@ body.ssp-playlist-window #bmusic,body.ssp-playlist-window #musicTab{display:none
 .cast-step.current{color:#e8eef7;font-weight:700;}
 .cast-step.done{color:rgba(255,255,255,.75);}
 #castFailMsg{color:#ffc2c2;font-size:12px;line-height:1.4;white-space:pre-wrap;}
-#castDetails{font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;background:#0b0b0b;border-radius:6px;padding:8px;margin-top:8px;color:rgba(255,255,255,.6);}
+#castDetails{font-family:var(--font-mono),ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;background:#0b0b0b;border-radius:6px;padding:8px;margin-top:8px;color:rgba(255,255,255,.6);}
 #castFirewall{margin-top:6px;font-size:11px;color:#b7c4d6;white-space:pre-wrap;}
 #lbcast,#bcast.cast-on{border-color:rgba(90,180,255,.55)!important;color:#9fd0ff!important;}
 #lbcast:disabled{border-color:rgba(255,255,255,.1)!important;color:inherit!important;}
@@ -7074,9 +7075,16 @@ document.addEventListener('keydown', e => {
     return;
   }
 
-  /* Escape: close shortcut editor, exit watch mode, close overflow, or clear selection (fixed) */
+  /* Escape: close settings or Cast, exit watch mode, close overflow, or clear selection (fixed) */
   if (e.key === 'Escape') {
     if (settingsOpen()) { closeSettings(); return; }
+    const castPanel = g('castPanel');
+    if (castPanel?.classList.contains('open')) {
+      castPanel.classList.remove('open');
+      const castButton = g('bcast');
+      (castButton?.getClientRects().length ? castButton : g('lbcast'))?.focus();
+      return;
+    }
     if (watchMode) { toggleWatchMode(); return; }
     if (g('ctrls-overflow')?.classList.contains('open')) { setOverflowOpen(false); return; }
     if (selectedItems.size > 0) {
@@ -8854,7 +8862,7 @@ try { initPlaylistWindowSync(); } catch (e) { console.warn('playlist window sync
     <button type="button" id="musicClose" title="Close (Esc)" aria-label="Close">&#x2715;</button>
   </div>
   <div class="mrow"><div id="musicNow" aria-live="polite"></div><span class="msp"></span><span id="musicBpm" hidden></span></div>
-  <div class="mrow">
+  <div class="mrow" id="musicCtlRow">
     <button type="button" id="musicPrev" title="Previous song" aria-label="Previous song">&#x2039;</button>
     <button type="button" id="musicPlay" title="Music on or off. Music plays while the slideshow plays.">Music on</button>
     <button type="button" id="musicNext" title="Next song" aria-label="Next song">&#x203A;</button>

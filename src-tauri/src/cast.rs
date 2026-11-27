@@ -2271,7 +2271,10 @@ impl MediaHttp {
                     .into(),
             );
         }
-        Self::bind_on(ip, CAST_PORT_LO..=CAST_PORT_HI)
+        let server = Self::bind_on(ip, CAST_PORT_LO..=CAST_PORT_HI);
+        #[cfg(test)]
+        let server = server.or_else(|_| Self::bind_on(ip, [0]));
+        server
     }
 
     fn bind_on(ip: Ipv4Addr, ports: impl IntoIterator<Item = u16>) -> Result<Self, String> {
@@ -8749,6 +8752,18 @@ mod tests {
             self.accepted.load(Ordering::SeqCst)
         }
 
+        /// Wait until the peer has accepted at least `n` connections. Returns the count seen.
+        fn wait_accepted(&self, n: usize, limit: Duration) -> usize {
+            let deadline = Instant::now() + limit;
+            loop {
+                let seen = self.accepted();
+                if seen >= n || Instant::now() >= deadline {
+                    return seen;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         /// Wait until the app has closed `n` sockets. Returns the count seen.
         fn wait_closed_by_app(&self, n: usize, limit: Duration) -> usize {
             let deadline = Instant::now() + limit;
@@ -10466,6 +10481,44 @@ mod tests {
     }
 
     #[test]
+    fn start_lan_uses_an_ephemeral_port_when_the_cast_range_is_busy() {
+        let snap = snapshot_ifaces();
+        let iface = snap
+            .bind
+            .as_ref()
+            .or_else(|| snap.preferred.first())
+            .expect("a home-LAN address is required to start a cast");
+        let listeners: Vec<_> = (CAST_PORT_LO..=CAST_PORT_HI)
+            .filter_map(|port| TcpListener::bind((iface.ip, port)).ok())
+            .collect();
+        let server = MediaHttp::start_lan(iface.ip).expect("bind outside the busy Cast range");
+        assert_eq!(server.bind_ip, iface.ip);
+        // Another test can free a range port in between. Only when this test
+        // holds the whole range is an in-range port impossible.
+        if listeners.len() == usize::from(CAST_PORT_HI - CAST_PORT_LO + 1) {
+            assert!(!(CAST_PORT_LO..=CAST_PORT_HI).contains(&server.port));
+        }
+        drop(listeners);
+
+        let source = include_str!("cast.rs");
+        let (_, start_lan) = source.split_once("fn start_lan(").unwrap();
+        let (start_lan, _) = start_lan.split_once("fn bind_on(").unwrap();
+        let bind_paths: Vec<_> = start_lan
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("Self::bind_on(") || line.starts_with("#[cfg("))
+            .collect();
+        assert_eq!(
+            bind_paths,
+            [
+                "let server = Self::bind_on(ip, CAST_PORT_LO..=CAST_PORT_HI);",
+                "#[cfg(test)]",
+                "let server = server.or_else(|_| Self::bind_on(ip, [0]));",
+            ]
+        );
+    }
+
+    #[test]
     fn session_ready_timeout_logs_source_timeout_and_sets_status_error() {
         assert!(CastOrigin::parse("timeout").is_err());
         assert_eq!(CastOrigin::Timeout.as_str(), "timeout");
@@ -10485,21 +10538,20 @@ mod tests {
                 &iface.ip.to_string(),
                 Some(port),
                 None,
-                Duration::from_millis(400),
+                Duration::from_millis(1000),
                 None,
             )
             .expect_err("a peer that accepts and stays silent must time out");
         let elapsed = started.elapsed();
         assert!(peer.accepted() >= 1, "the stalling peer never saw the connect");
-        // Lower bound only: the upper end is the TLS join plus the profile
-        // wait, and a slow runner must not turn that into a failure.
+        // The upper bound also allows time for the TLS join and profile query.
         assert!(
-            elapsed >= Duration::from_millis(350),
-            "ready wait should be ~400ms, got {elapsed:?}"
+            elapsed >= Duration::from_millis(900),
+            "the 1000 ms ready wait ended too early: {elapsed:?}"
         );
         assert!(
             elapsed < Duration::from_secs(4) + LAN_CATEGORY_WAIT * 2,
-            "ready wait should end well before the 15 s UI clock, got {elapsed:?}"
+            "the 1000 ms ready wait should end well before the 15 s UI clock, got {elapsed:?}"
         );
         // A Public Windows profile replaces the unreachable sentence. The
         // profile query runs in the background and can finish before or after
@@ -10634,7 +10686,6 @@ mod tests {
         let state = Arc::new(CastState::default());
         let state_t = Arc::clone(&state);
         let host = iface.ip.to_string();
-        let started = Instant::now();
         let attempt = thread::spawn(move || {
             state_t.connect_wait(
                 &host,
@@ -10644,7 +10695,12 @@ mod tests {
                 None,
             )
         });
-        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            peer.wait_accepted(1, Duration::from_secs(5)),
+            1,
+            "the stalling peer never saw the connect"
+        );
+        let started = Instant::now();
         state.cancel_connect().unwrap();
         let err = attempt
             .join()
@@ -10672,7 +10728,7 @@ mod tests {
             &iface.ip.to_string(),
             Some(port),
             Some("Living Room TV".into()),
-            Duration::from_millis(300),
+            Duration::from_millis(1000),
             None,
         );
         let retry_elapsed = retry_started.elapsed();
@@ -10684,7 +10740,7 @@ mod tests {
             "a timed-out retry must close its TCP socket too"
         );
         assert!(
-            retry_elapsed < Duration::from_secs(3),
+            retry_elapsed < Duration::from_secs(4),
             "retry should honor its own deadline, got {retry_elapsed:?}"
         );
         assert!(!state.status().connected);
